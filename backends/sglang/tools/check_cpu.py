@@ -11,7 +11,7 @@ CHECKS = (
     'rpc_framing_check', 'rpc_admission_check', 'ipc_teardown_check', 'watchdog_teardown_check',
     'shutdown_check', 'mps_exit_check', 'startup_smoke_check', 'startup_budget_check',
     'startup_regression_check', 'weight_owner_collectives_check', 'idle_cuda_cache_check',
-    'revoked_ready_check',
+    'revoked_ready_check', 'decode_run_check',
 )
 
 

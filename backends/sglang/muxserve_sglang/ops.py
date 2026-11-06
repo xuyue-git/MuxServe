@@ -5,9 +5,16 @@ from importlib import import_module
 from .contracts import IntegrationError
 
 
+_KERNELS = None
+
+
 def kernels():
+    global _KERNELS
+    if _KERNELS is not None:
+        return _KERNELS
     try:
-        return import_module("muxserve_sglang._headwise")
+        _KERNELS = import_module("muxserve_sglang._headwise")
+        return _KERNELS
     except ImportError as exc:
         raise IntegrationError(
             "KERNEL_UNAVAILABLE", "Build the Head-wise extension before starting execution groups"

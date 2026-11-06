@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
+import numpy as np
 import torch
 from sglang.srt.mem_cache.memory_pool import KVCache
 
@@ -45,6 +46,13 @@ class BoundForward:
     layer_metadata: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     metadata_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
     context_lens: torch.Tensor | None = None
+    # Reserved token capacity per request; a decode run advances within it.
+    capacities: tuple[int, ...] = ()
+    # Per-request numpy copies of ``tables`` and the uploaded padded block
+    # table. Both depend only on the frozen tables, so a decode run that
+    # advances inside its reserved capacity reuses them for every step.
+    np_tables: list | None = None
+    table_buffer: torch.Tensor | None = None
 
     @property
     def total_written(self) -> int:
@@ -159,7 +167,28 @@ class HeadwiseTokenToKVPool(KVCache):
                 used_blocks[rank].update(unique_blocks)
             tables.append(tuple(tuple(tuple(blocks) for blocks in heads)
                                 for heads in view.block_tables[self.rank]))
-        self._bound = BoundForward(mode, rows, targets, tuple(writes), tuple(starts), tuple(tables))
+        self._bound = BoundForward(mode, rows, targets, tuple(writes), tuple(starts), tuple(tables),
+                                   capacities=tuple(view.capacity_tokens for view in views))
+
+    def advance_decode(self, req_pool_indices: Sequence[int], target_lengths: Sequence[int]) -> None:
+        """Re-bind the next step of a granted decode run without re-reading views.
+
+        Only an executed DECODE binding may advance, by exactly one token per
+        request, inside the capacity reserved and fully validated at bind time.
+        """
+        bound = self.bound_forward
+        _require(bound.mode == "DECODE" and bound.batch is not None,
+                 "Only an executed decode binding can advance", "FORWARD_MISMATCH")
+        rows = _cpu_ints(req_pool_indices, "bound request rows")
+        targets = _cpu_ints(target_lengths, "bound target lengths")
+        _require(rows == bound.req_pool_indices, "Decode run rows changed", "FORWARD_MISMATCH")
+        _require(len(targets) == len(bound.target_lengths) and all(
+                     new == old + 1 and new <= min(capacity, 2048)
+                     for new, old, capacity in zip(targets, bound.target_lengths, bound.capacities)),
+                 "Decode run must append one token inside its reserved capacity", "FORWARD_MISMATCH")
+        self._bound = BoundForward("DECODE", rows, targets, (1,) * len(rows), bound.target_lengths,
+                                   bound.tables, capacities=bound.capacities,
+                                   np_tables=bound.np_tables, table_buffer=bound.table_buffer)
 
     def clear_forward(self) -> None:
         """Caller must hold the grant until all-rank GPU completion before clearing."""
@@ -207,24 +236,31 @@ class HeadwiseTokenToKVPool(KVCache):
         _require(bound.batch is not None, "ForwardBatch must be validated before layer use", "UNBOUND_FORWARD")
         if bound.metadata_buffers is None:
             # All layers retained this metadata until clear_forward already.
-            # Upload the same indices twice per forward instead of twice per
-            # layer; a leading layer dimension gives contiguous kernel views.
-            slot_layers, table_layers = [], []
-            max_pages = (max(bound.target_lengths) + 15) // 16
-            for selected_layer in range(self.start_layer, self.end_layer + 1):
-                slots, decode_tables = [], []
-                for request, (start, count, target) in enumerate(zip(
-                        bound.write_starts, bound.write_lengths, bound.target_lengths)):
-                    heads = bound.tables[request][selected_layer]
-                    for position in range(start, start + count):
-                        slots.append([blocks[position // 16] * 16 + position % 16 for blocks in heads])
-                    decode_tables.append([list(blocks[:(target + 15) // 16])
-                                          + [0] * (max_pages - (target + 15) // 16) for blocks in heads])
-                slot_layers.append(slots)
-                table_layers.append(decode_tables)
+            # At most two uploads per forward; a leading layer dimension gives
+            # contiguous kernel views. Index math runs in numpy, not per block.
+            selected = slice(self.start_layer, self.end_layer + 1)
+            layers = self.end_layer - self.start_layer + 1
+            if bound.np_tables is None:
+                bound.np_tables = [np.asarray(table, dtype=np.int64) for table in bound.tables]
+            if bound.table_buffer is None:
+                # Pad every request to the widest reserved mapping. The kernel
+                # reads only ceil(context/16) pages; unused entries are zero or
+                # blocks this request already owns.
+                max_pages = max(table.shape[2] for table in bound.np_tables)
+                padded = np.zeros((layers, len(bound.np_tables), self.head_num, max_pages), dtype=np.int32)
+                for row, table in enumerate(bound.np_tables):
+                    padded[:, row, :, :table.shape[2]] = table[selected]
+                bound.table_buffer = torch.tensor(padded, dtype=torch.int32, device=self.device)
+            slots = np.empty((layers, bound.total_written, self.head_num), dtype=np.int64)
+            offset = 0
+            for row, (start, count) in enumerate(zip(bound.write_starts, bound.write_lengths)):
+                positions = np.arange(start, start + count, dtype=np.int64)
+                pages = bound.np_tables[row][selected][:, :, positions // 16]
+                slots[:, offset:offset + count, :] = (pages * 16 + positions % 16).transpose(0, 2, 1)
+                offset += count
             bound.metadata_buffers = (
-                torch.tensor(slot_layers, dtype=torch.int64, device=self.device),
-                torch.tensor(table_layers, dtype=torch.int32, device=self.device),
+                torch.tensor(slots, dtype=torch.int64, device=self.device),
+                bound.table_buffer,
             )
         if layer_id not in bound.layer_metadata:
             offset = layer_id - self.start_layer

@@ -15,6 +15,8 @@ from types import ModuleType, SimpleNamespace
 from typing import Sequence
 import unittest
 
+import numpy
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from muxserve_sglang.contracts import IntegrationError, KVView, ModelLayout, RequestIdentity
@@ -22,6 +24,8 @@ from muxserve_sglang.contracts import IntegrationError, KVView, ModelLayout, Req
 
 class Tensor:
     def __init__(self, values, *, dtype, device='cpu'):
+        if hasattr(values, 'tolist') and not isinstance(values, (list, tuple)):
+            values = values.tolist()  # numpy arrays upload like nested lists
         self.values = deepcopy(values)
         self.dtype = dtype
         self.device = SimpleNamespace(type=str(device))
@@ -81,7 +85,7 @@ def adapter(upload):
     module = ModuleType('_metadata_adapter_check')
     sys.modules[module.__name__] = module
     namespace = module.__dict__
-    namespace.update(dataclass=dataclass, field=field, Sequence=Sequence, torch=upload,
+    namespace.update(dataclass=dataclass, field=field, Sequence=Sequence, torch=upload, np=numpy,
                      IntegrationError=IntegrationError, KVView=KVView, ModelLayout=ModelLayout)
     text = 'from __future__ import annotations\n' + '\n'.join(ast.unparse(node) for node in selected)
     exec(compile(text, 'actual-sglang-memory-methods', 'exec'), namespace)
@@ -222,6 +226,94 @@ class MetadataUploadChecks(unittest.TestCase):
             with self.subTest(corrupt=corrupt), self.assertRaises(IntegrationError):
                 pool.bind_forward(changed, (0, 1), (17, 33), 'DECODE')
             self.assertIsNone(pool._bound)
+
+
+def run_fixture(upload, start_lengths=(17, 30), steps=20, layers=4):
+    """DECODE bind whose views reserve ``steps`` more tokens than the first step."""
+    heads, ranks = 3, (0, 1, 2, 3)
+    layout = ModelLayout('m', layers, heads, ranks)
+    cursor, views = 0, []
+    for index, target in enumerate(start_lengths):
+        capacity = ((target + steps - 1 + 15) // 16) * 16
+        pages = capacity // 16
+        table = []
+        for _ in range(layers):
+            selected = []
+            for _ in range(heads):
+                selected.append(list(range(cursor, cursor + pages))[::-1])
+                cursor += pages
+            table.append(selected)
+        rank_tables = {rank: [[[block + rank * 10000 for block in blocks] for blocks in local]
+                              for local in table] for rank in ranks}
+        views.append(KVView('a-' + str(index), RequestIdentity('m', 'r-' + str(index)),
+                            capacity, target - 1, 16, rank_tables))
+    pool = adapter(upload)()
+    pool._bound = None
+    pool.layout, pool.rank = layout, 1
+    pool.layer_num, pool.head_num = layers, heads
+    pool.start_layer, pool.end_layer = 0, layers - 1
+    pool.physical_block_count = 40000
+    pool.device = 'cuda'
+    pool.bind_forward(views, list(range(len(views))), start_lengths, 'DECODE')
+    return pool, views
+
+
+def forward_for(bound):
+    return SimpleNamespace(forward_mode=SimpleNamespace(name='DECODE'),
+        batch_size=len(bound.target_lengths), req_pool_indices_cpu=list(bound.req_pool_indices),
+        seq_lens_cpu=list(bound.target_lengths),
+        input_ids=Tensor([0] * bound.total_written, dtype='int64'),
+        out_cache_loc=Tensor([0] * bound.total_written, dtype='int64'))
+
+
+class DecodeRunMetadataChecks(unittest.TestCase):
+    def test_advanced_steps_match_legacy_and_upload_the_table_once(self):
+        uploads = Uploads()
+        pool, _ = run_fixture(uploads, steps=20)
+        lengths = [17, 30]
+        table_uploads = []
+        for step in range(20):
+            bound = pool.bound_forward
+            pool.validate_forward(forward_for(bound))
+            for layer in range(4):
+                slots, tables = pool.layer_metadata(layer)
+                expected_slots, expected_tables = legacy_metadata(bound, layer)
+                self.assertEqual(slots.tolist(), expected_slots)
+                # Pages the kernel reads (ceil(context/16)) match the legacy table.
+                for row, target in enumerate(bound.target_lengths):
+                    pages = (target + 15) // 16
+                    for head in range(3):
+                        self.assertEqual(tables.tolist()[row][head][:pages],
+                                         expected_tables[row][head][:pages])
+                self.assertGreaterEqual(len(tables.tolist()[0][0]) * 16, max(bound.target_lengths))
+            table_uploads.append(bound.table_buffer)
+            if step < 19:
+                lengths = [length + 1 for length in lengths]
+                pool.advance_decode([0, 1], lengths)
+        self.assertTrue(all(buffer is table_uploads[0] for buffer in table_uploads),
+                        'A decode run must reuse its uploaded block table')
+
+    def test_advance_requires_executed_step_and_stays_inside_capacity(self):
+        uploads = Uploads()
+        pool, views = run_fixture(uploads, start_lengths=(17,), steps=3)
+        with self.assertRaises(IntegrationError):
+            pool.advance_decode([0], [18])  # Current step never executed.
+        pool.validate_forward(forward_for(pool.bound_forward))
+        with self.assertRaises(IntegrationError):
+            pool.advance_decode([0], [19])  # Must append exactly one token.
+        with self.assertRaises(IntegrationError):
+            pool.advance_decode([1], [18])  # Rows cannot change.
+        pool.advance_decode([0], [18])
+        pool.validate_forward(forward_for(pool.bound_forward))
+        pool.advance_decode([0], [19])
+        pool.validate_forward(forward_for(pool.bound_forward))
+        capacity = views[0].capacity_tokens
+        while pool.bound_forward.target_lengths[0] < capacity:
+            next_length = pool.bound_forward.target_lengths[0] + 1
+            pool.advance_decode([0], [next_length])
+            pool.validate_forward(forward_for(pool.bound_forward))
+        with self.assertRaises(IntegrationError):
+            pool.advance_decode([0], [capacity + 1])
 
 
 if __name__ == '__main__':

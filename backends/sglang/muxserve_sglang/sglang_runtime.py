@@ -135,16 +135,28 @@ class ControlledScheduler:
                  {"vocab_size": self.s.model_config.vocab_size, "eos_token_ids": eos,
                   "native_pd": True, "headwise_kv": True})
         try:
+            # Commands fetched but not yet accepted (held while a HANDOFF is
+            # pending). Long polls ask only for newer commands, and wake early
+            # when this group's broker state changes (epoch), so neither idle
+            # ranks nor pending handoffs spin on the owner.
+            backlog = []
+            epoch = None
+            wait_ms = 0
             while not self.drained:
-                commands = self.rpc("poll_commands", self.ctx.stage, self.rank, self.pid,
-                                    self.cursor, self.cursor or None)
-                for command in commands:
+                after = backlog[-1]["command_seq"] if backlog else self.cursor
+                reply = self.rpc("poll_commands_wait", self.ctx.stage, self.rank, self.pid,
+                                 after, self.cursor or None, wait_ms, epoch)
+                epoch = reply["epoch"]
+                backlog.extend(reply["commands"])
+                accepted = 0
+                while backlog:
                     # HANDOFF contains a native TP all-reduce. Every rank must
                     # complete it before consuming any later START/QUIESCE,
                     # even when command polling returns different-sized pages.
                     if self.handoff_pending is not None:
                         break
-                    self._accept(command)
+                    self._accept(backlog.pop(0))
+                    accepted += 1
                     if self.drained or self.handoff_pending is not None:
                         break
                 if self.drained:
@@ -155,8 +167,12 @@ class ControlledScheduler:
                     self.s.gracefully_exit = True
                     return
                 self._progress()
-                if not commands or self.handoff_pending is not None:
-                    time.sleep(0.005)
+                if accepted or (backlog and self.handoff_pending is None):
+                    wait_ms = 0
+                elif self.prepared or self.handoff_pending is not None:
+                    wait_ms = 20
+                else:
+                    wait_ms = 200
         except Exception as exc:
             # Never issue a QUIESCED proof after an uncertain CUDA/API failure.
             # Preserve the original error if the owner is unreachable too.
@@ -484,6 +500,8 @@ class ControlledScheduler:
         require(self.runner._muxserve_permit is None, "Prior permit still exists")
         state.started = True
         self.runner._muxserve_permit = {"grant_id": command["grant_id"], "consumed": False}
+        if state.command.get("run_steps", 1) > 1:
+            return self._start_run(command, state)
         start = time.monotonic()
         previous_output_counts = [len(req.output_ids) for req in state.reqs]
         self.s.cur_batch_for_debug = state.batch
@@ -529,6 +547,69 @@ class ControlledScheduler:
             "reservation_id": state.command["reservation_id"], "results": results,
             "gpu_forward_ms": gpu_forward_ms,
             "duration_ms": (time.monotonic() - start) * 1000})
+
+    def _start_run(self, command, state):
+        """Execute a multi-step D grant: forward, report, then continue only on
+        the owner's per-step decision (identical for every TP rank)."""
+        steps = state.command["run_steps"]
+        require(self.ctx.stage == "D" and state.command["batch_stage"] == "D"
+                and state.command["purpose"] == "GENERATE" and type(steps) is int and steps > 1,
+                "Decode runs require a D GENERATE grant")
+        start = time.monotonic()
+        start_valid = [item["target_valid_tokens"] - 1 for item in state.command["requests"]]
+        gpu_forward_ms = 0.0
+        step = 1
+        while True:
+            previous_output_counts = [len(req.output_ids) for req in state.reqs]
+            self.s.cur_batch_for_debug = state.batch
+            result = self.s.run_batch(state.batch)
+            require(result.delay_sample_func is None, "Delayed sampling is unsupported on controlled non-overlap path")
+            self.s.process_batch_result(state.batch, result)
+            require(all(len(req.output_ids) == previous + 1
+                        for req, previous in zip(state.reqs, previous_output_counts)),
+                    "Native greedy result must append exactly one token")
+            for req in state.reqs:
+                self._validate_finish(req)
+            self.sync()
+            permit = self.runner._muxserve_permit
+            require(permit["consumed"] and permit.get("gpu_timing_finished"),
+                    "Granted native forward was not consumed or timed")
+            gpu_forward_ms += permit["gpu_start_event"].elapsed_time(permit["gpu_end_event"])
+            results = [{"request_id": item["request_id"], "attempt": item["attempt"],
+                        "token_id": req.output_ids[-1], "valid_tokens": valid + step}
+                       for req, item, valid in zip(state.reqs, state.command["requests"], start_valid)]
+            finished = any(req.finished() for req in state.reqs)
+            reply = self.rpc("decode_step", self.rank, self.pid, command["batch_id"], step,
+                             results, finished)
+            if finished or step >= steps or reply.get("continue") is not True:
+                break
+            step += 1
+            self._advance_run(state, start_valid, step, command["grant_id"])
+        self.s.cur_batch_for_debug = None
+        self._report(command["batch_id"], "GPU_DONE", {
+            "reservation_id": state.command["reservation_id"], "results": results,
+            "gpu_forward_ms": gpu_forward_ms, "duration_ms": (time.monotonic() - start) * 1000,
+            "steps": step})
+
+    def _advance_run(self, state, start_valid, step, grant_id):
+        """Prepare decode step ``step`` locally, exactly as a fresh per-token
+        PREPARE would, inside the KV capacity already reserved for the run."""
+        for req, valid in zip(state.reqs, start_valid):
+            require(not req.finished() and req.kv.holds_kv
+                    and req.kv.kv_committed_len == valid + step - 1
+                    and len(req.origin_input_ids) + len(req.output_ids) - 1 == req.kv.kv_committed_len,
+                    "D request does not own the next run boundary")
+        state.batch = self._new_batch(state.reqs)
+        self._initialize_decode_metadata(state.batch)
+        state.batch.prepare_for_decode()
+        set_schedule_time_batch(state.batch)
+        rows = [req.kv.req_pool_idx for req in state.reqs]
+        targets = [valid + step for valid in start_valid]
+        self.pool.advance_decode(rows, targets)
+        require(tuple(state.batch.req_pool_indices_cpu.tolist()) == tuple(rows)
+                and tuple(state.batch.seq_lens_cpu.tolist()) == tuple(targets),
+                "Native CPU row/length metadata differs from the run step")
+        self.runner._muxserve_permit = {"grant_id": grant_id, "consumed": False}
 
     def _validate_finish(self, req):
         # Native precedence is EOS/stop token before length (same as owner).

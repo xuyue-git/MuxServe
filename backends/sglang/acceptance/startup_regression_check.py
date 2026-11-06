@@ -5,6 +5,7 @@ with lightweight buffer stand-ins; this does not test Torch math or CUDA IPC.
 RPC tests use real AF_UNIX sockets, authentication and request frames on Linux.
 """
 from __future__ import annotations
+import numpy
 
 import ast
 from collections import OrderedDict
@@ -59,7 +60,7 @@ class EagerForwardChecks(unittest.TestCase):
             tensor=lambda values, **kwargs: Tensor(len(values)),
             cuda=SimpleNamespace(Event=Event, is_current_stream_capturing=lambda: False))
         self.namespace = dict(__name__=__name__, dataclass=dataclass, field=field, replace=replace,
-            KVCache=object, AttentionBackend=object, BaseRunner=object, torch=self.torch,
+            KVCache=object, AttentionBackend=object, BaseRunner=object, torch=self.torch, np=numpy,
             IntegrationError=IntegrationError,
             envs=SimpleNamespace(SGLANG_EAGER_INPUT_NO_COPY=SimpleNamespace(get=lambda: self.no_copy)))
         for path, class_name, methods in (
