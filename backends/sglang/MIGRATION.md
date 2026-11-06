@@ -24,9 +24,9 @@ The older project's independent history remains in that repository.
 To inspect only this migration, run:
 
 ```bash
-git log --reverse --oneline 2f7172a..main
-git diff --stat 2f7172a..main
-git diff 2f7172a..main -- backends/sglang
+git log --reverse --oneline 2f7172a..HEAD
+git diff --stat 2f7172a..HEAD
+git diff 2f7172a..HEAD -- backends/sglang
 ```
 
 ## Functional mapping
