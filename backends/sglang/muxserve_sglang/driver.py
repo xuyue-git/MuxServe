@@ -32,10 +32,17 @@ class ControllerDriver:
         self.thread.start()
 
     def run(self):
+        # Wake on controller activity (reports, decode steps, submissions,
+        # commands); the timeout keeps deadline/watchdog ticks periodic.
+        wake = getattr(self.controller, "wake", None)
         try:
             while not self.stop_event.is_set():
                 self.step()
-                self.stop_event.wait(0.005)
+                if wake is None:
+                    self.stop_event.wait(0.005)
+                else:
+                    wake.wait(0.02)
+                    wake.clear()
         except Exception as exc:
             # No cleanup/rollback proof follows an unknown driver failure.
             self.failure = exc
@@ -73,23 +80,45 @@ class ControllerDriver:
             for proposal in proposals["suggestions"]:
                 self._prepare(proposal)
 
+    def _run_steps(self, proposal, outputs):
+        limit = getattr(self.config, "decode_run_steps", 1)
+        if proposal.stage != "D" or proposal.purpose != "GENERATE" or limit <= 1:
+            return 1
+        maximum = self.config.max_new_tokens
+        remaining = []
+        with self.controller.lock:
+            for output in outputs:
+                request = self.controller.requests.get((proposal.model_id, output["request_id"]))
+                budget = request.spec.max_new_tokens if request is not None else maximum
+                remaining.append(budget - output["output_count"])
+        return max(1, min([limit] + remaining))
+
     def _prepare(self, proposal):
         candidates = proposal.request_ids
         request_ids = candidates
+        steps = None
         while request_ids:
             try:
                 outputs = [self.controller.request_output(proposal.model_id, identity)
                            for identity in request_ids]
+                if steps is None:
+                    steps = self._run_steps(proposal, outputs)
                 plan = BatchPlan(
                     self.controller.group_id(proposal.model_id), uuid4().hex,
                     proposal.model_id, proposal.stage,
                     tuple(RequestRef(output["request_id"], output["attempt"], output["output_count"])
                           for output in outputs),
-                    purpose=proposal.purpose, prepare_timeout_ms=self.config.prepare_timeout_ms)
+                    purpose=proposal.purpose, prepare_timeout_ms=self.config.prepare_timeout_ms,
+                    steps=min(steps, self._run_steps(proposal, outputs)))
                 self.controller.prepare_batch(plan)
                 self.pending.add((proposal.model_id, plan.batch_id))
                 return
             except IntegrationError as exc:
+                if exc.code == "OUT_OF_CAPACITY" and steps is not None and steps > 1:
+                    # A shorter run needs less reserved KV; fall back to one step
+                    # before shrinking the request set.
+                    steps = 1
+                    continue
                 if exc.code == "OUT_OF_CAPACITY" and len(request_ids) > 1:
                     request_ids = request_ids[:-1]
                     continue
@@ -108,6 +137,9 @@ class ControllerDriver:
 
     def stop(self):
         self.stop_event.set()
+        wake = getattr(self.controller, "wake", None)
+        if wake is not None:
+            wake.set()
         self.thread.join()
 
     def pause(self):
