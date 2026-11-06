@@ -116,6 +116,9 @@ class DeploymentConfig:
     queue_limit: int = 4096
     runtime_dir: str = ""
     asset_lock_dir: str = ""
+    # Maximum consecutive decode forwards under one D grant. 1 is the original
+    # per-token protocol; larger runs still yield at every step boundary.
+    decode_run_steps: int = 1
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -143,7 +146,7 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
     integer_limits = ("tp_size", "batch_history_limit", "kv_bytes_per_rank", "extra_headroom_bytes_per_rank",
                       "max_model_inflight", "credit_multiplier", "max_input_tokens",
                       "max_new_tokens", "max_context_tokens", "request_timeout_ms",
-                      "prepare_timeout_ms", "controller_port", "queue_limit")
+                      "prepare_timeout_ms", "controller_port", "queue_limit", "decode_run_steps")
     if any(type(getattr(config, name)) is not int or getattr(config, name) <= 0
            for name in integer_limits):
         raise IntegrationError("INVALID_CONFIG", "Deployment limits must be positive integers")
@@ -155,6 +158,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "Request deadline must be 1000..300000 ms for native integer seconds")
     if config.prepare_timeout_ms > 120000:
         raise IntegrationError("INVALID_CONFIG", "Preparation deadline must be at most 120000 ms")
+    if config.decode_run_steps > config.max_new_tokens:
+        raise IntegrationError("INVALID_CONFIG", "Decode run length exceeds the output budget")
     if config.queue_limit > 100000:
         raise IntegrationError("INVALID_CONFIG", "Queue limit exceeds the bounded lifetime ceiling")
     if config.tp_size not in (1, 2, 4):

@@ -95,6 +95,9 @@ class BatchPlan:
     requests: tuple[RequestRef, ...]
     purpose: str = "GENERATE"
     prepare_timeout_ms: int = 30000
+    # D only: number of consecutive decode forwards granted by one reservation.
+    # 1 keeps the original one-token grant protocol unchanged.
+    steps: int = 1
 
 
 @dataclass(frozen=True)

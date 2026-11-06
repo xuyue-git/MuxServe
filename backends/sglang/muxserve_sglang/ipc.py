@@ -103,6 +103,11 @@ class _DeadlineConnection:
                 self.remaining()
                 return
 
+    def wait_readable(self, timeout_s: float) -> bool:
+        """Idle wait between requests on a persistent connection (no deadline)."""
+        self._poller.register(self._socket, select.POLLIN)
+        return bool(self._poller.poll(max(1, int(timeout_s * 1000))))
+
     def _receive(self, length: int) -> bytes:
         data = bytearray(length)
         view = memoryview(data)
@@ -271,48 +276,97 @@ def _connect_unix(address: str, deadline: float) -> socket.socket:
 
 
 class StorageRPCClient:
+    """Mutually authenticated client that keeps one connection per process.
+
+    Authentication happens once per connection, not once per call. Any
+    transport, framing or deadline error closes the connection: the result of
+    that call stays uncertain exactly as before, and the next call reconnects
+    and authenticates again. A forked child never reuses its parent's socket.
+    """
+
     def __init__(self, address: str, authkey: bytes, timeout_s: float = 30.0):
         _validate_options(authkey, timeout_s)
         self.address = _validate_endpoint(address)
         self._authkey = authkey
         self.timeout_s = timeout_s
+        self._lock = Lock()
+        self._state: tuple[int, Connection, _DeadlineConnection] | None = None
 
-    def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
-        if not isinstance(method, str) or not method or method.startswith("_"):
-            raise IntegrationError("INVALID_ARGUMENT", "Explicit RPC method required")
+    def _drop(self) -> None:
+        state, self._state = self._state, None
+        if state is None:
+            return
+        pid, conn, timed = state
+        timed.close()
+        conn.close()
+
+    def _connection(self, deadline: float) -> _DeadlineConnection:
+        if self._state is not None and self._state[0] != os.getpid():
+            # Inherited descriptor: closing it here only affects this process.
+            self._drop()
+        if self._state is not None:
+            timed = self._state[2]
+            timed.deadline = deadline
+            return timed
         _validate_endpoint(self.address)
-        deadline = time.monotonic() + self.timeout_s
-        sock = None
-        conn = None
-        timed = None
+        sock = conn = timed = None
         try:
             sock = _connect_unix(self.address, deadline)
             conn = Connection(sock.detach())
             timed = _DeadlineConnection(conn, deadline)
             answer_challenge(timed, self._authkey)
             deliver_challenge(timed, self._authkey)
-            timed.send_bytes(_encode({"method": method, "args": args, "kwargs": kwargs}))
-            response = pickle.loads(timed.recv_bytes(_MAX_MESSAGE_BYTES))
-            if not isinstance(response, dict) or "ok" not in response:
-                raise IntegrationError("RPC_PROTOCOL", "Malformed storage response")
-            if not response["ok"]:
-                raise IntegrationError(response["code"], response["message"])
-            return response["result"]
-        except IntegrationError:
-            raise
-        except AuthenticationError as exc:
-            raise IntegrationError("AUTHENTICATION_FAILED", "Local storage authentication failed") from exc
-        except socket.timeout as exc:
-            raise IntegrationError("RPC_TIMEOUT", "Local RPC deadline expired; result may be uncertain") from exc
-        except (OSError, EOFError, pickle.PickleError) as exc:
-            raise IntegrationError("RPC_UNAVAILABLE", "Local RPC failed; result may be uncertain") from exc
-        finally:
+        except BaseException:
             if timed is not None:
                 timed.close()
             if conn is not None:
                 conn.close()
             if sock is not None:
                 sock.close()
+            raise
+        self._state = (os.getpid(), conn, timed)
+        return timed
+
+    def close(self) -> None:
+        with self._lock:
+            self._drop()
+
+    def __del__(self):
+        try:
+            self._drop()
+        except Exception:
+            pass
+
+    def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if not isinstance(method, str) or not method or method.startswith("_"):
+            raise IntegrationError("INVALID_ARGUMENT", "Explicit RPC method required")
+        with self._lock:
+            deadline = time.monotonic() + self.timeout_s
+            try:
+                request = _encode({"method": method, "args": args, "kwargs": kwargs})
+                timed = self._connection(deadline)
+                timed.send_bytes(request)
+                response = pickle.loads(timed.recv_bytes(_MAX_MESSAGE_BYTES))
+                if not isinstance(response, dict) or "ok" not in response:
+                    raise IntegrationError("RPC_PROTOCOL", "Malformed storage response")
+            except IntegrationError:
+                self._drop()
+                raise
+            except AuthenticationError as exc:
+                self._drop()
+                raise IntegrationError("AUTHENTICATION_FAILED", "Local storage authentication failed") from exc
+            except socket.timeout as exc:
+                self._drop()
+                raise IntegrationError("RPC_TIMEOUT", "Local RPC deadline expired; result may be uncertain") from exc
+            except (OSError, EOFError, pickle.PickleError) as exc:
+                self._drop()
+                raise IntegrationError("RPC_UNAVAILABLE", "Local RPC failed; result may be uncertain") from exc
+            except BaseException:
+                self._drop()
+                raise
+        if not response["ok"]:
+            raise IntegrationError(response["code"], response["message"])
+        return response["result"]
 
     # Explicit methods match the logical store, convenient for controller use.
     def register_model(self, *args: Any, **kwargs: Any) -> Any:
@@ -421,7 +475,10 @@ class StorageRPCServer:
                 raise IntegrationError("INVALID_ARGUMENT", "Invalid explicit owner RPC extension")
             self._methods[name] = method
         self._stop = Event()
-        self._workers = BoundedSemaphore(32)
+        self._closing_handlers = False
+        # Each authenticated rank keeps one persistent connection (24 ranks for
+        # three TP4 P/D groups). Operation concurrency stays bounded separately.
+        self._workers = BoundedSemaphore(256)
         self._connections: set[Connection] = set()
         self._connection_lock = Lock()
         self._handlers_done = Event()
@@ -502,7 +559,9 @@ class StorageRPCServer:
                 raise
             finally:
                 self._listener.close()
-                # Admitted native workers must finish before any close barrier.
+                # Idle persistent handlers exit at their next wakeup; admitted
+                # native workers must still finish before any close barrier.
+                self._closing_handlers = True
                 self._handlers_done.wait()
         except BaseException:
             self._mark_failure("RPC_LISTENER_FAILED")
@@ -520,27 +579,50 @@ class StorageRPCServer:
                                         time.monotonic() + self.timeout_s, pending)
             deliver_challenge(timed, self._authkey)
             answer_challenge(timed, self._authkey)
-            try:
-                request = pickle.loads(timed.recv_bytes(_MAX_MESSAGE_BYTES))
-                if (not isinstance(request, dict) or set(request) != {"method", "args", "kwargs"}
-                        or not isinstance(request["method"], str)
-                        or not isinstance(request["args"], tuple) or not isinstance(request["kwargs"], dict)):
-                    raise IntegrationError("RPC_PROTOCOL", "Malformed storage request")
-                method = self._methods.get(request["method"])
-                if method is None:
-                    raise IntegrationError("METHOD_NOT_ALLOWED", "Storage RPC method is not exported")
-                # An operation that outlives a deadline may still mutate storage;
-                # reservation/consumer references therefore remain pinned.
-                result = _bounded(lambda: method(*request["args"], **request["kwargs"]),
-                                  timed.remaining(), pending=pending)
-                response = {"ok": True, "result": result}
-            except IntegrationError as exc:
-                response = {"ok": False, "code": exc.code, "message": str(exc)}
-            except (TypeError, ValueError, pickle.PickleError):
-                response = {"ok": False, "code": "INVALID_ARGUMENT", "message": "Invalid storage RPC arguments"}
-            except Exception:
-                response = {"ok": False, "code": "INTERNAL_ERROR", "message": "Storage owner operation failed"}
-            timed.send_bytes(_encode(response))
+            first = True
+            while True:
+                if not first:
+                    # Persistent connection: wait for the next request without
+                    # a deadline, but leave promptly once the owner stops.
+                    while not timed.wait_readable(0.2):
+                        if self._stop.is_set() or self._closing_handlers:
+                            return
+                    if self._stop.is_set():
+                        return
+                    timed.deadline = time.monotonic() + self.timeout_s
+                first = False
+                uncertain = False
+                try:
+                    request = pickle.loads(timed.recv_bytes(_MAX_MESSAGE_BYTES))
+                    if (not isinstance(request, dict) or set(request) != {"method", "args", "kwargs"}
+                            or not isinstance(request["method"], str)
+                            or not isinstance(request["args"], tuple) or not isinstance(request["kwargs"], dict)):
+                        raise IntegrationError("RPC_PROTOCOL", "Malformed storage request")
+                    method = self._methods.get(request["method"])
+                    if method is None:
+                        raise IntegrationError("METHOD_NOT_ALLOWED", "Storage RPC method is not exported")
+                    # An operation that outlives a deadline may still mutate storage;
+                    # reservation/consumer references therefore remain pinned.
+                    try:
+                        result = _bounded(lambda: method(*request["args"], **request["kwargs"]),
+                                          timed.remaining(), pending=pending)
+                    except IntegrationError as exc:
+                        uncertain = exc.code == "RPC_TIMEOUT"
+                        raise
+                    response = {"ok": True, "result": result}
+                except (EOFError, OSError):
+                    return  # Peer closed or transport failed; no request to answer.
+                except IntegrationError as exc:
+                    response = {"ok": False, "code": exc.code, "message": str(exc)}
+                except (TypeError, ValueError, pickle.PickleError):
+                    response = {"ok": False, "code": "INVALID_ARGUMENT", "message": "Invalid storage RPC arguments"}
+                except Exception:
+                    response = {"ok": False, "code": "INTERNAL_ERROR", "message": "Storage owner operation failed"}
+                timed.send_bytes(_encode(response))
+                if uncertain or self._stop.is_set():
+                    # A timed-out operation may still be running: end this
+                    # connection and keep the handler pinned in finally.
+                    return
         except Exception:
             # Authentication failures / disconnects never log secrets and never
             # remove consumer leases or roll back uncertain running batches.
