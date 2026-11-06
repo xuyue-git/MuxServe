@@ -226,13 +226,14 @@ class HeadwiseStore:
                     model_id = allocation.identity.model_id
                     source = (self._model_free[model_id][rank] if self._pool_mode == "static"
                               else self._free[rank])
-                    available = iter(sorted(source))
-                    chosen = []
+                    # Same assignment as taking ascending free blocks one by
+                    # one: each (layer, head) receives the next ``groups``.
+                    chosen = sorted(source)[:groups * sum(len(heads) for heads in layers)]
+                    offset = 0
                     for heads in layers:
                         for blocks in heads:
-                            added = [next(available) for _ in range(groups)]
-                            blocks.extend(added)
-                            chosen.extend(added)
+                            blocks.extend(chosen[offset:offset + groups])
+                            offset += groups
                     self._free[rank].difference_update(chosen)
                     if self._pool_mode == "static":
                         self._model_free[model_id][rank].difference_update(chosen)

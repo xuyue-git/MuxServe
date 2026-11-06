@@ -270,8 +270,7 @@ def main():
     expected = [token_for(i) for i in range(args.output_len)]
     for m in MODELS:
         assert result["first_output_ids"][m] == expected, (m, result["first_output_ids"][m][:8])
-    overall = result["summary"]["overall"]
-    tpot = statistics_line = {m: round(s["mean_tpot_s"] * 1000, 2) for m, s in result["summary"]["models"].items()}
+    tpot = {m: round(s["mean_tpot_s"] * 1000, 2) for m, s in result["summary"]["models"].items()}
     print("E2E_PASS run_steps=%d mean_tpot_ms=%s (simulated GPU %.1f ms) ttft_ms=%s" % (
         args.run_steps, tpot, DECODE_S * 1000,
         {m: round(s["mean_ttft_s"] * 1000, 1) for m, s in result["summary"]["models"].items()}))

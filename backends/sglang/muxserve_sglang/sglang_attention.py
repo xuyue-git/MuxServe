@@ -22,6 +22,9 @@ class HeadwiseAttentionBackend(AttentionBackend):
         self.token_to_kv_pool = runner.token_to_kv_pool
         self.data_type = self.kv_cache_dtype = torch.float16
         self.forward_metadata = None
+        # Static per-layer configuration is validated once per layer object;
+        # tensors, shapes and the bound grant are still checked on every call.
+        self._validated_layers = set()
 
     def init_forward_metadata(self, forward_batch):
         _require(not torch.cuda.is_current_stream_capturing(), "CUDA graphs are unsupported")
@@ -47,12 +50,27 @@ class HeadwiseAttentionBackend(AttentionBackend):
         _require(not torch.cuda.is_current_stream_capturing(), "CUDA graphs are unsupported")
         bound = self.token_to_kv_pool.validate_forward(forward_batch)
         _require(save_kv_cache and not kwargs, "Each granted layer must write its K/V without extra options")
-        xai_temperature_len = getattr(layer, "xai_temperature_len", -1)
-        _require(xai_temperature_len is None or xai_temperature_len <= 0,
-                 "xAI temperature attention is unsupported")
         _require(not getattr(forward_batch, "mha_return_lse", False),
                  "MHA log-sum-exp output is unsupported")
         heads = self.token_to_kv_pool.head_num
+        if id(layer) not in self._validated_layers:
+            self._validate_layer(layer, heads)
+            self._validated_layers.add(id(layer))
+        expected = (bound.total_written, heads, 128)
+        shaped = []
+        for tensor in (q, k, v):
+            _require(isinstance(tensor, torch.Tensor), "Q/K/V must all be present")
+            _require(tensor.dtype == torch.float16 and tensor.device == self.token_to_kv_pool.device,
+                     "Q/K/V must use the imported pool CUDA device and FP16")
+            _require(tuple(tensor.shape) in (expected, (expected[0], heads * 128)),
+                     "Q/K/V geometry mismatch")
+            shaped.append(tensor.reshape(expected).contiguous())
+        return bound, shaped
+
+    def _validate_layer(self, layer, heads):
+        xai_temperature_len = getattr(layer, "xai_temperature_len", -1)
+        _require(xai_temperature_len is None or xai_temperature_len <= 0,
+                 "xAI temperature attention is unsupported")
         _require(layer.tp_q_head_num == layer.tp_k_head_num == layer.tp_v_head_num == heads
                  and layer.head_dim == layer.qk_head_dim == layer.v_head_dim == 128,
                  "Only local MHA with H128 is supported")
@@ -64,16 +82,6 @@ class HeadwiseAttentionBackend(AttentionBackend):
                  "KV quantization/scales are unsupported")
         _require(isinstance(layer.scaling, (float, int)) and math.isfinite(layer.scaling)
                  and layer.scaling > 0, "Invalid attention scale")
-        expected = (bound.total_written, heads, 128)
-        shaped = []
-        for tensor in (q, k, v):
-            _require(isinstance(tensor, torch.Tensor), "Q/K/V must all be present")
-            _require(tensor.dtype == torch.float16 and tensor.device == self.token_to_kv_pool.device,
-                     "Q/K/V must use the imported pool CUDA device and FP16")
-            _require(tuple(tensor.shape) in (expected, (expected[0], heads * 128)),
-                     "Q/K/V geometry mismatch")
-            shaped.append(tensor.reshape(expected).contiguous())
-        return bound, shaped
 
     def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
         bound, (q, k, v) = self._inputs(q, k, v, layer, forward_batch, save_kv_cache, kwargs)
