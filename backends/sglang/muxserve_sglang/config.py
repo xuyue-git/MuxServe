@@ -55,73 +55,9 @@ def safe_path(value: str | Path) -> Path:
     return resolved
 
 
-_READ_ONLY_SHARED_MODELS = tuple(
-    (Path("/home/LAB/yezr/models/huggyllama") / name,
-     Path("/home/incoming/Models/huggyllama") / name)
-    for name in ("llama-7b", "llama-13b", "llama-30b")
-)
-
-
 def read_asset_path(value: str | Path) -> Path:
-    """Read approved model entries through their public alias; never use for outputs."""
-    path = Path(os.path.expanduser(os.fspath(value)))
-    if os.name != "posix" or not path.is_absolute() or ".." in path.parts:
-        return safe_path(value)
-    match = next(((alias, target) for alias, target in _READ_ONLY_SHARED_MODELS
-                  if path == alias or alias in path.parents), None)
-    if match is None:
-        return safe_path(value)
-    alias, expected_target = match
-    if safe_path(alias.parent) != alias.parent:
-        raise IntegrationError("FORBIDDEN_PATH", "Shared model parent has changed")
-    try:
-        target = os.readlink(alias)
-    except OSError as exc:
-        if exc.errno in (errno.EINVAL, errno.ENOENT, errno.ENOTDIR):
-            return safe_path(value)
-        raise
-    if Path(target) != expected_target:
-        raise IntegrationError("FORBIDDEN_PATH", "Shared model link target has changed")
-
-    # Retain the approved alias in every filesystem operation and returned path.
-    pending = deque(path.relative_to(alias).parts)
-    resolved: list[str] = []
-    hops = 0
-    while pending:
-        part = pending.popleft()
-        if part in ("", "."):
-            continue
-        if part == "..":
-            if not resolved:
-                raise IntegrationError("FORBIDDEN_PATH", "Asset link leaves its model directory")
-            resolved.pop()
-            continue
-        candidate = alias.joinpath(*resolved, part)
-        try:
-            target = os.readlink(candidate)
-        except OSError as exc:
-            if exc.errno not in (errno.EINVAL, errno.ENOENT, errno.ENOTDIR):
-                raise
-            resolved.append(part)
-            continue
-        hops += 1
-        if hops > 40:
-            raise IntegrationError("INVALID_PATH", "Too many symbolic-link hops")
-        target_path = Path(target)
-        if target_path.is_absolute():
-            for base in (alias, expected_target):
-                try:
-                    relative = target_path.relative_to(base)
-                except ValueError:
-                    continue
-                resolved.clear()
-                pending.extendleft(reversed(relative.parts))
-                break
-            else:
-                raise IntegrationError("FORBIDDEN_PATH", "Asset link leaves its model directory")
-        else:
-            pending.extendleft(reversed(target_path.parts))
-    return alias.joinpath(*resolved)
+    """Resolve an explicit asset path through the common protected resolver."""
+    return safe_path(value)
 
 
 def asset_lock_path(root: str | Path, lock_dir: str = "") -> Path:
@@ -132,11 +68,9 @@ def asset_lock_path(root: str | Path, lock_dir: str = "") -> Path:
     if not isinstance(lock_dir, str) or not Path(lock_dir).is_absolute():
         raise IntegrationError("INVALID_CONFIG", "asset_lock_dir must be an absolute personal directory")
     directory = safe_path(lock_dir)
-    identity = next((target / root.relative_to(alias) for alias, target in _READ_ONLY_SHARED_MODELS
-                     if root == alias or alias in root.parents), root)
-    if any(directory == asset or asset in directory.parents for asset in (root, identity)):
+    if directory == root or root in directory.parents:
         raise IntegrationError("INVALID_CONFIG", "Asset locks must be outside model/tokenizer directories")
-    name = hashlib.sha256(os.fsencode(identity)).hexdigest() + ".json"
+    name = hashlib.sha256(os.fsencode(root)).hexdigest() + ".json"
     path = directory / name
     if path.is_symlink():
         raise IntegrationError("INVALID_CONFIG", "Personal asset lock files must not be symbolic links")
