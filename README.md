@@ -134,3 +134,9 @@ sudo bash scripts/stop_mps.sh examples/basic/mps
   year={2024}
 }
 ```
+
+## Optional SGLang backend
+
+This fork adds an independent [SGLang Head-wise backend](backends/sglang/README.md).
+The original MuxServe/vLLM code and history are preserved. See the
+[migration and original-code comparison](backends/sglang/MIGRATION.md) for scope and validation limits.
