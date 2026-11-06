@@ -8,6 +8,7 @@ import socket
 import sys
 import tempfile
 import time
+import threading
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -133,6 +134,32 @@ class AdmissionChecks(unittest.TestCase):
         self.assertEqual(len(self.calls), 192)
         self.assertEqual(len(set(self.calls)), 192)
 
+
+    def test_persistent_connection_reaps_each_call_worker(self):
+        # Finished but unjoined threads are not "alive", yet keep OS resources
+        # (stacks); a persistent handler must join each call's worker.
+        import muxserve_sglang.ipc as ipc_module
+        started, joined = [], set()
+        class Tracked(ipc_module.Thread):
+            def start(self):
+                started.append(self)
+                return super().start()
+            def join(self, *args, **kwargs):
+                joined.add(id(self))
+                return super().join(*args, **kwargs)
+        client = StorageRPCClient(self.address, self.key, 4)
+        client.call('once', 'warm')
+        original = ipc_module.Thread
+        ipc_module.Thread = Tracked
+        try:
+            for index in range(200):
+                self.assertEqual(client.call('once', index), index)
+        finally:
+            ipc_module.Thread = original
+        workers = [thread for thread in started if thread.name != 'storage-owner-lifetime-keeper']
+        self.assertGreaterEqual(len(workers), 200)
+        self.assertLessEqual(sum(id(thread) not in joined for thread in workers), 1)
+        client.close()
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

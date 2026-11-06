@@ -618,6 +618,13 @@ class StorageRPCServer:
                     response = {"ok": False, "code": "INVALID_ARGUMENT", "message": "Invalid storage RPC arguments"}
                 except Exception:
                     response = {"ok": False, "code": "INTERNAL_ERROR", "message": "Storage owner operation failed"}
+                if not uncertain:
+                    # The operation has returned; reap its worker now. Unjoined
+                    # threads keep OS resources, and a persistent connection
+                    # serves many calls before its handler's finally runs.
+                    for worker in pending:
+                        worker.join()
+                    pending.clear()
                 timed.send_bytes(_encode(response))
                 if uncertain or self._stop.is_set():
                     # A timed-out operation may still be running: end this

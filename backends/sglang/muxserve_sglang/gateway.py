@@ -409,6 +409,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.finish_admission(self.connection)
         path = urlsplit(self.path).path
+        if path == "/metrics":
+            # Bounded controller telemetry (cumulative per-stage timing totals).
+            self._json(200, self.server.state.controller.metrics())
+            return
         if path not in ("/health", "/status"):
             self._json(404, {"error": "Unknown endpoint"})
             return
