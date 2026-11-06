@@ -56,10 +56,25 @@ python -I -B tools/check_cpu.py
 These checks exercise CPU storage, control, transport and source contracts.
 They do not load model weights or validate CUDA execution/performance.
 
+## Decode runs and control-plane performance
+
+`decode_run_steps` (default 1 = original per-token grants; the sample config
+uses 128) lets one D grant cover several consecutive decode forwards. KV for
+the whole run is reserved once; every TP rank reports each step through
+`decode_step`, a token is published once all ranks agree, and one memoized
+continue decision per step keeps ranks in lockstep. A run yields at the next
+step boundary when a prefill waits for credits, cancellation/timeout arrives,
+or capacity recovery protects another request. Ranks keep one authenticated
+RPC connection, long-poll their commands, and the driver wakes on controller
+activity instead of polling. `tools/bench_fixed.py` reproduces the fixed
+512/128 closed-loop point against the gateway (`/metrics` exposes the
+controller's per-stage totals); `acceptance/control_plane_e2e_check.py` runs
+the full control plane with simulated rank processes on CPU.
+
 ## Known limitations
 
-The copied runtime retains its existing per-token control overhead. KV
-mapping caching and RPC optimizations have not been implemented. The sample
+CUDA graphs, overlap scheduling and custom all-reduce remain disabled. Each
+run start still ships and validates the complete multi-rank KV view once. The sample
 configuration uses D30 for 7B and D40 for 13B/30B; it is not the all-D40 paired
 experiment configuration. Asset paths now use the common protected resolver,
 with no hardcoded lab model aliases. No original-paper performance reproduction

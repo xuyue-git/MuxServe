@@ -52,5 +52,6 @@
       "decode_port": 18203,
       "bootstrap_port": 18303
     }
-  ]
+  ],
+  "decode_run_steps": 128
 }

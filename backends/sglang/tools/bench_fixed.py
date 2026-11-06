@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import os
 import random
 import statistics
 import sys
@@ -43,10 +44,15 @@ def get_json(port: int, path: str, timeout: float = 10.0):
         connection.close()
 
 
-def wait_ready(port: int, timeout_s: float) -> None:
+def wait_ready(port: int, timeout_s: float, supervisor_pid: int | None = None) -> None:
     deadline = time.monotonic() + timeout_s
     last = None
     while time.monotonic() < deadline:
+        if supervisor_pid is not None:
+            try:
+                os.kill(supervisor_pid, 0)
+            except ProcessLookupError:
+                raise SystemExit(f"Launcher PID {supervisor_pid} exited before the gateway became ready")
         try:
             status, body = get_json(port, "/health", 5)
             if status == 200 and body and body.get("ready"):
@@ -156,10 +162,11 @@ def main() -> None:
     parser.add_argument("--request-timeout", type=float, default=600)
     parser.add_argument("--out", required=True)
     parser.add_argument("--reference", help="earlier result JSON whose output tokens must match")
+    parser.add_argument("--supervisor-pid", type=int, help="abort the readiness wait if this PID exits")
     args = parser.parse_args()
     models = [m for m in args.models.split(",") if m]
     input_ids = synthetic_input(args.input_len, args.seed)
-    wait_ready(args.port, args.ready_timeout)
+    wait_ready(args.port, args.ready_timeout, args.supervisor_pid)
     print(f"BENCH_READY models={models} input={args.input_len} output={args.output_len}", flush=True)
 
     def run(phase: str, count: int) -> dict:
