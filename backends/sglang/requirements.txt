@@ -1,0 +1,9 @@
+# Install the pinned patched third_party/sglang first, in an isolated A100 environment.
+# CUDA 13.2 toolkit and its compatible PyTorch wheel are deployment prerequisites.
+torch==2.13.0
+torchaudio==2.11.0
+torchvision==0.28.0
+transformers==5.12.1
+sglang-kernel==0.4.7
+# Existing SGLang dependency; benchmark HTTP framing uses the same client.
+aiohttp

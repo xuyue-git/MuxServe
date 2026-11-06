@@ -1,0 +1,13 @@
+SGLang Head-wise backend
+
+Runtime source migrated from xuyue-git/MuxServe-SGLang-Head_wise_cache
+at a512d05496122521fb16fa620aa44d8f4d4d3d18.
+Scheduling rules derive from MuxServe
+9fb0fa555bb4051bee612b72938e5d85796dffec.
+Head-wise CUDA sources derive from MuxServe-vLLM
+eaca02eb1a8c3654fa086594e271f4e1e09dede4; existing NVIDIA, vLLM and
+FasterTransformer source notices and native/headwise/LICENSE are retained.
+The external SGLang source is v0.5.20,
+94602c9c2b7cbdb8efd5c52802dac6a1c180089e, under Apache-2.0.
+The parent fork retains its upstream LICENSE.txt.
+No CrossPool source is included in this core preview.

@@ -1,0 +1,62 @@
+{
+  "python/sglang/srt/managers/tp_worker.py": {
+    "source_sha256": "3fd8496b1d7b122bfc30edf9f31b9529e96903fc0da26b7217beb29054044f12",
+    "patched_sha256": "62ab1acc455f166ecb77fc6fd4dda8954c13d659857cf66a6eab16858b2fd491"
+  },
+  "python/sglang/srt/model_executor/model_runner.py": {
+    "source_sha256": "df38e26ace5deae708f2353b56962afab7f92fac35d1bd4f274b7d6d62356372",
+    "patched_sha256": "5b0453ad78b8c6e428f27eb50cf367a254e25787d1afea9e653d27626bd7e966",
+    "upgrade_from": {
+      "2d6acd21eaaa287b2b495462025baaa2bdfe9cfad3f2b4ffa04588ece83ddccc": [
+        [
+          "        return output\n\n    def _maybe_execute_deferred_mamba_cow_and_clear(",
+          "        from muxserve_sglang.sglang_hooks import finish_forward_timing\n        finish_forward_timing(self)\n        return output\n\n    def _maybe_execute_deferred_mamba_cow_and_clear("
+        ]
+      ]
+    }
+  },
+  "python/sglang/srt/model_loader/loader.py": {
+    "source_sha256": "69043753c6158f200c17ffda174282cef62430320d3d7caab361c39426a1902e",
+    "patched_sha256": "3db185c607164bfb9ede47ad442d4f7d1c74fc6b5452b9a2e381b66d3c2e89e4"
+  },
+  "python/sglang/srt/managers/scheduler.py": {
+    "source_sha256": "439ee96dd785fbb63a9f139b192cec984c252df16a573a436877f0ef9a4ca045",
+    "patched_sha256": "b6502486b41003ce3232e4ffa4d9bb16e80cbdfe8dbb86332bf07399d2419fac"
+  },
+  "python/sglang/srt/model_executor/forward_batch_info.py": {
+    "source_sha256": "6da11b9fda45d2589e409de77707562b744be60a6092e5dc05cfd2db7ab41f6d",
+    "patched_sha256": "7318bfd0d39044410ae1ca2b131c7f0f7c9bea657f1d7a99177033a10c64badf"
+  },
+  "python/sglang/srt/layers/attention/attention_registry.py": {
+    "source_sha256": "5e0106901059daf78ac0776385096e7492d10255f33617bf16aa1b366f7fe686",
+    "patched_sha256": "b5fde366559ff20906a25c79f460484979366ec92b96f8ebc47cdc4eeafbc5ee"
+  },
+  "python/sglang/srt/arg_groups/choices.py": {
+    "source_sha256": "b7a9d27cf221614d8d525229a042eb81d7043ca18deffb4e20a369274c50478b",
+    "patched_sha256": "b1100bcc36fc7cfbca3283691ba0c0a220a518b29f166aa2dae66c10ebc67efc"
+  },
+  "python/sglang/srt/disaggregation/utils.py": {
+    "source_sha256": "21885e741a49aa0edb19e4750cd18f9494578f8338e9f4c3d3f6434d699c04b1",
+    "patched_sha256": "6f00820958926d6622a201a2e7c2bbfac17a69358a25ee9d6486c494da8e6441"
+  },
+  "python/sglang/srt/disaggregation/prefill.py": {
+    "source_sha256": "f956a3dbe17e8bc470de8ae483358d512b7d9d7350767bd01a30792efeb7c13a",
+    "patched_sha256": "c11cc26c1a997497aa291e525c6c60e51446107d648db9acabe961cb391c6b3c"
+  },
+  "python/sglang/srt/disaggregation/decode.py": {
+    "source_sha256": "695bf37c4f68ca2a0604a9bf7441b6cb3303970c6c7eb167ffe8bcbeb2b393ca",
+    "patched_sha256": "7b53b749b583fe1bb8e0b6c94871a4e4be3ac0f5e3523448ef2140b0ef708ef0"
+  },
+  "python/sglang/srt/weight_cache/ipc_loader.py": {
+    "source_sha256": "4c9b1ab2103c53e3dbc095e604683f9ed2e5a3f18bff47d7b01eb7236d028c8e",
+    "patched_sha256": "8cfa6b5791babe37195baa60fb1f65ec598687c80803852a608a54c27129a240"
+  },
+  "python/sglang/srt/model_executor/runner/eager_runner.py": {
+    "source_sha256": "9868a79ab6c7f637a88659caa6beba50006dba557ce916e65b940b13daf37683",
+    "patched_sha256": "7d9a0f4eb907ef0cb65a18368c91a8d42d91dc128df3d6c300398b59220e3ab8"
+  },
+  "python/sglang/srt/utils/watchdog.py": {
+    "source_sha256": "55fa2c9afe8999abbb0b4d0f0aa31a33f935870838b220ac35f85d63b0228cf7",
+    "patched_sha256": "0ce5c8e92478e1679f9493098b415bc7f43f29d09750ef736dfec0346847f0c7"
+  }
+}

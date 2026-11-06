@@ -1,0 +1,42 @@
+[
+  {
+    "source": "csrc/attention/attention_headwise_kernels.cu",
+    "destination": "native/headwise/attention_headwise_kernels.cu",
+    "sha256": "62199939e853d15764e7ac97a88d7ebdc31ce651d42898d61e93fcbb084b2e93"
+  },
+  {
+    "source": "csrc/attention/attention_dtypes.h",
+    "destination": "native/headwise/attention_dtypes.h",
+    "sha256": "d36d43d10eba970efb920117c98368f3bd1195161d71005225ca4d674d83408a"
+  },
+  {
+    "source": "csrc/attention/attention_generic.cuh",
+    "destination": "native/headwise/attention_generic.cuh",
+    "sha256": "67720718c0fa85ccca1bb648141847e261a0f0b0845698be94d59c5f616ea5c7"
+  },
+  {
+    "source": "csrc/attention/attention_utils.cuh",
+    "destination": "native/headwise/attention_utils.cuh",
+    "sha256": "e17072cf04215572685dae92a4aaaed259c4d31a7924ade61474fcdf54821723"
+  },
+  {
+    "source": "csrc/attention/dtype_bfloat16.cuh",
+    "destination": "native/headwise/dtype_bfloat16.cuh",
+    "sha256": "1525b0b402aa47ffc4d24e8e7d9acd9caf728dbeb127bfc747dbe111250962d9"
+  },
+  {
+    "source": "csrc/attention/dtype_float16.cuh",
+    "destination": "native/headwise/dtype_float16.cuh",
+    "sha256": "607e2ce5e12a207032f082ebc125375bda0e015f7488ba0f05adc9e7b6999eeb"
+  },
+  {
+    "source": "csrc/attention/dtype_float32.cuh",
+    "destination": "native/headwise/dtype_float32.cuh",
+    "sha256": "aaca31e08fc49696c8322835bc67da5a81312b4ff20bb8b3ac39e07f75909e6a"
+  },
+  {
+    "source": "csrc/dispatch_utils.h",
+    "destination": "native/headwise/dispatch_utils.h",
+    "sha256": "41d3243b5218afa4e9614824300fff28b4e1282be4c4f7576847730073408dc4"
+  }
+]

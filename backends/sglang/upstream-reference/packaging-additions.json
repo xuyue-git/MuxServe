@@ -1,0 +1,17 @@
+{
+  "sglang_commit": "94602c9c2b7cbdb8efd5c52802dac6a1c180089e",
+  "additions": [
+    {
+      "path": "python/README.md",
+      "source": "README.md",
+      "sha256": "ee6908559f95fe54c3f6773ed23e163d76c984f4750445830a343eac6edca1d0",
+      "reason": "Exact upstream metadata copy for Python project-relative package references"
+    },
+    {
+      "path": "python/LICENSE",
+      "source": "LICENSE",
+      "sha256": "1495e1e757ef4d0925a2350563cf5754bb23c51701a8ec4fb3c5cdcbedae6747",
+      "reason": "Exact upstream metadata copy for Python project-relative package references"
+    }
+  ]
+}
