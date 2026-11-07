@@ -15,6 +15,7 @@
 # same deployment, afterwards run each model alone: SOLO_REQUESTS, default 8),
 # DECODE_GRAPH=1 (D-stage decode CUDA graphs: config decode_cuda_graph=true),
 # PARK=1 (decode runs park for a waiting prefill: config decode_run_park=true),
+# PREFILL_GRAPH=1 (P-stage breakable prefill CUDA graphs: config prefill_cuda_graph=true),
 # PROFILE=1 (torch.profiler on each model's D rank 0 for 10 decode steps at
 # its 300th and 1600th run step; summaries in OUT_DIR/profile; diagnosis only;
 # MXS_PROFILE_RANKS=P0 MXS_PROFILE_AT=3,12 MXS_PROFILE_STEPS=4 profiles prefills;
@@ -37,12 +38,13 @@ SOLO_REQUESTS="${SOLO_REQUESTS:-8}"
 PROFILE="${PROFILE:-}"
 DECODE_GRAPH="${DECODE_GRAPH:-}"
 PARK="${PARK:-}"
+PREFILL_GRAPH="${PREFILL_GRAPH:-}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
-"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" <<'PYEOF'
+"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" <<'PYEOF'
 import json, sys
-source, target, locks, root, steps, fraction, headroom, graph, park = sys.argv[1:]
+source, target, locks, root, steps, fraction, headroom, graph, park, pgraph = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -57,6 +59,9 @@ if graph:
 config.pop("decode_run_park", None)
 if park:
     config["decode_run_park"] = True
+config.pop("prefill_cuda_graph", None)
+if pgraph:
+    config["prefill_cuda_graph"] = True
 if int(steps) > 0:
     config["decode_run_steps"] = int(steps)
 for model, size in zip(config["models"], ("7b", "13b", "30b")):
@@ -68,7 +73,8 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
                  else "%d bytes" % config["kv_bytes_per_rank"]),
       "headroom=%dMiB" % (config["extra_headroom_bytes_per_rank"] // 1024**2),
       "decode_graph=%s" % config.get("decode_cuda_graph", False),
-      "park=%s" % config.get("decode_run_park", False))
+      "park=%s" % config.get("decode_run_park", False),
+      "prefill_graph=%s" % config.get("prefill_cuda_graph", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

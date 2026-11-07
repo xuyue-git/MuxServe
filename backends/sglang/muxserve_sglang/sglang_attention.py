@@ -13,6 +13,13 @@ from . import ops
 from .contracts import IntegrationError
 from .sglang_memory import GRAPH_MAX_CONTEXT, HeadwiseTokenToKVPool, _require
 
+try:  # SGLang breakable (segmented) prefill CUDA graphs run attention eagerly.
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        is_in_breakable_cuda_graph)
+except ImportError:  # pragma: no cover - older native trees
+    def is_in_breakable_cuda_graph():
+        return False
+
 
 class HeadwiseAttentionBackend(AttentionBackend):
     def __init__(self, runner):
@@ -31,6 +38,11 @@ class HeadwiseAttentionBackend(AttentionBackend):
         # Eager entry point (eager runner): always the bound, validated grant.
         _require(not torch.cuda.is_current_stream_capturing(), "Eager metadata cannot be captured")
         self._static = False
+        if self.token_to_kv_pool._bound is None and is_in_breakable_cuda_graph():
+            # P-stage prefill graph capture/warmup at model-runner init, before
+            # any grant: attention runs eagerly at graph breaks and writes no KV.
+            self.forward_metadata = None
+            return
         self.forward_metadata = self.token_to_kv_pool.validate_forward(forward_batch)
 
     # ---- decode CUDA graph (native DecodeCudaGraphRunner, D stage only) ----
@@ -63,6 +75,8 @@ class HeadwiseAttentionBackend(AttentionBackend):
     def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
         if getattr(self, "_static", False):
             return self._forward_decode_static(q, k, v, layer, forward_batch, save_kv_cache, kwargs)
+        if is_in_breakable_cuda_graph() and not forward_batch.forward_mode.is_decode():
+            return self._forward_extend_graph_break(q, k, v, layer, forward_batch, save_kv_cache, kwargs)
         # Override the native idle fast path: an unbound or idle call must
         # fail. Both methods validate the grant first thing (via _inputs).
         method = self.forward_decode if forward_batch.forward_mode.is_decode() else self.forward_extend
@@ -109,14 +123,19 @@ class HeadwiseAttentionBackend(AttentionBackend):
         bound, (q, k, v) = self._inputs(q, k, v, layer, forward_batch, save_kv_cache, kwargs)
         _require(bound.mode in ("PREFILL", "REBUILD"), "Extend requires full prefill or rebuild")
         self.token_to_kv_pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
-        if len(bound.write_lengths) == 1:
+        return self._extend_attention(q, k, v, bound.write_lengths, layer.scaling)
+
+    @staticmethod
+    def _extend_attention(q, k, v, write_lengths, scaling):
+        total = sum(write_lengths)
+        if len(write_lengths) == 1:
             # One request: same attention without slicing or a concatenation.
             output = scaled_dot_product_attention(
                 q.transpose(0, 1).unsqueeze(0), k.transpose(0, 1).unsqueeze(0),
-                v.transpose(0, 1).unsqueeze(0), dropout_p=0.0, is_causal=True, scale=layer.scaling)
-            return output.squeeze(0).transpose(0, 1).reshape(bound.total_written, -1)
+                v.transpose(0, 1).unsqueeze(0), dropout_p=0.0, is_causal=True, scale=scaling)
+            return output.squeeze(0).transpose(0, 1).reshape(total, -1)
         outputs, start = [], 0
-        for length in bound.write_lengths:
+        for length in write_lengths:
             end = start + length
             # Independent segments are essential: concatenated requests must
             # never share attention even though their tokens share a forward.
@@ -124,11 +143,50 @@ class HeadwiseAttentionBackend(AttentionBackend):
                 q[start:end].transpose(0, 1).unsqueeze(0),
                 k[start:end].transpose(0, 1).unsqueeze(0),
                 v[start:end].transpose(0, 1).unsqueeze(0),
-                dropout_p=0.0, is_causal=True, scale=layer.scaling,
+                dropout_p=0.0, is_causal=True, scale=scaling,
             )
             outputs.append(output.squeeze(0).transpose(0, 1))
             start = end
-        return torch.cat(outputs, dim=0).reshape(bound.total_written, -1)
+        return torch.cat(outputs, dim=0).reshape(total, -1)
+
+    # ---- P-stage breakable prefill CUDA graph (prefill_cuda_graph) ----------
+    # Native BCG captures the transformer body in segments and runs attention
+    # eagerly at the graph breaks, with the runner's static batch (Q/K/V already
+    # narrowed to the real tokens). ModelRunner.forward validated the live
+    # grant first (validate_forward sets extend_checked); here the static batch
+    # must carry exactly that grant's geometry, and K/V go to its write slots.
+    def _forward_extend_graph_break(self, q, k, v, layer, forward_batch, save_kv_cache, kwargs):
+        _require(not torch.cuda.is_current_stream_capturing(),
+                 "Graph-break attention runs eagerly, never inside a captured segment")
+        _require(save_kv_cache and not kwargs and not getattr(forward_batch, "mha_return_lse", False),
+                 "Each granted layer must write its K/V without extra options")
+        pool = self.token_to_kv_pool
+        heads = pool.head_num
+        if id(layer) not in self._validated_layers:
+            self._validate_layer(layer, heads)
+            self._validated_layers.add(id(layer))
+        rows = q.shape[0]
+        if pool._bound is None:
+            # Capture/warmup at init: no grant exists, so nothing is stored.
+            shaped = [tensor.reshape(rows, heads, 128) for tensor in (q, k, v)]
+            return self._extend_attention(*shaped, (rows,), layer.scaling)
+        bound = pool.bound_forward
+        _require(bound.mode in ("PREFILL", "REBUILD") and bound.extend_checked and bound.batch is not None,
+                 "Prefill graph replay requires the validated live grant", "FORWARD_MISMATCH")
+        _require(forward_batch.batch_size == len(bound.req_pool_indices)
+                 and getattr(forward_batch, "global_num_token_non_padded_cpu", None) == bound.total_written
+                 and rows == bound.total_written,
+                 "Prefill graph replay geometry differs from the grant", "FORWARD_MISMATCH")
+        shaped = []
+        for tensor in (q, k, v):
+            _require(isinstance(tensor, torch.Tensor) and tensor.dtype == torch.float16
+                     and tensor.device == pool.device
+                     and tuple(tensor.shape) in ((rows, heads, 128), (rows, heads * 128)),
+                     "Q/K/V geometry mismatch")
+            shaped.append(tensor.reshape(rows, heads, 128).contiguous())
+        q, k, v = shaped
+        ops.store(k, v, pool.pool_key, pool.pool_value, pool.layer_slots(layer.layer_id))
+        return self._extend_attention(q, k, v, bound.write_lengths, layer.scaling)
 
     def _forward_decode_static(self, q, k, v, layer, forward_batch, save_kv_cache, kwargs):
         """Graph warmup/capture body; replay re-executes exactly these kernels."""

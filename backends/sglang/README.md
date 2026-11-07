@@ -90,9 +90,17 @@ feedback then includes the parked time. In this mode a prefill also prepares
 keep going; it takes all credits at START. Runs park only for a READY
 prefill, and no new decode batch is prepared while one waits.
 
+`prefill_cuda_graph: true` enables SGLang's breakable prefill CUDA graph on
+P ranks for prompts of exactly 512 tokens (`launcher.PREFILL_GRAPH_TOKENS`;
+other lengths stay eager). The transformer body is captured in segments at
+model-runner init; Head-wise attention runs eagerly at every graph break.
+Capture writes no KV. On replay the live batch was already validated by the
+grant check, the runner's static batch must carry exactly that grant's
+geometry, and K/V go to the grant's write slots.
+
 ## Known limitations
 
-Prefill CUDA graphs, overlap scheduling and custom all-reduce remain disabled.
+Prefill CUDA graphs (unless `prefill_cuda_graph`), overlap scheduling and custom all-reduce remain disabled.
 Each run start still ships and validates the complete multi-rank KV view once
 (as packed int32 tables). The sample
 configuration uses D30 for 7B and D40 for 13B/30B; it is not the all-D40 paired

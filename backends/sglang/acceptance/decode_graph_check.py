@@ -19,7 +19,8 @@ from muxserve_sglang.contracts import IntegrationError  # noqa: E402
 
 def launcher_functions():
     tree = ast.parse((ROOT / 'muxserve_sglang/launcher.py').read_text())
-    body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ('_native_fields', '_graph_fields')]
+    body = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in ('_native_fields', '_graph_fields'))
+            or (isinstance(n, ast.Assign) and any(getattr(t, 'id', '') == 'PREFILL_GRAPH_TOKENS' for t in n.targets))]
     namespace = {}
     exec(compile(ast.Module(body=body, type_ignores=[]), 'launcher-fields', 'exec'), namespace)
     return namespace
@@ -66,6 +67,142 @@ class DecodeGraphConfigChecks(unittest.TestCase):
             else:
                 self.assertTrue(d['disable_cuda_graph'] and d['disable_decode_cuda_graph'])
                 self.assertNotIn('cuda_graph_bs_decode', d)
+
+
+class PrefillGraphChecks(unittest.TestCase):
+    def config(self, **extra):
+        return DecodeGraphConfigChecks.config(self, **extra)
+
+    def test_prefill_graph_flag_and_launcher_fields(self):
+        self.assertFalse(self.config().prefill_cuda_graph)
+        self.assertTrue(self.config(prefill_cuda_graph=True).prefill_cuda_graph)
+        with self.assertRaises(IntegrationError):
+            self.config(prefill_cuda_graph=1)
+        ns = launcher_functions()
+        model = SimpleNamespace(model_path='p', tokenizer_path='t', revision='r', prefill_port=1,
+                                decode_port=2, bootstrap_port=3)
+        cfg = SimpleNamespace(tp_size=4, request_timeout_ms=20000, max_model_inflight=1, queue_limit=64,
+                              max_context_tokens=2048, decode_cuda_graph=True, prefill_cuda_graph=True)
+        p = ns['_native_fields'](cfg, model, 'P')
+        d = ns['_native_fields'](cfg, model, 'D')
+        self.assertFalse(p['disable_cuda_graph'] or p['disable_prefill_cuda_graph'])
+        self.assertEqual((p['cuda_graph_backend_prefill'], p['cuda_graph_bs_prefill']), ('breakable', [512]))
+        self.assertTrue(p['disable_decode_cuda_graph'])
+        self.assertEqual(p['cuda_graph_backend_decode'], 'disabled')
+        self.assertEqual((d['cuda_graph_backend_decode'], d['cuda_graph_backend_prefill']), ('full', 'disabled'))
+        cfg.prefill_cuda_graph = False
+        p = ns['_native_fields'](cfg, model, 'P')
+        self.assertTrue(p['disable_cuda_graph'] and p['disable_prefill_cuda_graph'])
+
+
+class FakeTensor:
+    def __init__(self, shape, name='t'):
+        self.shape, self.name, self.dtype, self.device = tuple(shape), name, 'fp16', 'cuda'
+
+    def reshape(self, *shape):
+        total = 1
+        for size in self.shape:
+            total *= size
+        known = 1
+        for size in shape:
+            known *= size if size != -1 else 1
+        return FakeTensor(tuple(total // known if size == -1 else size for size in shape), self.name)
+
+    def contiguous(self):
+        return self
+
+    def transpose(self, a, b):
+        shape = list(self.shape)
+        shape[a], shape[b] = shape[b], shape[a]
+        return FakeTensor(shape, self.name)
+
+    def unsqueeze(self, dim):
+        shape = list(self.shape)
+        shape.insert(dim, 1)
+        return FakeTensor(shape, self.name)
+
+    def squeeze(self, dim):
+        shape = list(self.shape)
+        shape.pop(dim)
+        return FakeTensor(shape, self.name)
+
+
+def attention_backend(stores, breakable):
+    tree = ast.parse((ROOT / 'muxserve_sglang/sglang_attention.py').read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'HeadwiseAttentionBackend')
+    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in (
+        'forward', '_forward_extend_graph_break', '_extend_attention', '_validate_layer', 'init_forward_metadata')]
+    cls.bases = []
+    torch = SimpleNamespace(Tensor=FakeTensor, float16='fp16',
+                            cuda=SimpleNamespace(is_current_stream_capturing=lambda: False),
+                            cat=lambda parts, dim=0: FakeTensor((sum(p.shape[0] for p in parts),) + parts[0].shape[1:]))
+    namespace = dict(torch=torch, math=__import__('math'),
+                     is_in_breakable_cuda_graph=lambda: breakable[0],
+                     scaled_dot_product_attention=lambda q, k, v, **kw: FakeTensor(q.shape, 'out'),
+                     ops=SimpleNamespace(store=lambda k, v, key, value, slots: stores.append(slots)),
+                     AttentionType=SimpleNamespace(DECODER='decoder'), IntegrationError=IntegrationError)
+    def require(condition, message, code='INTEGRATION_ERROR'):
+        if not condition:
+            raise IntegrationError(code, message)
+    namespace['_require'] = require
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), 'attention-graph-break', 'exec'), namespace)
+    return namespace['HeadwiseAttentionBackend']
+
+
+class PrefillGraphBreakAttentionChecks(unittest.TestCase):
+    def setup(self, bound=True):
+        stores, breakable = [], [True]
+        backend = attention_backend(stores, breakable).__new__(attention_backend(stores, breakable))
+        pool, _, live = fixture(Uploads(), 'PREFILL', (33,), layers=3)
+        if not bound:
+            pool._bound = None
+        pool.pool_key = pool.pool_value = 'pool'
+        pool.device = 'cuda'
+        backend.token_to_kv_pool, backend._validated_layers, backend._static = pool, set(), False
+        layer = SimpleNamespace(layer_id=1, xai_temperature_len=-1, tp_q_head_num=3, tp_k_head_num=3,
+                                tp_v_head_num=3, head_dim=128, qk_head_dim=128, v_head_dim=128,
+                                attn_type='decoder', is_cross_attention=False, pos_encoding_mode='NONE',
+                                use_irope=False, logit_cap=0, sliding_window_size=-1, scaling=0.1)
+        static = SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: False), batch_size=1,
+                                 global_num_token_non_padded_cpu=33)
+        return backend, pool, live, static, layer, stores
+
+    def qkv(self, rows=33):
+        return [FakeTensor((rows, 3 * 128), n) for n in 'qkv']
+
+    def test_capture_runs_attention_without_storing(self):
+        backend, pool, _, static, layer, stores = self.setup(bound=False)
+        backend.init_forward_metadata(static)
+        self.assertIsNone(backend.forward_metadata)
+        out = backend.forward(*self.qkv(512), layer, static, True)
+        self.assertEqual((out.shape, stores), ((512, 384), []))
+
+    def test_replay_stores_the_granted_slots_and_checks_geometry(self):
+        backend, pool, live, static, layer, stores = self.setup()
+        backend.init_forward_metadata(live)  # replay prep validates the live batch
+        out = backend.forward(*self.qkv(), layer, static, True)
+        self.assertEqual(out.shape, (33, 384))
+        self.assertEqual(len(stores), 1)
+        self.assertIs(stores[0], pool.layer_slots(1))
+        for change in (dict(batch_size=2), dict(global_num_token_non_padded_cpu=32)):
+            with self.subTest(change=change):
+                with self.assertRaises(IntegrationError):
+                    backend.forward(*self.qkv(), layer, SimpleNamespace(**{**vars(static), **change}), True)
+        with self.assertRaises(IntegrationError):
+            backend.forward(*self.qkv(32), layer, static, True)
+        with self.assertRaises(IntegrationError):
+            backend.forward(*self.qkv(), layer, static, True, sinks='x')
+
+    def test_replay_requires_a_validated_prefill_grant(self):
+        backend, pool, _, static, layer, _ = self.setup()
+        pool.bound_forward.extend_checked = False
+        with self.assertRaises(IntegrationError):
+            backend.forward(*self.qkv(), layer, static, True)
+        decode, _, _ = fixture(Uploads(), 'DECODE', (33,), layers=3)
+        decode.pool_key = decode.pool_value = 'pool'
+        backend.token_to_kv_pool = decode
+        with self.assertRaises(IntegrationError):
+            backend.forward(*self.qkv(1), layer, static, True)
 
 
 class GraphReplayMetadataChecks(unittest.TestCase):

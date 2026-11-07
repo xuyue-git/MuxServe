@@ -52,8 +52,19 @@ def _native_fields(config, model, stage):
     return fields
 
 
+# Breakable prefill graphs are captured per aggregate token count; the paired
+# workload's prompts are exactly 512 tokens (other lengths run eagerly).
+PREFILL_GRAPH_TOKENS = (512,)
+
+
 def _graph_fields(config, stage):
-    """D-stage decode CUDA graphs (SGLang-native full graphs, bs 1..inflight)."""
+    """D-stage decode CUDA graphs (SGLang-native full graphs, bs 1..inflight);
+    P-stage breakable prefill graphs (attention eager at graph breaks)."""
+    if stage == "P" and getattr(config, "prefill_cuda_graph", False):
+        return dict(disable_cuda_graph=False, disable_prefill_cuda_graph=False,
+                    disable_decode_cuda_graph=True, cuda_graph_backend_prefill="breakable",
+                    cuda_graph_backend_decode="disabled",
+                    cuda_graph_bs_prefill=list(PREFILL_GRAPH_TOKENS))
     if stage != "D" or not getattr(config, "decode_cuda_graph", False):
         return {}
     return dict(disable_cuda_graph=False, disable_prefill_cuda_graph=True,

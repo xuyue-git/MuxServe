@@ -60,6 +60,7 @@ class EagerForwardChecks(unittest.TestCase):
             tensor=lambda values, **kwargs: Tensor(len(values)),
             cuda=SimpleNamespace(Event=Event, is_current_stream_capturing=lambda: False))
         self.namespace = dict(__name__=__name__, dataclass=dataclass, field=field, replace=replace,
+            is_in_breakable_cuda_graph=lambda: False,
             KVCache=object, AttentionBackend=object, BaseRunner=object, torch=self.torch, np=numpy,
             IntegrationError=IntegrationError,
             envs=SimpleNamespace(SGLANG_EAGER_INPUT_NO_COPY=SimpleNamespace(get=lambda: self.no_copy)))

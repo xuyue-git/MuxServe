@@ -98,6 +98,13 @@ class ControlledScheduler:
                                          and getattr(decode_graph, "attn_backend", None)
                                          is getattr(self.runner, "attn_backend", None)),
                 "Decode CUDA graphs require decode_cuda_graph on a D rank with the Head-wise backend")
+        prefill_graph = getattr(self.runner, "prefill_cuda_graph_runner", None)
+        require(prefill_graph is None or type(prefill_graph).__name__ == "EagerRunner"
+                or (context.stage == "P" and getattr(context.config, "prefill_cuda_graph", False)
+                    and type(getattr(prefill_graph, "backend", None)).__name__ == "BreakableCudaGraphBackend"
+                    and getattr(self.runner, "attn_backend", None).__class__.__name__
+                    == "HeadwiseAttentionBackend"),
+                "Prefill CUDA graphs require prefill_cuda_graph on a P rank (breakable, Head-wise)")
         require(getattr(self.runner, "cuda_graph_runner", None) is None
                 and not getattr(scheduler, "enable_staging", False)
                 and getattr(scheduler, "decode_offload_manager", None) is None
