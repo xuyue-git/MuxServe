@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 def _native_fields(config, model, stage):
     """Fields are from the frozen arg_groups/fields declarations."""
-    return dict(model_path=model.model_path, tokenizer_path=model.tokenizer_path,
+    fields = dict(model_path=model.model_path, tokenizer_path=model.tokenizer_path,
                 revision=model.revision, trust_remote_code=False, dtype="float16",
                 context_length=2048, tp_size=config.tp_size, pp_size=1, dp_size=1,
                 host="127.0.0.1", port=model.prefill_port if stage == "P" else model.decode_port,
@@ -48,6 +48,18 @@ def _native_fields(config, model, stage):
                 skip_tokenizer_init=False, enable_metrics=False,
                 weight_cache_mode="client" if stage in ("P", "D") else "off",
                 load_format="auto")
+    fields.update(_graph_fields(config, stage))
+    return fields
+
+
+def _graph_fields(config, stage):
+    """D-stage decode CUDA graphs (SGLang-native full graphs, bs 1..inflight)."""
+    if stage != "D" or not getattr(config, "decode_cuda_graph", False):
+        return {}
+    return dict(disable_cuda_graph=False, disable_prefill_cuda_graph=True,
+                disable_decode_cuda_graph=False, cuda_graph_backend_decode="full",
+                cuda_graph_backend_prefill="disabled",
+                cuda_graph_bs_decode=list(range(1, config.max_model_inflight + 1)))
 
 
 def _arguments(fields):
@@ -201,6 +213,8 @@ class Supervisor:
         # Controlled workers receive all commands over our RPC event loop.
         # Native tokenizer-input broadcast queues are unused in this mode.
         os.environ["SGLANG_USE_MESSAGE_QUEUE_BROADCASTER"] = "0"
+        # Replay prep must run eagerly every step (it loads the bound grant).
+        os.environ["SGLANG_ENABLE_METADATA_GLUE_GRAPH"] = "0"
         os.environ["PATH"] = str(Path(software["cuda_home"]) / "bin") + ":" + os.environ.get("PATH", "")
         for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
             if any(field.strip().lower() == "expandable_segments:true"

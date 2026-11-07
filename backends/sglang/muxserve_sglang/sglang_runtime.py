@@ -92,6 +92,12 @@ class ControlledScheduler:
         timeout = scheduler.server_args.dist_timeout
         require(type(timeout) in (int, float) and 0 < timeout <= context.config.request_timeout_ms / 1000,
                 "Launcher must configure a finite native distributed timeout")
+        decode_graph = getattr(self.runner, "decode_cuda_graph_runner", None)
+        graphs_allowed = context.stage == "D" and getattr(context.config, "decode_cuda_graph", False)
+        require(decode_graph is None or (graphs_allowed and getattr(self.pool, "graph", None) is not None
+                                         and getattr(decode_graph, "attn_backend", None)
+                                         is getattr(self.runner, "attn_backend", None)),
+                "Decode CUDA graphs require decode_cuda_graph on a D rank with the Head-wise backend")
         require(getattr(self.runner, "cuda_graph_runner", None) is None
                 and not getattr(scheduler, "enable_staging", False)
                 and getattr(scheduler, "decode_offload_manager", None) is None

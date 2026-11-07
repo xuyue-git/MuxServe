@@ -71,10 +71,18 @@ activity instead of polling. `tools/bench_fixed.py` reproduces the fixed
 controller's per-stage totals); `acceptance/control_plane_e2e_check.py` runs
 the full control plane with simulated rank processes on CPU.
 
+`decode_cuda_graph: true` captures D-stage decode forwards as SGLang-native
+full CUDA graphs (batch sizes 1..`max_model_inflight`; P stays eager). Capture
+runs at model-runner initialization, before the rank registers, on static
+per-layer slot / page-table / length buffers sized for 2048-token contexts.
+Every replay still passes the per-forward grant check and `validate_forward`
+of the live batch; the validated grant is then copied into those buffers.
+
 ## Known limitations
 
-CUDA graphs, overlap scheduling and custom all-reduce remain disabled. Each
-run start still ships and validates the complete multi-rank KV view once. The sample
+Prefill CUDA graphs, overlap scheduling and custom all-reduce remain disabled.
+Each run start still ships and validates the complete multi-rank KV view once
+(as packed int32 tables). The sample
 configuration uses D30 for 7B and D40 for 13B/30B; it is not the all-D40 paired
 experiment configuration. Asset paths now use the common protected resolver,
 with no hardcoded lab model aliases. No original-paper performance reproduction

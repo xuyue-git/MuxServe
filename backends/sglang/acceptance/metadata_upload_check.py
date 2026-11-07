@@ -79,7 +79,9 @@ def adapter(upload):
     methods = [node for node in native.body if isinstance(node, ast.FunctionDef)
                and node.name != '__init__']
     selected = [node for node in tree.body if getattr(node, 'name', '')
-                in ('_require', '_cpu_ints', 'BoundForward')]
+                in ('_require', '_cpu_ints', 'BoundForward', 'graph_replay_arrays')
+                or (isinstance(node, ast.Assign) and all(
+                    isinstance(t, ast.Name) and t.id.startswith('GRAPH_') for t in node.targets))]
     cls = ast.ClassDef(name='Pool', bases=[], keywords=[], body=methods, decorator_list=[])
     selected.append(cls)
     module = ModuleType('_metadata_adapter_check')

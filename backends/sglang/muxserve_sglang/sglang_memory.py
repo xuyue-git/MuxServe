@@ -53,10 +53,60 @@ class BoundForward:
     # advances inside its reserved capacity reuses them for every step.
     np_tables: list | None = None
     table_buffer: torch.Tensor | None = None
+    # Set once this run's padded tables were uploaded into the decode graph's
+    # static table buffer; advance_decode carries it to later run steps.
+    graph_tables: object | None = None
 
     @property
     def total_written(self) -> int:
         return sum(self.write_lengths)
+
+
+# Decode CUDA graphs bake the attention kernel's context capacity into the
+# capture; every request is capped at this many tokens by the controller.
+GRAPH_MAX_CONTEXT = 2048
+GRAPH_PAGES = GRAPH_MAX_CONTEXT // 16
+
+
+@dataclass
+class GraphBuffers:
+    """Static decode-graph metadata. Captured kernels read these addresses;
+    each replay overwrites their contents from the validated bound grant."""
+    max_bs: int
+    slots: torch.Tensor         # [layers, max_bs, heads] int64 physical write slots
+    tables: torch.Tensor        # [layers, max_bs, heads, GRAPH_PAGES] int32 page tables
+    context_lens: torch.Tensor  # [max_bs] int32
+    static: bool = False        # capture/warmup Python forwards use these buffers
+
+
+def graph_replay_arrays(bound: BoundForward, start_layer: int, end_layer: int, head_num: int,
+                        upload_tables: bool):
+    """Numpy contents for one decode-graph replay of ``bound`` (no torch).
+
+    Identical indexing to layer_metadata: write slot = page * 16 + offset of
+    the single appended token, per layer and head; tables padded with zeros
+    to GRAPH_PAGES (the kernel reads only ceil(context / 16) pages).
+    """
+    _require(bound.mode == "DECODE" and all(count == 1 for count in bound.write_lengths),
+             "Decode graphs replay one appended token per request", "FORWARD_MISMATCH")
+    _require(all(0 < target <= GRAPH_MAX_CONTEXT for target in bound.target_lengths),
+             "Decode graph context exceeds the captured capacity", "FORWARD_MISMATCH")
+    if bound.np_tables is None:
+        bound.np_tables = [np.asarray(table, dtype=np.int64) for table in bound.tables]
+    selected = slice(start_layer, end_layer + 1)
+    layers, rows = end_layer - start_layer + 1, len(bound.np_tables)
+    tables = None
+    if upload_tables:
+        tables = np.zeros((layers, rows, head_num, GRAPH_PAGES), dtype=np.int32)
+        for row, table in enumerate(bound.np_tables):
+            _require(table.shape[1] == head_num and table.shape[2] <= GRAPH_PAGES,
+                     "Decode graph page table exceeds the captured capacity", "FORWARD_MISMATCH")
+            tables[:, row, :, :table.shape[2]] = table[selected]
+    slots = np.empty((layers, rows, head_num), dtype=np.int64)
+    for row, (start, table) in enumerate(zip(bound.write_starts, bound.np_tables)):
+        slots[:, row, :] = table[selected][:, :, start // 16] * 16 + start % 16
+    lengths = np.asarray(bound.target_lengths, dtype=np.int32)
+    return tables, slots, lengths
 
 
 class HeadwiseTokenToKVPool(KVCache):
@@ -103,6 +153,7 @@ class HeadwiseTokenToKVPool(KVCache):
         self.host_capacity_bytes = sum(self.get_kv_size_bytes())
         self.mem_usage = self.host_capacity_bytes / (1 << 30)
         self._bound: BoundForward | None = None
+        self.graph: GraphBuffers | None = None
 
     @property
     def bound_req_pool_indices(self) -> tuple[int, ...]:
@@ -197,7 +248,8 @@ class HeadwiseTokenToKVPool(KVCache):
                  "Decode run must append one token inside its reserved capacity", "FORWARD_MISMATCH")
         self._bound = BoundForward("DECODE", rows, targets, (1,) * len(rows), bound.target_lengths,
                                    bound.tables, capacities=bound.capacities,
-                                   np_tables=bound.np_tables, table_buffer=bound.table_buffer)
+                                   np_tables=bound.np_tables, table_buffer=bound.table_buffer,
+                                   graph_tables=bound.graph_tables)
 
     def clear_forward(self) -> None:
         """Caller must hold the grant until all-rank GPU completion before clearing."""
@@ -282,6 +334,56 @@ class HeadwiseTokenToKVPool(KVCache):
     def _check_layer(self, layer_id: int) -> None:
         _require(type(layer_id) is int and self.start_layer <= layer_id <= self.end_layer,
                  "Layer outside model layout")
+
+    # ---- decode CUDA graph support -------------------------------------
+    def init_graph_buffers(self, max_bs: int) -> None:
+        _require(type(max_bs) is int and 1 <= max_bs <= 16, "Invalid decode graph batch size")
+        layers = self.end_layer - self.start_layer + 1
+        self.graph = GraphBuffers(
+            max_bs,
+            torch.zeros((layers, max_bs, self.head_num), dtype=torch.int64, device=self.device),
+            torch.zeros((layers, max_bs, self.head_num, GRAPH_PAGES), dtype=torch.int32, device=self.device),
+            torch.ones((max_bs,), dtype=torch.int32, device=self.device))
+
+    def graph_capture_metadata(self, bs: int) -> None:
+        """Dummy metadata for warmup/capture forwards, before any grant exists.
+
+        Capture runs at model-runner initialization, before this rank
+        registers with the owner, so no request owns KV yet; the dummy forward
+        writes only page 0 of physical block 0.
+        """
+        graph = self.graph
+        _require(graph is not None and 1 <= bs <= graph.max_bs, "Decode graph buffers are not sized")
+        _require(self._bound is None, "Graph capture must precede every granted forward", "FORWARD_BUSY")
+        graph.slots.zero_()
+        graph.tables.zero_()
+        graph.context_lens.fill_(1)
+        graph.static = True
+
+    def graph_layer_metadata(self, layer_id: int, bs: int):
+        self._check_layer(layer_id)
+        graph = self.graph
+        _require(graph is not None and 1 <= bs <= graph.max_bs, "Decode graph buffers are not sized")
+        offset = layer_id - self.start_layer
+        return graph.slots[offset, :bs], graph.tables[offset, :bs], graph.context_lens[:bs]
+
+    def prepare_graph_replay(self, bs: int) -> None:
+        """Load the validated bound decode grant into the static graph buffers."""
+        graph = self.graph
+        _require(graph is not None, "Decode graph buffers are not sized")
+        bound = self.bound_forward
+        _require(bound.batch is not None, "Replay requires a validated ForwardBatch", "UNBOUND_FORWARD")
+        _require(len(bound.req_pool_indices) == bs <= graph.max_bs,
+                 "Decode graph replay must exactly fill the captured batch", "FORWARD_MISMATCH")
+        graph.static = False
+        upload = bound.graph_tables is not graph.tables
+        tables, slots, lengths = graph_replay_arrays(bound, self.start_layer, self.end_layer,
+                                                     self.head_num, upload)
+        if upload:
+            graph.tables[:, :bs].copy_(torch.from_numpy(tables))
+            bound.graph_tables = graph.tables
+        graph.slots[:, :bs].copy_(torch.from_numpy(slots))
+        graph.context_lens[:bs].copy_(torch.from_numpy(lengths))
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         self._check_layer(layer_id)

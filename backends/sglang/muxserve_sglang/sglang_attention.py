@@ -11,7 +11,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 
 from . import ops
 from .contracts import IntegrationError
-from .sglang_memory import HeadwiseTokenToKVPool, _require
+from .sglang_memory import GRAPH_MAX_CONTEXT, HeadwiseTokenToKVPool, _require
 
 
 class HeadwiseAttentionBackend(AttentionBackend):
@@ -25,22 +25,44 @@ class HeadwiseAttentionBackend(AttentionBackend):
         # Static per-layer configuration is validated once per layer object;
         # tensors, shapes and the bound grant are still checked on every call.
         self._validated_layers = set()
+        self._static = False
 
     def init_forward_metadata(self, forward_batch):
-        _require(not torch.cuda.is_current_stream_capturing(), "CUDA graphs are unsupported")
+        # Eager entry point (eager runner): always the bound, validated grant.
+        _require(not torch.cuda.is_current_stream_capturing(), "Eager metadata cannot be captured")
+        self._static = False
         self.forward_metadata = self.token_to_kv_pool.validate_forward(forward_batch)
 
+    # ---- decode CUDA graph (native DecodeCudaGraphRunner, D stage only) ----
+    # Capture/warmup forwards run once at model-runner init, before any grant,
+    # on static per-layer slot/page-table/length buffers. Every replay is
+    # preceded by ModelRunner.forward's grant check and validate_forward of the
+    # live batch; init_forward_metadata_out_graph then copies that validated
+    # grant's slots/tables/lengths into the same static buffers.
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        _require(max_num_tokens == max_bs, "Head-wise decode graphs carry one token per request")
+        self.token_to_kv_pool.init_graph_buffers(max_bs)
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
+
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
-        _require(not in_capture, "CUDA graph capture is unsupported")
-        self.init_forward_metadata(forward_batch)
+        _require(forward_batch.forward_mode.is_decode(), "Only decode forwards are graph-captured")
+        if in_capture:
+            self.token_to_kv_pool.graph_capture_metadata(forward_batch.batch_size)
+            self._static = True
+        else:
+            # Replay prep (runs eagerly outside the graph).
+            self.token_to_kv_pool.prepare_graph_replay(forward_batch.batch_size)
+            self._static = False
+        self.forward_metadata = None
 
     def init_forward_metadata_in_graph(self, forward_batch):
-        _require(not torch.cuda.is_current_stream_capturing(), "CUDA graphs are unsupported")
-
-    def init_cuda_graph_state(self, *args, **kwargs):
-        raise IntegrationError("UNSUPPORTED", "Head-wise execution requires eager forwards")
+        """Nothing to record: replay prep wrote the static buffers eagerly."""
 
     def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
+        if getattr(self, "_static", False):
+            return self._forward_decode_static(q, k, v, layer, forward_batch, save_kv_cache, kwargs)
         # Override the native idle fast path: an unbound or idle call must fail.
         self.token_to_kv_pool.validate_forward(forward_batch)
         method = self.forward_decode if forward_batch.forward_mode.is_decode() else self.forward_extend
@@ -101,6 +123,33 @@ class HeadwiseAttentionBackend(AttentionBackend):
             outputs.append(output.squeeze(0).transpose(0, 1))
             start = end
         return torch.cat(outputs, dim=0).reshape(bound.total_written, -1)
+
+    def _forward_decode_static(self, q, k, v, layer, forward_batch, save_kv_cache, kwargs):
+        """Graph warmup/capture body; replay re-executes exactly these kernels."""
+        pool = self.token_to_kv_pool
+        _require(forward_batch.forward_mode.is_decode() and pool._bound is None
+                 and pool.graph is not None and pool.graph.static,
+                 "Static graph forwards exist only for capture before any grant", "FORWARD_NOT_GRANTED")
+        _require(save_kv_cache and not kwargs and not getattr(forward_batch, "mha_return_lse", False),
+                 "Each graph layer must write its K/V without extra options")
+        heads = pool.head_num
+        if id(layer) not in self._validated_layers:
+            self._validate_layer(layer, heads)
+            self._validated_layers.add(id(layer))
+        bs = forward_batch.batch_size
+        shaped = []
+        for tensor in (q, k, v):
+            _require(isinstance(tensor, torch.Tensor) and tensor.dtype == torch.float16
+                     and tensor.device == pool.device
+                     and tuple(tensor.shape) in ((bs, heads, 128), (bs, heads * 128)),
+                     "Q/K/V graph geometry mismatch")
+            shaped.append(tensor.reshape(bs, heads, 128).contiguous())
+        q, k, v = shaped
+        slots, table, lengths = pool.graph_layer_metadata(layer.layer_id, bs)
+        ops.store(k, v, pool.pool_key, pool.pool_value, slots)
+        output = ops.decode(q, pool.pool_key, pool.pool_value, table, lengths, layer.scaling,
+                            GRAPH_MAX_CONTEXT)
+        return output.reshape(bs, -1)
 
     def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
         bound, (q, k, v) = self._inputs(q, k, v, layer, forward_batch, save_kv_cache, kwargs)

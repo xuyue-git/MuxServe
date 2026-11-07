@@ -13,6 +13,7 @@
 # TRACE=1 (record a timing trace into OUT_DIR/trace and write
 # OUT_DIR/trace-report.txt after stopping; recording only), SOLO=1 (with the
 # same deployment, afterwards run each model alone: SOLO_REQUESTS, default 8),
+# DECODE_GRAPH=1 (D-stage decode CUDA graphs: config decode_cuda_graph=true),
 # PROFILE=1 (torch.profiler on each model's D rank 0 for 10 decode steps at
 # its 300th and 1600th run step; summaries in OUT_DIR/profile; diagnosis only). The launcher is always stopped with SIGINT
 # (normal drain); the script waits for it to exit.
@@ -31,12 +32,13 @@ TRACE="${TRACE:-}"
 SOLO="${SOLO:-}"
 SOLO_REQUESTS="${SOLO_REQUESTS:-8}"
 PROFILE="${PROFILE:-}"
+DECODE_GRAPH="${DECODE_GRAPH:-}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
-"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" <<'PYEOF'
+"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" <<'PYEOF'
 import json, sys
-source, target, locks, root, steps, fraction, headroom = sys.argv[1:]
+source, target, locks, root, steps, fraction, headroom, graph = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -45,6 +47,9 @@ if fraction:
 if headroom:
     config["extra_headroom_bytes_per_rank"] = int(headroom) * 1024**2
 config.pop("decode_run_steps", None)
+config.pop("decode_cuda_graph", None)
+if graph:
+    config["decode_cuda_graph"] = True
 if int(steps) > 0:
     config["decode_run_steps"] = int(steps)
 for model, size in zip(config["models"], ("7b", "13b", "30b")):
@@ -54,7 +59,8 @@ json.dump(config, open(target, "w"), indent=2)
 print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "absent"),
       "kv=%s" % (("fraction %s" % config["kv_memory_fraction"]) if "kv_memory_fraction" in config
                  else "%d bytes" % config["kv_bytes_per_rank"]),
-      "headroom=%dMiB" % (config["extra_headroom_bytes_per_rank"] // 1024**2))
+      "headroom=%dMiB" % (config["extra_headroom_bytes_per_rank"] // 1024**2),
+      "decode_graph=%s" % config.get("decode_cuda_graph", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

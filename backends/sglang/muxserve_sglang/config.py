@@ -119,6 +119,10 @@ class DeploymentConfig:
     # Maximum consecutive decode forwards under one D grant. 1 is the original
     # per-token protocol; larger runs still yield at every step boundary.
     decode_run_steps: int = 1
+    # Capture D-stage decode forwards as SGLang-native CUDA graphs (one per
+    # batch size 1..max_model_inflight). P stays eager. Off keeps every
+    # forward eager, as before.
+    decode_cuda_graph: bool = False
     # Original MuxServe sizing: KV = gpu_memory_utilization x total GPU memory
     # (see kv_bytes_from_fraction). When set, the launcher resolves it into
     # kv_bytes_per_rank before writing the runtime config; mutually exclusive
@@ -185,6 +189,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "Request deadline must be 1000..300000 ms for native integer seconds")
     if config.prepare_timeout_ms > 120000:
         raise IntegrationError("INVALID_CONFIG", "Preparation deadline must be at most 120000 ms")
+    if type(config.decode_cuda_graph) is not bool:
+        raise IntegrationError("INVALID_CONFIG", "decode_cuda_graph must be a boolean")
     if config.decode_run_steps > config.max_new_tokens:
         raise IntegrationError("INVALID_CONFIG", "Decode run length exceeds the output budget")
     if config.queue_limit > 100000:
