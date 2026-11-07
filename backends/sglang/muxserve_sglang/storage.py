@@ -7,14 +7,15 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from itertools import islice
 import pickle
 from threading import RLock
 from typing import Any, Sequence
 from uuid import uuid4
 
-from .contracts import (IntegrationError, KVTarget, KVView, ModelLayout, RequestIdentity, Reservation,
-                        pack_tables)
+import numpy as np
+
+from .contracts import (IntegrationError, KVTarget, KVView, ModelLayout, PackedBlocks, RequestIdentity,
+                        Reservation)
 
 
 def _copy_metadata(value: Any) -> Any:
@@ -22,12 +23,45 @@ def _copy_metadata(value: Any) -> Any:
     return pickle.loads(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
 
 
+class _FreeBlocks:
+    """One pool's free block IDs as a stack: take/put move whole arrays.
+
+    Blocks are handed out lowest ID first from a fresh pool, then most
+    recently freed first. Only the store holds it, under the store lock.
+    """
+    def __init__(self, blocks):
+        self.data = np.array(sorted(blocks), dtype=np.int32)[::-1].copy()
+        self.top = len(self.data)
+
+    def __len__(self) -> int:
+        return self.top
+
+    def take(self, count: int) -> np.ndarray:
+        if not 0 <= count <= self.top:
+            raise IntegrationError("INVARIANT_VIOLATION", "Free block stack underflow")
+        chosen = self.data[self.top - count:self.top][::-1].copy()
+        self.top -= count
+        return chosen
+
+    def put(self, blocks: np.ndarray) -> None:
+        count = len(blocks)
+        if self.top + count > len(self.data):
+            raise IntegrationError("INVARIANT_VIOLATION", "Free block stack overflow (double free)")
+        self.data[self.top:self.top + count] = blocks[::-1]
+        self.top += count
+
+    def as_set(self) -> set[int]:
+        return set(self.data[:self.top].tolist())
+
+
 @dataclass
 class _Allocation:
     allocation_id: str
     identity: RequestIdentity
     layout: ModelLayout
-    tables: dict[int, list[list[list[int]]]]
+    # Per rank int32[layer, head, page]; pages [0, capacity // block_size)
+    # are mapped, the rest is unused room up to the context limit.
+    arrays: dict[int, np.ndarray]
     capacity: int = 0
     valid: int = 0
     version: int = 0
@@ -36,6 +70,18 @@ class _Allocation:
     # Bumped on every physical mapping change; keys the packed view cache.
     epoch: int = 0
     packed: tuple | None = None
+
+    @property
+    def pages(self) -> int:
+        return self.capacity // self.layout.block_size
+
+    def mapped(self, rank: int) -> np.ndarray:
+        return self.arrays[rank][:, :, :self.pages]
+
+    @property
+    def tables(self) -> dict[int, list[list[list[int]]]]:
+        """Nested-list copy of the mapping (snapshots, checks, diagnostics)."""
+        return {rank: self.mapped(rank).tolist() for rank in self.arrays}
 
 
 @dataclass
@@ -80,12 +126,15 @@ class HeadwiseStore:
                 raise IntegrationError("INVALID_ARGUMENT", "Static pool requires unique model IDs and at least one block per model")
         self._lock = RLock()
         self._pool = dict(pool_blocks_by_rank)
-        self._free = {r: set(range(n)) for r, n in self._pool.items()}
+        # Shared mode: one free stack per rank. Static mode: one per model and
+        # rank (self._free stays empty); a rank's free count is their sum.
+        self._free = ({r: _FreeBlocks(range(n)) for r, n in self._pool.items()}
+                      if pool_mode == "shared" else {})
         self._pool_mode = pool_mode
         self._batch_history_limit = batch_history_limit
         self._model_ids = model_ids if pool_mode == "static" else ()
         self._model_ranges: dict[str, dict[int, tuple[int, ...]]] = {}
-        self._model_free: dict[str, dict[int, set[int]]] = {}
+        self._model_free: dict[str, dict[int, _FreeBlocks]] = {}
         if pool_mode == "static":
             for model_index, model_id in enumerate(model_ids):
                 self._model_ranges[model_id] = {}
@@ -96,7 +145,7 @@ class HeadwiseStore:
                     start = model_index * base + min(model_index, remainder)
                     blocks = tuple(range(start, start + count))
                     self._model_ranges[model_id][rank] = blocks
-                    self._model_free[model_id][rank] = set(blocks)
+                    self._model_free[model_id][rank] = _FreeBlocks(blocks)
         self._models: dict[str, ModelLayout] = {}
         self._allocations: dict[str, _Allocation] = {}
         self._identities: dict[RequestIdentity, str] = {}
@@ -186,9 +235,10 @@ class HeadwiseStore:
                     # Retrying the same retired attempt must use a new attempt number.
                     if latest == identity.attempt and identity not in self._identities:
                         raise IntegrationError("STALE_ATTEMPT", "Retired request attempt cannot be reused")
+                    max_pages = (self._max_context + layout.block_size - 1) // layout.block_size
                     allocation = _Allocation(uuid4().hex, identity, layout,
-                        {r: [[[] for _ in range(layout.kv_heads_per_rank)]
-                             for _ in range(layout.num_layers)] for r in layout.ranks})
+                        {r: np.empty((layout.num_layers, layout.kv_heads_per_rank, max_pages), np.int32)
+                         for r in layout.ranks})
                     new_allocation_count += 1
                 if key not in self._latest_attempt:
                     new_request_keys.add(key)
@@ -205,7 +255,7 @@ class HeadwiseStore:
                     or len(self._allocations) + len(self._retired_ids) + new_allocation_count >
                     self.HISTORY_LIMIT * 2):
                 raise IntegrationError("HISTORY_FULL", "Store identity history requires safe owner restart")
-            if any(needs[r] > len(self._free[r]) for r in needs):
+            if any(needs[r] > self._free_count(r) for r in needs):
                 raise IntegrationError("OUT_OF_CAPACITY", "Atomic all-rank KV reservation failed")
             if self._pool_mode == "static" and any(
                     needs_by_model[mid][rank] > len(self._model_free[mid][rank])
@@ -224,26 +274,16 @@ class HeadwiseStore:
                     self._allocations[aid] = allocation
                     self._identities[allocation.identity] = aid
                 groups = (capacity - allocation.capacity) // allocation.layout.block_size
-                for rank, layers in allocation.tables.items():
+                first = allocation.pages
+                layers, heads = allocation.layout.num_layers, allocation.layout.kv_heads_per_rank
+                for rank, table in allocation.arrays.items():
                     ranks.add(rank)
                     if not groups:
                         continue
-                    model_id = allocation.identity.model_id
-                    source = (self._model_free[model_id][rank] if self._pool_mode == "static"
-                              else self._free[rank])
-                    # Take any ``needed`` free blocks in O(needed): iterating
-                    # the set yields them in its (deterministic) slot order, so
-                    # no O(pool) sort of every free block per rank.
-                    needed = groups * sum(len(heads) for heads in layers)
-                    chosen = list(islice(source, needed))
-                    offset = 0
-                    for heads in layers:
-                        for blocks in heads:
-                            blocks.extend(chosen[offset:offset + groups])
-                            offset += groups
-                    self._free[rank].difference_update(chosen)
-                    if self._pool_mode == "static":
-                        self._model_free[model_id][rank].difference_update(chosen)
+                    # Each (layer, head) gets the next ``groups`` blocks, in
+                    # layer-major order, appended after its mapped pages.
+                    chosen = self._free_source(allocation, rank).take(groups * layers * heads)
+                    table[:, :, first:first + groups] = chosen.reshape(layers, heads, groups)
                 if groups:
                     allocation.epoch += 1
                 allocation.capacity = capacity
@@ -438,8 +478,8 @@ class HeadwiseStore:
     def rank_usage(self) -> dict:
         """Return capacity counters without materializing allocation mappings."""
         with self._lock:
-            return {rank: {"total_blocks": total, "free_blocks": len(self._free[rank]),
-                           "used_blocks": total - len(self._free[rank])}
+            return {rank: {"total_blocks": total, "free_blocks": self._free_count(rank),
+                           "used_blocks": total - self._free_count(rank)}
                     for rank, total in self._pool.items()}
 
     def snapshot(self) -> dict:
@@ -447,8 +487,8 @@ class HeadwiseStore:
             return {
                 "closing": self._closing,
                 "pool_mode": self._pool_mode,
-                "ranks": {r: {"total_blocks": n, "free_blocks": len(self._free[r]),
-                              "used_blocks": n - len(self._free[r])} for r, n in self._pool.items()},
+                "ranks": {r: {"total_blocks": n, "free_blocks": self._free_count(r),
+                              "used_blocks": n - self._free_count(r)} for r, n in self._pool.items()},
                 "model_partitions": {mid: {
                     "block_ranges_by_rank": {r: (blocks[0], blocks[-1] + 1)
                                               for r, blocks in ranks.items()},
@@ -458,9 +498,8 @@ class HeadwiseStore:
                     for mid, ranks in self._model_ranges.items()},
                 "allocations": {aid: {"identity": a.identity, "capacity_tokens": a.capacity,
                     "valid_tokens": a.valid, "holders": sorted(a.holders), "active_batch": a.active,
-                    "version": a.version, "block_tables": deepcopy(a.tables),
-                    "headwise_blocks_by_rank": {r: sum(len(b) for hs in ls for b in hs)
-                                                for r, ls in a.tables.items()}}
+                    "version": a.version, "block_tables": a.tables,
+                    "headwise_blocks_by_rank": {r: int(a.mapped(r).size) for r in a.arrays}}
                     for aid, a in self._allocations.items()},
                 "reservations": {rid: {"batch_id": b.reservation.batch_id, "state": b.state,
                     "assigned_ranks": sorted(b.ranks), "completed_ranks": sorted(b.completed),
@@ -491,35 +530,34 @@ class HeadwiseStore:
                     batch = self._batches.get(a.active)
                     check(batch is not None and batch.state in {"PREPARING", "RUNNING", "FENCED"}
                           and aid in batch.old_capacity, "Batch access mismatch")
-                check(set(a.tables) == set(a.layout.ranks), "Rank mapping mismatch")
+                check(set(a.arrays) == set(a.layout.ranks), "Rank mapping mismatch")
                 groups = a.capacity // a.layout.block_size
-                for r, layers in a.tables.items():
-                    check(len(layers) == a.layout.num_layers, "Layer count mismatch")
-                    for heads in layers:
-                        check(len(heads) == a.layout.kv_heads_per_rank, "Head count mismatch")
-                        for blocks in heads:
-                            check(len(blocks) == groups, "Ceil token mapping mismatch")
-                            for block in blocks:
-                                check(0 <= block < self._pool[r] and block not in owned[r], "Duplicate/invalid block")
-                                owned[r].add(block)
-                                if self._pool_mode == "static":
-                                    check(block in self._model_ranges[a.identity.model_id][r],
-                                          "Allocation escaped its static model partition")
-                                    model_owned[a.identity.model_id][r].add(block)
+                for r, table in a.arrays.items():
+                    check(table.dtype == np.int32 and table.ndim == 3, "Block table type mismatch")
+                    check(table.shape[0] == a.layout.num_layers, "Layer count mismatch")
+                    check(table.shape[1] == a.layout.kv_heads_per_rank, "Head count mismatch")
+                    check(table.shape[2] >= groups, "Ceil token mapping mismatch")
+                    for block in a.mapped(r).reshape(-1).tolist():
+                        check(0 <= block < self._pool[r] and block not in owned[r], "Duplicate/invalid block")
+                        owned[r].add(block)
+                        if self._pool_mode == "static":
+                            check(block in self._model_ranges[a.identity.model_id][r],
+                                  "Allocation escaped its static model partition")
+                            model_owned[a.identity.model_id][r].add(block)
             for r, blocks in owned.items():
-                check(not (blocks & self._free[r]), "Live block marked free")
-                check(blocks | self._free[r] == set(range(self._pool[r])), "Pool accounting mismatch")
+                free = self._free_set(r)
+                check(len(free) == self._free_count(r), "Duplicate free block")
+                check(not (blocks & free), "Live block marked free")
+                check(blocks | free == set(range(self._pool[r])), "Pool accounting mismatch")
             if self._pool_mode == "static":
                 for mid in self._model_ids:
                     for rank in self._pool:
                         partition = set(self._model_ranges[mid][rank])
-                        free = self._model_free[mid][rank]
+                        free = self._model_free[mid][rank].as_set()
+                        check(len(free) == len(self._model_free[mid][rank]), "Duplicate free block")
                         check(not (model_owned[mid][rank] & free), "Live model block marked free")
                         check(model_owned[mid][rank] | free == partition,
                               "Static model partition accounting mismatch")
-                        check(self._free[rank] == set().union(*(
-                            self._model_free[other][rank] for other in self._model_ids)),
-                            "Global and static free block maps differ")
             for rid, b in self._batches.items():
                 if b.state in {"PREPARING", "RUNNING", "FENCED"}:
                     check(all(aid in self._allocations and self._allocations[aid].active == rid
@@ -552,12 +590,31 @@ class HeadwiseStore:
             raise IntegrationError("UNKNOWN_RESERVATION", "Reservation is unknown")
         return self._batches[reservation_id]
 
+    def _free_count(self, rank: int) -> int:
+        if self._pool_mode == "static":
+            return sum(len(self._model_free[mid][rank]) for mid in self._model_ids)
+        return len(self._free[rank])
+
+    def _free_set(self, rank: int) -> set[int]:
+        if self._pool_mode == "static":
+            return set().union(*(self._model_free[mid][rank].as_set() for mid in self._model_ids))
+        return self._free[rank].as_set()
+
+    def _free_source(self, allocation: _Allocation, rank: int) -> _FreeBlocks:
+        if self._pool_mode == "static":
+            return self._model_free[allocation.identity.model_id][rank]
+        return self._free[rank]
+
     @staticmethod
     def _view(a: _Allocation) -> KVView:
         # Views carry immutable PackedBlocks: callers cannot alias or mutate
-        # the store's mapping, and copying a view no longer walks every block.
+        # the store's mapping. The store's int32[layer, head, page] array is
+        # PackedBlocks' byte layout, so packing is one copy of the mapped pages.
         if a.packed is None or a.packed[0] != a.epoch:
-            a.packed = (a.epoch, pack_tables(a.tables))
+            pages = a.pages
+            a.packed = (a.epoch, {rank: PackedBlocks(a.layout.num_layers, a.layout.kv_heads_per_rank,
+                                                     pages, a.mapped(rank).tobytes())
+                                  for rank in a.arrays})
         return KVView(a.allocation_id, a.identity, a.capacity, a.valid,
                       a.layout.block_size, dict(a.packed[1]), a.version)
 
@@ -567,14 +624,9 @@ class HeadwiseStore:
             if allocation.active != batch.reservation.reservation_id:
                 raise IntegrationError("INVARIANT_VIOLATION", "Stale reservation rollback")
             groups = capacity // allocation.layout.block_size
-            for rank, layers in allocation.tables.items():
-                for heads in layers:
-                    for blocks in heads:
-                        released = blocks[groups:]
-                        self._free[rank].update(released)
-                        if self._pool_mode == "static":
-                            self._model_free[allocation.identity.model_id][rank].update(released)
-                        del blocks[groups:]
+            for rank, table in allocation.arrays.items():
+                released = table[:, :, groups:allocation.pages].reshape(-1)
+                self._free_source(allocation, rank).put(released)
             allocation.epoch += 1
             allocation.capacity = capacity
             allocation.version += 1
@@ -586,11 +638,8 @@ class HeadwiseStore:
     def _collect(self, allocation: _Allocation) -> None:
         if allocation.holders or allocation.active is not None:
             return
-        for rank, layers in allocation.tables.items():
-            released = {block for heads in layers for blocks in heads for block in blocks}
-            self._free[rank].update(released)
-            if self._pool_mode == "static":
-                self._model_free[allocation.identity.model_id][rank].update(released)
+        for rank in allocation.arrays:
+            self._free_source(allocation, rank).put(allocation.mapped(rank).reshape(-1))
         self._allocations.pop(allocation.allocation_id)
         self._identities.pop(allocation.identity)
         self._retired_ids.add(allocation.allocation_id)

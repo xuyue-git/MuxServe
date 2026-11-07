@@ -605,7 +605,7 @@ def allocation_cost_checks():
     for rank in range(4):
         flat = [b for heads in tables[rank] for blocks in heads for b in blocks]
         assert len(flat) == 60 * 13 * 40 and len(set(flat)) == len(flat)
-        assert not set(flat) & store._free[rank]
+        assert not set(flat) & store._free_set(rank)
     store.assert_integrity()
 
 
