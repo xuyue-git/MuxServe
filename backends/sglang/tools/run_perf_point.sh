@@ -16,6 +16,10 @@
 # DECODE_GRAPH=1 (D-stage decode CUDA graphs: config decode_cuda_graph=true),
 # PARK=1 (decode runs park for a waiting prefill: config decode_run_park=true),
 # PREFILL_GRAPH=1 (P-stage breakable prefill CUDA graphs: config prefill_cuda_graph=true),
+# INLINE_START=1 (controller STARTs a batch the moment it is startable: config inline_start=true),
+# SKIP_P=1 (decode batches involve only D ranks: config decode_skip_prefill_ranks=true),
+# EARLY_TOKEN=1 (publish the prefill token at commit, not after the D handoff:
+# config prefill_early_token=true; moves the TTFT boundary, adds the handoff to TPOT),
 # PROFILE=1 (torch.profiler on each model's D rank 0 for 10 decode steps at
 # its 300th and 1600th run step; summaries in OUT_DIR/profile; diagnosis only;
 # MXS_PROFILE_RANKS=P0 MXS_PROFILE_AT=3,12 MXS_PROFILE_STEPS=4 profiles prefills;
@@ -39,12 +43,16 @@ PROFILE="${PROFILE:-}"
 DECODE_GRAPH="${DECODE_GRAPH:-}"
 PARK="${PARK:-}"
 PREFILL_GRAPH="${PREFILL_GRAPH:-}"
+INLINE_START="${INLINE_START:-}"
+SKIP_P="${SKIP_P:-}"
+EARLY_TOKEN="${EARLY_TOKEN:-}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
-"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" <<'PYEOF'
+"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" <<'PYEOF'
 import json, sys
-source, target, locks, root, steps, fraction, headroom, graph, park, pgraph = sys.argv[1:]
+(source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
+ inline, skip_p, early) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -62,6 +70,11 @@ if park:
 config.pop("prefill_cuda_graph", None)
 if pgraph:
     config["prefill_cuda_graph"] = True
+for key, value in (("inline_start", inline), ("decode_skip_prefill_ranks", skip_p),
+                   ("prefill_early_token", early)):
+    config.pop(key, None)
+    if value:
+        config[key] = True
 if int(steps) > 0:
     config["decode_run_steps"] = int(steps)
 for model, size in zip(config["models"], ("7b", "13b", "30b")):
@@ -74,7 +87,10 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "headroom=%dMiB" % (config["extra_headroom_bytes_per_rank"] // 1024**2),
       "decode_graph=%s" % config.get("decode_cuda_graph", False),
       "park=%s" % config.get("decode_run_park", False),
-      "prefill_graph=%s" % config.get("prefill_cuda_graph", False))
+      "prefill_graph=%s" % config.get("prefill_cuda_graph", False),
+      "inline_start=%s" % config.get("inline_start", False),
+      "skip_p=%s" % config.get("decode_skip_prefill_ranks", False),
+      "early_token=%s" % config.get("prefill_early_token", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

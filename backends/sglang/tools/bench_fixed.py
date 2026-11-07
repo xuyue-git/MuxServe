@@ -103,10 +103,12 @@ def generate(port: int, model: str, input_ids: list[int], output_len: int, timeo
     except (OSError, ValueError) as exc:
         error = repr(exc)
     finally:
+        done = time.monotonic()  # stream end ([DONE]); the closed loop sends the next request now
         connection.close()
     if error is None and len(output_ids) != output_len:
         error = f"expected {output_len} tokens, got {len(output_ids)}"
-    return {"sent": sent, "token_times": token_times, "output_ids": output_ids, "error": error}
+    return {"sent": sent, "token_times": token_times, "output_ids": output_ids, "error": error,
+            "done": done}
 
 
 def summarize(records: list[dict]) -> dict:
@@ -120,9 +122,16 @@ def summarize(records: list[dict]) -> dict:
     tpot = [(r["token_times"][-1] - r["token_times"][0]) / (len(r["token_times"]) - 1) for r in ok]
     gaps = sorted(b - a for r in ok for a, b in zip(r["token_times"], r["token_times"][1:]))
     pick = lambda q: gaps[min(len(gaps) - 1, int(q * (len(gaps) - 1)))]
+    # Last token to stream end: server-side completion (quiesce/cleanup) that a
+    # closed loop waits for before its next request; outside TTFT and TPOT.
+    tails = [r["done"] - r["token_times"][-1] for r in ok if r.get("done") is not None]
+    ordered = sorted(ok, key=lambda r: r["sent"])
+    cycles = [b["sent"] - a["sent"] for a, b in zip(ordered, ordered[1:])]
     return {"requests": len(records), "completed": len(ok), "output_tokens": tokens,
             "window_s": end - start, "output_tokens_per_second": tokens / (end - start),
             "mean_ttft_s": statistics.mean(ttft), "mean_tpot_s": statistics.mean(tpot),
+            "mean_tail_s": statistics.mean(tails) if tails else None,
+            "mean_cycle_s": statistics.mean(cycles) if cycles else None,
             "token_gap_s": {"p50": pick(0.5), "p90": pick(0.9), "p99": pick(0.99), "max": gaps[-1]}}
 
 
@@ -229,13 +238,14 @@ def main() -> None:
               "errors": errors, "outputs_consistent": consistency, "reference_match": reference_match,
               "first_output_ids": {m: (outputs[m][0] if outputs[m] else None) for m in models},
               "controller_metrics_before": before, "controller_metrics_after": after,
-              "records": {m: [{k: r[k] for k in ("sent", "token_times", "error")} for r in measured[m]]
-                          for m in models}}
+              "records": {m: [{k: r.get(k) for k in ("sent", "token_times", "error", "done")}
+                              for r in measured[m]] for m in models}}
     with open(args.out, "w", encoding="utf-8") as stream:
         json.dump(result, stream)
     print("BENCH_SUMMARY " + json.dumps({"overall": summary["overall"],
           "models": {m: {k: v for k, v in s.items() if k in ("output_tokens_per_second", "mean_ttft_s",
-                                                              "mean_tpot_s", "window_s", "completed")}
+                                                              "mean_tpot_s", "mean_tail_s", "mean_cycle_s",
+                                                              "token_gap_s", "window_s", "completed")}
                      for m, s in summary["models"].items()},
           "outputs_consistent": consistency, "reference_match": reference_match,
           "errors": len(errors)}, indent=1), flush=True)
