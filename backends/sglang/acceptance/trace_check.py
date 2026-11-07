@@ -214,5 +214,36 @@ class TraceChecks(unittest.TestCase):
         self.assertLess(start.index("self.sync()\n        if profiler is not None:\n            profiler.after()"),
                         start.index("gpu_forward_ms = permit"))
 
+    def test_step_profiler_python_mode_ranks_functions(self):
+        from muxserve_sglang import step_profile
+        saved = step_profile._DIR
+
+        def busy_helper():
+            return sum(i * i for i in range(20000))
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                step_profile._DIR = directory
+                os.environ.update(MXS_PROFILE_AT="2", MXS_PROFILE_STEPS="3", MXS_PROFILE_RANKS="P0",
+                                  MXS_PROFILE_PY="1")
+                prof = step_profile.StepProfiler("m", "P", 0)
+                self.assertTrue(prof.enabled and prof.python)
+                for _ in range(7):
+                    prof.before(); busy_helper(); prof.after()
+                self.assertIsNone(prof.profiler)
+                summary = json.load(open(os.path.join(directory, "profile-m-P0-at2-py.json")))
+                self.assertEqual(summary["steps"], 3)
+                self.assertIsNotNone(summary["forward_wall_ms_unprofiled"])
+                names = [row["function"] for row in summary["top_cumulative"]]
+                self.assertTrue(any("busy_helper" in name for name in names), names[:5])
+                row = next(r for r in summary["top_cumulative"] if "busy_helper" in r["function"])
+                self.assertEqual(row["calls_per_step"], 1.0)
+                text = open(os.path.join(directory, "profile-m-P0-at2-py.txt")).read()
+                self.assertIn("(cProfile)", text)
+        finally:
+            step_profile._DIR = saved
+            for key in ("MXS_PROFILE_AT", "MXS_PROFILE_STEPS", "MXS_PROFILE_RANKS", "MXS_PROFILE_PY"):
+                os.environ.pop(key, None)
+
 if __name__ == "__main__":
     unittest.main()

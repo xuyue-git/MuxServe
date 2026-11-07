@@ -16,7 +16,8 @@
 # DECODE_GRAPH=1 (D-stage decode CUDA graphs: config decode_cuda_graph=true),
 # PROFILE=1 (torch.profiler on each model's D rank 0 for 10 decode steps at
 # its 300th and 1600th run step; summaries in OUT_DIR/profile; diagnosis only;
-# MXS_PROFILE_RANKS=P0 MXS_PROFILE_AT=3,12 MXS_PROFILE_STEPS=4 profiles prefills). The launcher is always stopped with SIGINT
+# MXS_PROFILE_RANKS=P0 MXS_PROFILE_AT=3,12 MXS_PROFILE_STEPS=4 profiles prefills;
+# MXS_PROFILE_PY=1 uses cProfile instead: Python functions by self/cum time). The launcher is always stopped with SIGINT
 # (normal drain); the script waits for it to exit.
 set -euo pipefail
 RUNTIME="$(cd "$(dirname "$0")/.." && pwd)"
@@ -80,7 +81,7 @@ fi
 if [ -n "$PROFILE" ]; then
     rm -rf "$OUT/profile"
     export MXS_PROFILE_DIR="$OUT/profile"
-    echo "PROFILE dir=$MXS_PROFILE_DIR at=${MXS_PROFILE_AT:-300,1600} steps=${MXS_PROFILE_STEPS:-10} ranks=${MXS_PROFILE_RANKS:-D0}"
+    echo "PROFILE dir=$MXS_PROFILE_DIR at=${MXS_PROFILE_AT:-300,1600} steps=${MXS_PROFILE_STEPS:-10} ranks=${MXS_PROFILE_RANKS:-D0} python=${MXS_PROFILE_PY:-0}"
 fi
 CUDA_VISIBLE_DEVICES="$GPUS" setsid nohup "$PY" -m muxserve_sglang.launcher "$OUT/config.json" \
     --startup-timeout 7200 > "$OUT/launcher.log" 2>&1 &

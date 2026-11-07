@@ -15,6 +15,11 @@ P rank (e.g. ``MXS_PROFILE_RANKS=P0``) one step is one prefill forward
   activation, sampling, other) and kernel launches per step;
 * top kernels and top CPU ops by self time.
 
+With ``MXS_PROFILE_PY=1`` the same window is captured with cProfile instead
+(the calling thread only, i.e. the forward thread): Python functions ranked
+by self time and by cumulative time per step, written as ``...-py.txt/json``.
+cProfile inflates call-heavy Python, so read the ranking, not absolute ms.
+
 Every failure is swallowed: profiling never changes execution or results.
 """
 from __future__ import annotations
@@ -79,8 +84,10 @@ class StepProfiler:
             self.at = sorted({int(x) for x in os.environ.get("MXS_PROFILE_AT", "300,1600").split(",") if x.strip()})
             self.window = max(1, int(os.environ.get("MXS_PROFILE_STEPS", "10")))
             self.enabled = f"{stage}{rank}" in ranks
+            self.python = os.environ.get("MXS_PROFILE_PY") == "1"
         except Exception:
             self.enabled = False
+        self.python = getattr(self, "python", False)
         self.count = 0
         self.profiler = None
         self.active_at = None
@@ -94,7 +101,13 @@ class StepProfiler:
         if not self.enabled:
             return
         try:
-            if self.profiler is None and self.count in self.at:
+            if self.profiler is None and self.count in self.at and self.python:
+                import cProfile
+                self.profiler = cProfile.Profile()
+                self.profiler.enable()
+                self.active_at = self.count
+                self.walls = []
+            elif self.profiler is None and self.count in self.at:
                 import torch
                 activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
                 self.profiler = torch.profiler.profile(activities=activities, record_shapes=False,
@@ -125,8 +138,12 @@ class StepProfiler:
     def _finish(self) -> None:
         profiler, self.profiler = self.profiler, None
         try:
-            profiler.stop()
-            self._write(profiler)
+            if self.python:
+                profiler.disable()
+                self._write_python(profiler)
+            else:
+                profiler.stop()
+                self._write(profiler)
         except Exception as exc:  # pragma: no cover - diagnosis only
             try:
                 os.makedirs(_DIR, exist_ok=True)
@@ -198,6 +215,48 @@ class StepProfiler:
             handle.write(render(summary))
         if os.environ.get("MXS_PROFILE_CHROME"):
             profiler.export_chrome_trace(base + ".trace.json")
+
+
+    def _write_python(self, profiler) -> None:
+        import pstats
+        steps = len(self.walls)
+        stats = pstats.Stats(profiler).stats
+        rows = []
+        for (filename, line, function), (_, calls, self_s, cum_s, _) in stats.items():
+            short = "/".join(filename.replace("\\", "/").split("/")[-3:])
+            rows.append({"function": f"{short}:{line}({function})"[:160],
+                         "calls_per_step": round(calls / steps, 1),
+                         "self_ms_per_step": round(self_s * 1000 / steps, 3),
+                         "cum_ms_per_step": round(cum_s * 1000 / steps, 3)})
+        baseline = sum(self.baseline) / len(self.baseline) if self.baseline else None
+        summary = {
+            "rank": self.label, "profiled_from_step": self.active_at, "steps": steps,
+            "forward_wall_ms_unprofiled": round(baseline, 3) if baseline is not None else None,
+            "forward_wall_ms_profiled": round(sum(self.walls) / steps, 3),
+            "python_self_ms_per_step_total": round(sum(r["self_ms_per_step"] for r in rows), 3),
+            "top_self": sorted(rows, key=lambda r: -r["self_ms_per_step"])[:40],
+            "top_cumulative": sorted(rows, key=lambda r: -r["cum_ms_per_step"])[:40],
+        }
+        os.makedirs(_DIR, exist_ok=True)
+        base = os.path.join(_DIR, f"profile-{self.label}-at{self.active_at}-py")
+        with open(base + ".json", "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=1)
+        with open(base + ".txt", "w", encoding="utf-8") as handle:
+            handle.write(render_python(summary))
+
+
+def render_python(summary: dict) -> str:
+    lines = [f"rank={summary['rank']} steps={summary['steps']} from_step={summary['profiled_from_step']} (cProfile)",
+             f"forward wall/step: unprofiled={summary['forward_wall_ms_unprofiled']} ms  "
+             f"profiled={summary['forward_wall_ms_profiled']} ms  "
+             f"python self total={summary['python_self_ms_per_step_total']} ms",
+             "top by self time (self ms/step, cum ms/step, calls/step):"]
+    for row in summary["top_self"]:
+        lines.append(f"  {row['self_ms_per_step']:>8.3f} {row['cum_ms_per_step']:>9.3f} {row['calls_per_step']:>8}  {row['function']}")
+    lines.append("top by cumulative time (cum ms/step, self ms/step, calls/step):")
+    for row in summary["top_cumulative"]:
+        lines.append(f"  {row['cum_ms_per_step']:>9.3f} {row['self_ms_per_step']:>8.3f} {row['calls_per_step']:>8}  {row['function']}")
+    return "\n".join(lines) + "\n"
 
 
 def render(summary: dict) -> str:
