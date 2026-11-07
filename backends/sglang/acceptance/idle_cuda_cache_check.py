@@ -99,6 +99,18 @@ class IdleCacheChecks(unittest.TestCase):
         self.assertEqual(self.trace[:3], ['sync', ('release_request', ('request', 1)), 'sync'])
         self.assertEqual(runtime.cursor, 1)
 
+    def test_trim_walks_the_model_once_after_release(self):
+        runtime, _, _ = self.fixture()
+        module = sys.modules['muxserve_sglang.weight_loader']
+        audit, calls = module.audit_shared_weights, []
+        def counted(model):
+            calls.append('empty_cache' in self.trace)
+            return audit(model)
+        module.audit_shared_weights = counted
+        with redirect_stdout(io.StringIO()):
+            runtime._accept(self.command())
+        self.assertEqual(calls, [True], 'One weight audit, after the cache release')
+
     def test_live_request_preparation_mapping_or_room_prevents_trimming(self):
         for field, value in (('requests', {'live': object()}), ('prepared', {'batch': object()}),
                              ('binding', object()), ('descriptors', {'room': object()})):

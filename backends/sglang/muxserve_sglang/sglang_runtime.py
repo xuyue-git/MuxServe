@@ -272,7 +272,9 @@ class ControlledScheduler:
         require(self.runner._muxserve_permit is None, "Live permit prevents idle cache trimming")
         from .weight_loader import _local_alias, audit_shared_weights
         aliases = (_local_alias(self.pool.pool_key), _local_alias(self.pool.pool_value))
-        audit_shared_weights(self.runner.model)
+        # Weight aliases are audited once after the release (they were
+        # audited at load and by every earlier trim); a pre-release audit
+        # walked the whole model again on every request cleanup.
         device = self.runner.gpu_id
         before_allocated = torch.cuda.memory_allocated(device)
         before_reserved = torch.cuda.memory_reserved(device)
