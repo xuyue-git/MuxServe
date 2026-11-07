@@ -3,6 +3,8 @@
 The original implementation remains under the repository root. This optional
 backend has its own build configuration and dependencies under `backends/sglang`.
 It does not silently change the original launcher into an SGLang launcher.
+It imports and calls original code where that code applies without vLLM: SM
+accounting and KV block sizing (see "Reused original code").
 
 ## History and source
 
@@ -27,6 +29,7 @@ To inspect only this migration, run:
 git log --reverse --oneline 2f7172a..HEAD
 git diff --stat 2f7172a..HEAD
 git diff 2f7172a..HEAD -- backends/sglang
+git diff 2f7172a..HEAD -- muxserve     # the three original files changed for reuse
 ```
 
 ## Functional mapping
@@ -35,16 +38,47 @@ git diff 2f7172a..HEAD -- backends/sglang
 |---|---|---|
 | `muxserve/flexserver/llm_runtime.py`, `pipeworker.py`, model execution | `sglang_runtime.py`, `sglang_hooks.py` | Use fixed native SGLang execution with explicit forward grants |
 | `muxserve/muxsched/scheduler.py` | `policy.py`, `controller.py`, `driver.py`, `events.py` | Source-derived ADBS rules, request/batch state and completion protocol |
+| `muxserve/muxsched/resource.py` `SMResource` / `SMPart` | `policy.py` `CreditLedger` | Reused: one original `SMResource` per TP rank allocates and frees the 10 SM parts |
+| `get_num_gpu_blocks` (`flexstore/manager.py`, `muxsched/resource.py`) | `config.kv_bytes_from_fraction` | Reused: original `muxsched.resource.num_gpu_blocks`; bytes unchanged |
 | `muxserve/flexstore/manager.py`, `csrc/memory_manager.*` | `storage.py`, `gpu_storage.py`, `contracts.py` | Separate logical allocation, physical CUDA storage, versions and leases |
 | FlexStore weight loading | `weight_owner.py`, `weight_loader.py` | Share model weight allocations between P/D via CUDA IPC |
 | External MuxServe-vLLM attention and P/D communication | `sglang_memory.py`, `sglang_attention.py`, `sglang_pd.py`, `ops.py`, `native/headwise` | Adapt the original Head-wise layout and kernels to SGLang |
 | `muxserve/launch.py`, launcher/config, MPS scripts | `launcher.py`, `startup.py`, `preflight.py`, `mps_shutdown.py`, `config.py` | Private MPS, explicit assets/devices, admission and ordered shutdown |
 | Offline workload and original control IPC | `gateway.py`, `ipc.py` | HTTP/SSE gateway and authenticated local control messages |
 
-Backend Python names are relative to `muxserve_sglang`. The rules are derived
-from the original scheduler, but this is an independent control implementation,
-not a claim that the original scheduler is reused unchanged. Original placement
-and workload code has not been automatically connected to the new gateway.
+Backend Python names are relative to `muxserve_sglang`. The ADBS rules are
+derived from the original scheduler, but the control implementation is new,
+not the original scheduler reused unchanged; SM accounting and KV block sizing
+call the original code. Original placement and workload code has not been
+automatically connected to the new gateway.
+
+## Reused original code
+
+`muxserve_sglang/__init__.py` appends the repository root to the import path,
+so the launcher and every spawned process import this checkout's `muxserve`
+(another installed copy is rejected). `acceptance/original_reuse_check.py`
+checks that this imports no vLLM, Torch or transformers module.
+
+- `policy.CreditLedger` gives each TP rank one original `SMResource`, created
+  with `overload_threshold` = `credit_multiplier` (1 or 3) explicitly, and
+  allocates with `overload=True` as the original scheduler does. The ledger
+  keeps only the grant protocol: leases keyed by batch id (idempotent replay,
+  changed contents rejected), one lease per (model, stage), all-or-nothing
+  allocation across ranks. Like the original, an overloaded part is picked
+  with `random.choice` (the replaced ledger took the first one); free and
+  overloaded part counts, and so admission, are unchanged.
+- `config.kv_bytes_from_fraction` takes its block count from the original
+  `num_gpu_blocks` (head_size 128, block_size 32, FP16); the bytes equal the
+  previous arithmetic.
+
+To make these imports possible without vLLM or Torch, three original files
+changed without changing what they compute: `muxserve/__init__.py` imports
+`MuxServeArgs`/`MuxScheduler` on first use (PEP 562; `from muxserve import
+MuxScheduler` works as before); `muxserve/config.py` imports Torch only to
+resolve the default `model_dtype` of `JobConfig` (still `torch.float16`);
+`muxserve/muxsched/resource.py` imports Torch/transformers inside
+`get_gpu_memory` and `CacheResource`, and `get_num_gpu_blocks` calls the
+module-level `num_gpu_blocks` holding its formula. `SMResource` is unchanged.
 
 ## Deliberate changes during migration
 
@@ -68,7 +102,11 @@ bootstrap contracts. They use temporary fixtures and simulated rank reports
 only within test code. No GPU correctness, capacity or performance claim follows.
 
 Historical GPU acceptance belongs to the prior project and its harness. This
-migration has not been clean-installed or GPU-tested. Existing per-token mapping
-and control overhead remains; performance optimization needs separate commits.
+branch has not been clean-installed. Later commits reduce the per-token mapping
+and control overhead. `tools/run_perf_point.sh` with `tools/bench_fixed.py`
+runs the paired four-GPU point (LLaMA 7B/13B/30B, TP4, FP16, 512/128, one
+request in flight per model) on original MuxServe's frozen inputs, checking
+every output against the original's tokens; measured results are kept outside
+this repository. SGLang timings are taken at the HTTP client.
 The sample D30/D40 configuration is not the all-D40 fixed synthetic comparison.
 Neither original-paper reproduction nor native xbench invocation is claimed.

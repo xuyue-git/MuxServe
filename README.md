@@ -135,8 +135,11 @@ sudo bash scripts/stop_mps.sh examples/basic/mps
 }
 ```
 
-## Optional SGLang backend
+## SGLang backend
 
-This fork adds an independent [SGLang Head-wise backend](backends/sglang/README.md).
-The original MuxServe/vLLM code and history are preserved. See the
-[migration and original-code comparison](backends/sglang/MIGRATION.md) for scope and validation limits.
+This fork adds an [SGLang Head-wise backend](backends/sglang/README.md) on top of
+this repository's original MuxServe: it imports and calls the original SM
+accounting (`muxserve/muxsched/resource.py` `SMResource`) and KV block sizing
+(`num_gpu_blocks`). The original MuxServe/vLLM code and history are preserved.
+See the [migration and original-code comparison](backends/sglang/MIGRATION.md)
+for what is reused, what is reimplemented, and validation limits.

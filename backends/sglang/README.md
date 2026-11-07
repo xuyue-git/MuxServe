@@ -1,8 +1,9 @@
 # Optional SGLang Head-wise backend
 
-This directory contains the existing SGLang backend, separated from the
-unchanged upstream MuxServe/vLLM implementation. It adds shared weights,
-Head-wise KV storage and externally controlled prefill/decode execution.
+This directory contains the SGLang backend of this MuxServe fork. It runs next
+to the original MuxServe/vLLM implementation in the repository root and imports
+its SM accounting and KV block sizing. It adds shared weights, Head-wise KV
+storage and externally controlled prefill/decode execution.
 
 Source: [MuxServe-SGLang-Head_wise_cache at a512d05](https://github.com/xuyue-git/MuxServe-SGLang-Head_wise_cache/tree/a512d05496122521fb16fa620aa44d8f4d4d3d18).
 SGLang is pinned to **v0.5.20**, commit `94602c9c2b7cbdb8efd5c52802dac6a1c180089e`.
@@ -10,6 +11,8 @@ See [the original-to-backend mapping](MIGRATION.md) and [source notices](NOTICE)
 
 ## Scope
 
+- Original MuxServe `SMResource` (one per TP rank) for SM credits and the
+  original KV block formula, imported from `muxserve.muxsched.resource`.
 - Shared physical Head-wise KV pools and model weights via CUDA IPC.
 - Externally granted prefill/decode execution and request lifecycle control.
 - Native SGLang integration through 13 pinned upstream source patches.
@@ -18,7 +21,9 @@ See [the original-to-backend mapping](MIGRATION.md) and [source notices](NOTICE)
 ## Build and launch
 
 Run backend commands from this directory. Keep its environment separate from
-the legacy root project. The prototype targets Linux, Python 3.10, four reserved
+the legacy root project. `muxserve_sglang` appends the repository root to the
+import path and imports only vLLM-free original modules, so the root package
+needs no installation, but the backend must stay inside this checkout. The prototype targets Linux, Python 3.10, four reserved
 A100 40 GB GPUs, CUDA 13.2 and the package pins in `requirements.txt`.
 
 1. Materialize SGLang with `python tools/bootstrap_source.py`. For offline use,
@@ -97,6 +102,17 @@ model-runner init; Head-wise attention runs eagerly at every graph break.
 Capture writes no KV. On replay the live batch was already validated by the
 grant check, the runner's static batch must carry exactly that grant's
 geometry, and K/V go to the grant's write slots.
+
+Opt-in control-plane fast paths (all off by default): `inline_start` lets the
+controller START a batch as soon as it is startable instead of on the driver's
+next pass; `decode_skip_prefill_ranks` runs decode batches with the D ranks
+only (P ranks no longer prepare/quiesce decode batches they never execute);
+`prefill_early_token` publishes the prefill token once every P rank's result
+is committed, as original MuxServe returns it at prefill end (it moves the
+TTFT boundary; the request is not shorter). `tools/run_perf_point.sh` takes
+`INLINE_START=1 SKIP_P=1 EARLY_TOKEN=1`, and `FROZEN_BUNDLE=... WARMUP_TOTAL=128`
+to bench original MuxServe's frozen 512/128 inputs with its 43/43/42 warmup,
+checking every output against the original's tokens.
 
 ## Known limitations
 
