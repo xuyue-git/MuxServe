@@ -19,6 +19,7 @@ from .contracts import (BatchPlan, IntegrationError, KVTarget, RequestIdentity,
                         RequestRef, RequestSpec, ResumeRecord)
 from .events import RuntimeOutbox
 from .ipc import CommandSnapshot, copy_message
+from . import trace
 from .policy import (ADBS, BatchFeedback, BatchSuggestion, CreditLedger, ModelDemand,
                      PolicySnapshot)
 
@@ -381,6 +382,8 @@ class MuxController:
         target.commands[target.next_command] = (CommandSnapshot.capture(command)
             if kind in ("PREPARE", "HANDOFF") else deepcopy(command))
         target.next_command += 1
+        trace.ev("cmd", payload.get("batch_id") or payload.get("cleanup_id"), kind=kind,
+                 m=group.model_id, s=key[0], r=key[1])
         if owner is not None:
             held[owner] -= 1
         self._notify()
@@ -456,9 +459,14 @@ class MuxController:
                 self._cv.wait(remaining)
             commands = tuple(cmd.detach() if isinstance(cmd, CommandSnapshot) else deepcopy(cmd)
                              for seq, cmd in target.commands.items() if seq > after_seq)
+            if trace.enabled():
+                for cmd in commands:
+                    trace.ev("dlv", cmd.get("batch_id") or cmd.get("cleanup_id"), kind=cmd.get("kind"),
+                             m=group.model_id, s=stage, r=rank, seq=cmd.get("command_seq"))
             return {"commands": commands, "epoch": group.epoch}
 
     def submit_request(self, spec: RequestSpec, *, initialization_token: str | None = None) -> dict:
+        trace.ev("submit", None, m=getattr(spec, "model_id", None), req=getattr(spec, "request_id", None))
         with self.lock:
             self._require_admission()
             if self.initializing and initialization_token != self._initialization_token:
@@ -711,6 +719,7 @@ class MuxController:
                                     "fenced": g.fenced} for m, g in self.groups.items()}}
 
     def prepare_batch(self, plan: BatchPlan) -> dict:
+        trace.ev("prep_call", getattr(plan, "batch_id", None))
         with self.lock:
             self._require_admission()
             if not isinstance(plan, BatchPlan) or plan.stage not in _STAGES or not plan.requests:
@@ -838,6 +847,9 @@ class MuxController:
                     **self._command_payload(group, batch, key), "_command_owner": owner})
             self.policy.admitted(BatchSuggestion(plan.model_id, plan.stage,
                 tuple(ref.request_id for ref in plan.requests), plan.purpose))
+            trace.ev("prep", plan.batch_id, m=plan.model_id, gid=plan.group_id, s=plan.stage,
+                     purpose=plan.purpose, steps=plan.steps,
+                     reqs=[ref.request_id for ref in plan.requests])
             return self._batch_view(batch)
 
     @staticmethod
@@ -946,6 +958,7 @@ class MuxController:
                                "batch_stage": batch.plan.stage, "purpose": batch.plan.purpose,
                                "grant_id": batch.reservation.reservation_id,
                                "_command_owner": batch.holder})
+            trace.ev("start", batch_id, m=batch.plan.model_id, s=batch.plan.stage)
             return self._batch_view(batch)
 
     @staticmethod
@@ -1093,6 +1106,7 @@ class MuxController:
 
     def rank_report(self, group_id: str, stage: str, rank: int, pid: int,
                     report_id: str, batch_id: str, kind: str, payload: dict) -> dict:
+        trace.ev("rpt", batch_id, kind=kind, gid=group_id, s=stage, r=rank)
         with self.lock:
             group = self._group(group_id)
             key = (stage, rank)
@@ -1173,6 +1187,7 @@ class MuxController:
         The controller already owns the complete atomic reservation. The native
         slot is a CPU ordinal, never a pointer or a transfer-completion proof.
         """
+        trace.ev("brk", None, op="register_destination", gid=group_id, room=room, r=rank)
         with self.lock:
             group = self._group(group_id)
             target = group.registered.get(("D", rank))
@@ -1212,6 +1227,7 @@ class MuxController:
                          allocation_id: str, reserved_version: int,
                          target_valid_tokens: int) -> dict:
         """Read all-D destination readiness; independent of P READY/STAGE."""
+        trace.ev("brk", None, op="bootstrap", gid=group_id, room=room, r=rank)
         with self.lock:
             group = self._group(group_id)
             target = group.registered.get(("P", rank))
@@ -1230,6 +1246,7 @@ class MuxController:
     def broker_stage(self, group_id: str, room: int, rank: int, pid: int,
                      metadata: dict) -> dict:
         """P sender.send stores CPU metadata privately; this never publishes it."""
+        trace.ev("brk", None, op="stage", gid=group_id, room=room, r=rank)
         with self.lock:
             group = self._group(group_id)
             target = group.registered.get(("P", rank))
@@ -1276,6 +1293,7 @@ class MuxController:
     def broker_lookup(self, group_id: str, room: int, rank: int, pid: int,
                       model_id: str, request_id: str, attempt: int,
                       allocation_id: str, version: int, valid_tokens: int) -> dict:
+        trace.ev("brk", None, op="lookup", gid=group_id, room=room, r=rank)
         with self.lock:
             group = self._group(group_id)
             target = group.registered.get(("D", rank))
@@ -1297,6 +1315,7 @@ class MuxController:
     def broker_ack(self, group_id: str, room: int, rank: int, pid: int,
                    allocation_id: str, version: int, valid_tokens: int,
                    rank_block_table: list) -> dict:
+        trace.ev("brk", None, op="ack", gid=group_id, room=room, r=rank)
         with self.lock:
             group = self._group(group_id)
             target = group.registered.get(("D", rank))
@@ -1314,6 +1333,7 @@ class MuxController:
     def broker_poll(self, group_id: str, room: int, rank: int, pid: int,
                     stage: str = "D") -> dict:
         """Native receiver may finish transfer once every D rank validated mapping."""
+        trace.ev("brk", None, op="poll", gid=group_id, room=room, r=rank)
         with self.lock:
             group = self._group(group_id)
             target = group.registered.get((stage, rank))
@@ -1392,6 +1412,7 @@ class MuxController:
         if len(batch.gpu) != len(group.ranks):
             return
         batch.gpu_completed_at = self.clock()
+        trace.ev("gpu_all", batch.plan.batch_id, m=batch.plan.model_id, s=batch.plan.stage)
         batch.output_metadata = results
         if batch.plan.steps > 1:
             if len(batch.run_reports.get(payload["steps"], {})) != len(group.ranks):
@@ -1472,6 +1493,7 @@ class MuxController:
         once per step and replayed to every rank, so TP ranks never diverge on
         whether another forward follows.
         """
+        trace.ev("dstep", batch_id, gid=group_id, r=rank, step=step)
         with self.lock:
             group = self._group(group_id)
             target = group.registered.get(("D", rank))
@@ -1615,6 +1637,7 @@ class MuxController:
         if len(batch.handoff) == len(group.ranks):
             if batch.gpu_completed_at is not None:
                 batch.pd_handoff_ms = max(0.0, (self.clock() - batch.gpu_completed_at) * 1000)
+            trace.ev("handoff_all", batch.plan.batch_id, m=batch.plan.model_id)
             if batch.plan.purpose != "REBUILD":
                 self._apply_tokens(group, batch)
             else:
@@ -1682,6 +1705,7 @@ class MuxController:
                 self._finish_batch(group, batch)
 
     def _finish_batch(self, group: _Group, batch: _Batch) -> None:
+        trace.ev("finish", batch.plan.batch_id, m=batch.plan.model_id, s=batch.plan.stage)
         try:
             before = {"ranks": self.store.rank_usage()}
         except IntegrationError as exc:

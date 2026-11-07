@@ -9,7 +9,10 @@
 # compare output tokens against), KV_FRACTION (size the KV pool like original
 # MuxServe: gpu_memory_utilization x total GPU memory, instead of kv_bytes_per_rank),
 # HEADROOM_MIB (startup free-memory gate per card; default 2048 from the sample
-# config, minimum 1024; lowering it is a deviation from the approved design). The launcher is always stopped with SIGINT
+# config, minimum 1024; lowering it is a deviation from the approved design),
+# TRACE=1 (record a timing trace into OUT_DIR/trace and write
+# OUT_DIR/trace-report.txt after stopping; recording only), SOLO=1 (with the
+# same deployment, afterwards run each model alone: SOLO_REQUESTS, default 8). The launcher is always stopped with SIGINT
 # (normal drain); the script waits for it to exit.
 set -euo pipefail
 RUNTIME="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,6 +25,9 @@ GPUS="${GPUS:-1,2,3,4}"
 REFERENCE="${REFERENCE:-}"
 KV_FRACTION="${KV_FRACTION:-}"
 HEADROOM_MIB="${HEADROOM_MIB:-}"
+TRACE="${TRACE:-}"
+SOLO="${SOLO:-}"
+SOLO_REQUESTS="${SOLO_REQUESTS:-8}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
@@ -54,6 +60,13 @@ if [ -n "$busy" ]; then
 fi
 
 cd "$RUNTIME"
+PHASE_ARGS=()
+if [ -n "$TRACE" ]; then
+    rm -rf "$OUT/trace" "$OUT/phases.txt"
+    export MXS_TRACE_DIR="$OUT/trace"
+    PHASE_ARGS=(--phase-file "$OUT/phases.txt")
+    echo "TRACE dir=$MXS_TRACE_DIR"
+fi
 CUDA_VISIBLE_DEVICES="$GPUS" setsid nohup "$PY" -m muxserve_sglang.launcher "$OUT/config.json" \
     --startup-timeout 7200 > "$OUT/launcher.log" 2>&1 &
 SUPERVISOR=$!
@@ -75,5 +88,22 @@ trap stop_launcher EXIT
 
 "$PY" "$RUNTIME/tools/bench_fixed.py" --port 18080 --requests "$REQUESTS" --warmup "$WARMUP" \
     --ready-timeout 7200 --supervisor-pid "$SUPERVISOR" --out "$OUT/bench.json" \
+    ${PHASE_ARGS[@]+"${PHASE_ARGS[@]}"} ${TRACE:+--phase-name concurrent} \
     ${REFERENCE:+--reference "$REFERENCE"} 2>&1 | tee "$OUT/bench.log"
 echo "RESULT $OUT/bench.json"
+
+if [ -n "$SOLO" ]; then
+    for model in llama7b llama13b llama30b; do
+        "$PY" "$RUNTIME/tools/bench_fixed.py" --port 18080 --models "$model" \
+            --requests "$SOLO_REQUESTS" --warmup 1 --ready-timeout 600 \
+            --supervisor-pid "$SUPERVISOR" --out "$OUT/bench-solo-$model.json" \
+            ${PHASE_ARGS[@]+"${PHASE_ARGS[@]}"} ${TRACE:+--phase-name "solo-$model"} 2>&1 | tee "$OUT/bench-solo-$model.log"
+    done
+fi
+
+if [ -n "$TRACE" ]; then
+    stop_launcher
+    "$PY" "$RUNTIME/tools/trace_report.py" "$OUT/trace" --phases "$OUT/phases.txt" \
+        --json "$OUT/trace-report.json" | tee "$OUT/trace-report.txt"
+    echo "TRACE_REPORT $OUT/trace-report.txt"
+fi

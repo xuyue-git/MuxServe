@@ -23,6 +23,7 @@ from multiprocessing import AuthenticationError
 from multiprocessing.connection import Connection, Listener, answer_challenge, deliver_challenge
 
 from .contracts import IntegrationError
+from . import trace
 from .storage import HeadwiseStore
 
 
@@ -338,6 +339,15 @@ class StorageRPCClient:
             pass
 
     def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if not trace.enabled():
+            return self._call(method, *args, **kwargs)
+        started = time.monotonic()
+        try:
+            return self._call(method, *args, **kwargs)
+        finally:
+            trace.ev("rpc", None, m=method, ms=(time.monotonic() - started) * 1000)
+
+    def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if not isinstance(method, str) or not method or method.startswith("_"):
             raise IntegrationError("INVALID_ARGUMENT", "Explicit RPC method required")
         with self._lock:

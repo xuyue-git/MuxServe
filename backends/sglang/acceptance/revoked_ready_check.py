@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'acceptance'))
 from controller_check import Fixture
+from muxserve_sglang import trace
 from muxserve_sglang.config import DeploymentConfig, ModelDeployment
 from muxserve_sglang.contracts import BatchPlan, IntegrationError, RequestRef, RequestSpec
 from muxserve_sglang.controller import MuxController
@@ -158,7 +159,7 @@ class RevokedReadyChecks(unittest.TestCase):
         method = next(node for node in owner.body if isinstance(node, ast.FunctionDef)
                       and node.name == '_report')
         require = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'require')
-        namespace = dict(deepcopy=deepcopy, IntegrationError=IntegrationError)
+        namespace = dict(deepcopy=deepcopy, IntegrationError=IntegrationError, trace=trace)
         exec(compile(ast.Module(body=[require, method], type_ignores=[]), 'native-report-fixture', 'exec'), namespace)
         fixture, plan, batch = self.cancelled()
         lost = [True]

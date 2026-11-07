@@ -163,6 +163,8 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--reference", help="earlier result JSON whose output tokens must match")
     parser.add_argument("--supervisor-pid", type=int, help="abort the readiness wait if this PID exits")
+    parser.add_argument("--phase-file", help="append '<name> <start> <end>' (time.monotonic) of the measured phase")
+    parser.add_argument("--phase-name", default="measured")
     args = parser.parse_args()
     models = [m for m in args.models.split(",") if m]
     input_ids = synthetic_input(args.input_len, args.seed)
@@ -194,7 +196,11 @@ def main() -> None:
         before = get_json(args.port, "/metrics")[1]
     except OSError:
         pass
+    phase_start = time.monotonic()
     measured = run("measured", args.requests)
+    if args.phase_file:
+        with open(args.phase_file, "a", encoding="utf-8") as handle:
+            handle.write(f"{args.phase_name} {phase_start} {time.monotonic()}\n")
     after = None
     try:
         status, after = get_json(args.port, "/metrics")

@@ -31,6 +31,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import DynamicGradMode
 
+from . import trace
 from .contracts import IntegrationError, KVView, RequestIdentity
 from .ipc import CommandSnapshot, copy_message
 
@@ -116,6 +117,7 @@ class ControlledScheduler:
         require(self.pending_report is None or self.pending_report == envelope,
                 "An uncertain report must be replayed before advancing its sequence")
         self.pending_report = envelope
+        trace.ev("rep_send", batch_id, kind=kind)
         reply = self.rpc("rank_report", self.ctx.stage, self.rank, self.pid, *envelope)
         require(reply["accepted"], "Controller refused a rank report")
         self.report_seq += 1
@@ -123,6 +125,7 @@ class ControlledScheduler:
 
     @DynamicGradMode()
     def run(self):
+        trace.set_role(f"{self.ctx.model.model_id}-{self.ctx.stage}{self.rank}")
         eos = self.s.model_config.hf_eos_token_id
         eos = () if eos is None else tuple(eos) if isinstance(eos, (tuple, list, set)) else (eos,)
         tokenizer = self.s.tokenizer
@@ -155,7 +158,11 @@ class ControlledScheduler:
                     # even when command polling returns different-sized pages.
                     if self.handoff_pending is not None:
                         break
-                    self._accept(backlog.pop(0))
+                    command = backlog.pop(0)
+                    tag = command.get("batch_id") or command.get("cleanup_id")
+                    trace.ev("acc", tag, kind=command.get("kind"), seq=command.get("command_seq"))
+                    self._accept(command)
+                    trace.ev("acc_end", tag, kind=command.get("kind"), seq=command.get("command_seq"))
                     accepted += 1
                     if self.drained or self.handoff_pending is not None:
                         break
@@ -165,6 +172,7 @@ class ControlledScheduler:
                     self.rpc("poll_commands", self.ctx.stage, self.rank, self.pid,
                              self.cursor, self.cursor)
                     self.s.gracefully_exit = True
+                    trace.flush()
                     return
                 self._progress()
                 if accepted or (backlog and self.handoff_pending is None):
@@ -441,6 +449,7 @@ class ControlledScheduler:
                 polls = [r.disagg_kv_sender.poll() for r in state.reqs]
                 require(KVPoll.Failed not in polls, "P bootstrap was aborted")
                 if all(p == KVPoll.WaitingForInput for p in polls):
+                    trace.ev("p_boot_ok", state.command["batch_id"])
                     queue = self.s.disagg_prefill_bootstrap_queue
                     for req in state.reqs:
                         require(queue.finalize_bootstrap(req), "Native P metadata slots exhausted")
@@ -468,7 +477,9 @@ class ControlledScheduler:
                 if all(p == KVPoll.Success for p in polls):
                     # Exactly one native collective transfer pass, only after
                     # owner proof that every rank has ACKed every selected room.
+                    trace.ev("ho_ok", state.command["batch_id"])
                     transferred = queue.pop_transferred([r.rid for r in state.reqs])
+                    trace.ev("ho_pop", state.command["batch_id"])
                     require(transferred == state.reqs, "Native transfer order or success differs")
                     for req in transferred:
                         req.init_next_round_input(self.s.tree_cache)
@@ -480,7 +491,9 @@ class ControlledScheduler:
                     self.s.batch_result_processor.process_batch_result_prebuilt(batch)
                     for req in transferred:
                         self._validate_finish(req)
+                    trace.ev("ho_prebuilt", state.command["batch_id"])
                     self.sync()
+                    trace.ev("ho_sync", state.command["batch_id"])
                     state.handoff_done = True
                     self._report(state.command["batch_id"], "HANDOFF_READY",
                                  {"requests": state.handoff["requests"]})
