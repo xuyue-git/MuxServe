@@ -136,6 +136,19 @@ class DeploymentConfig:
     # kv_bytes_per_rank before writing the runtime config; mutually exclusive
     # with an explicit kv_bytes_per_rank.
     kv_memory_fraction: float | None = None
+    # START a batch inside the controller as soon as it becomes startable
+    # (its last READY arrives, or a parking/finishing batch frees the credits
+    # a READY prefill waits for), instead of on the driver thread's next pass.
+    # Same checks as the driver's start_batch call.
+    inline_start: bool = False
+    # Decode batches involve only the D ranks. P ranks otherwise receive a
+    # PREPARE/QUIESCE for every decode batch only to validate and acknowledge
+    # a mapping they never use. Prefill batches still involve every rank.
+    decode_skip_prefill_ranks: bool = False
+    # Publish a prefill's token as soon as every P rank's result is committed
+    # (same token, all ranks agreed), instead of after the D handoff. The
+    # request still becomes decodable only after the handoff.
+    prefill_early_token: bool = False
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -203,6 +216,9 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "decode_run_park must be a boolean")
     if type(config.prefill_cuda_graph) is not bool:
         raise IntegrationError("INVALID_CONFIG", "prefill_cuda_graph must be a boolean")
+    for name in ("inline_start", "decode_skip_prefill_ranks", "prefill_early_token"):
+        if type(getattr(config, name)) is not bool:
+            raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_run_steps > config.max_new_tokens:
         raise IntegrationError("INVALID_CONFIG", "Decode run length exceeds the output budget")
     if config.queue_limit > 100000:

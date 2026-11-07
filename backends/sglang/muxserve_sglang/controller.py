@@ -139,6 +139,11 @@ class _Batch:
     # Views are immutable for the batch's lifetime, so each is packed once.
     packed: dict[str, dict[int, PackedBlocks]] = field(default_factory=dict)
     packed_committed: dict[str, dict[int, PackedBlocks]] = field(default_factory=dict)
+    # (stage, rank) keys that prepare, READY and quiesce this batch. Every
+    # rank, except decode batches with decode_skip_prefill_ranks (D only).
+    participants: frozenset = frozenset()
+    # prefill_early_token: the prefill's tokens were published at commit.
+    tokens_published: bool = False
 
 
 def _packed_view(batch: _Batch, request_id: str, committed: bool = False) -> dict[int, PackedBlocks]:
@@ -260,6 +265,59 @@ class MuxController:
         self.policy = ADBS(**self._policy_parameters)
         self._tick_count = 0
         self._tick_duration_ms = 0.0
+        # inline_start: allowed only while a scheduling driver owns grants
+        # (ControllerDriver enables it and clears it on pause/failure). An
+        # unexpected inline START failure is kept for the driver to raise.
+        self._inline_start_allowed = False
+        self._inline_starting = False
+        self.inline_start_error: BaseException | None = None
+        self.inline_start_count = 0
+
+    def set_inline_start(self, allowed: bool) -> None:
+        with self.lock:
+            self._inline_start_allowed = bool(allowed) and self.config.inline_start
+
+    def _participants(self, group: _Group, stage: str) -> frozenset:
+        if stage == "D" and self.config.decode_skip_prefill_ranks:
+            return frozenset(("D", rank) for rank in group.ranks)
+        return frozenset(group.required)
+
+    def _start_ready_inline(self) -> None:
+        """Caller holds the lock. With inline_start, START every fully READY
+        preparation now rather than on the driver's next pass. start_batch
+        makes every check; a batch it refuses (NOT_READY: credits, expiry;
+        EVENT_BACKPRESSURE) stays PREPARING for the driver's ordinary retry.
+        Any other failure is kept and re-raised by the driver, exactly as if
+        its own start_batch call had raised it."""
+        if (not self._inline_start_allowed or self._inline_starting
+                or self.inline_start_error is not None or self.protected_failure is not None):
+            return
+        self._inline_starting = True
+        try:
+            for group in self.groups.values():
+                if not group.ready:
+                    continue
+                # Prefills first: a READY prefill is what parked decodes wait for.
+                for batch in sorted(tuple(group.batches.values()), key=lambda b: b.plan.stage != "P"):
+                    if batch.status != "PREPARING" or batch.ready != batch.participants:
+                        continue
+                    try:
+                        self.start_batch(group.group_id, batch.plan.batch_id)
+                        if batch.status == "RUNNING":
+                            self.inline_start_count += 1
+                    except IntegrationError as exc:
+                        if exc.code not in ("NOT_READY", "EVENT_BACKPRESSURE"):
+                            self.inline_start_error = exc
+                            self._inline_start_allowed = False
+                            self.wake.set()
+                            return
+                    except Exception as exc:  # pragma: no cover - surfaced by the driver
+                        self.inline_start_error = exc
+                        self._inline_start_allowed = False
+                        self.wake.set()
+                        return
+        finally:
+            self._inline_starting = False
 
     def rpc_methods(self) -> dict[str, Any]:
         """Explicit allowlist for StorageRPCServer(extra_methods=...)."""
@@ -420,12 +478,13 @@ class MuxController:
         self._notify()
 
     @staticmethod
-    def _reserve_commands(group: _Group, owner: str, count: int) -> None:
+    def _reserve_commands(group: _Group, owner: str, count: int, keys=None) -> None:
+        keys = group.required if keys is None else keys
         if any(len(group.registered[key].commands) +
                sum(group.command_reserved.get(key, {}).values()) + count > _COMMAND_WINDOW
-               for key in group.required):
+               for key in keys):
             raise IntegrationError("COMMAND_BACKPRESSURE", "Rank command replay window full")
-        for key in group.required:
+        for key in keys:
             group.command_reserved.setdefault(key, {})[owner] = count
 
     @staticmethod
@@ -833,17 +892,19 @@ class MuxController:
             elif not self.credits.acquire(plan.batch_id, plan.model_id, plan.stage, credits):
                 raise IntegrationError("OUT_OF_CREDITS", "Per-rank software credits unavailable")
             owner = "batch:" + group.group_id + ":" + plan.batch_id
+            participants = self._participants(group, plan.stage)
             reservation = None
             reserve_called = False
             try:
                 group.outbox.reserve(owner, (plan.steps + 1) * len(requests) + 2)
-                self._reserve_commands(group, owner, 4)
+                self._reserve_commands(group, owner, 4, participants)
                 free_before = self.store.rank_usage()
                 reserve_called = True
                 reservation = self.store.reserve_kv(plan.batch_id, targets, owner)
                 views = {view.identity.request_id: view for view in reservation.views}
                 trace.ev("prep_reserved", plan.batch_id)
                 batch = _Batch(deepcopy(plan), reservation, owner, views, prepared_at=self.clock(),
+                    participants=participants,
                     selected_input_tokens=sum((len(request.spec.input_ids) + len(request.output) - 1)
                         if plan.stage == "P" and plan.purpose == "REBUILD" else
                         len(request.spec.input_ids) if plan.stage == "P" else 1
@@ -885,7 +946,7 @@ class MuxController:
                 raise
             for request in requests:
                 request.state = "PREPARING"
-            for key in sorted(group.required):
+            for key in sorted(participants):
                 self._command(group, key, "PREPARE", {
                     **self._command_payload(group, batch, key), "_command_owner": owner})
             self.policy.admitted(BatchSuggestion(plan.model_id, plan.stage,
@@ -903,6 +964,7 @@ class MuxController:
     def _batch_view(batch: _Batch) -> dict:
         return {"batch_id": batch.plan.batch_id, "group_id": batch.plan.group_id,
                 "status": batch.status, "ready": sorted(batch.ready),
+                "participants": sorted(batch.participants),
                 "reservation_id": batch.reservation.reservation_id}
 
     def _command_payload(self, group: _Group, batch: _Batch,
@@ -969,7 +1031,7 @@ class MuxController:
             if batch.status == "RUNNING":
                 return self._batch_view(batch)
             if (batch.status != "PREPARING" or not group.ready
-                    or batch.ready != group.required):
+                    or batch.ready != batch.participants):
                 raise IntegrationError("NOT_READY", "Every P/D rank must prepare before fresh START")
             protected = self.recovery_protected.get(self._recovery_key(group.model_id))
             identities = {(group.model_id, ref.request_id) for ref in batch.plan.requests}
@@ -1040,8 +1102,8 @@ class MuxController:
             return
         batch.status, batch.failure_reason = "REVOKING", reason
         batch.quiesce_deadline = self.clock() + self.config.prepare_timeout_ms / 1000
-        batch.quiesce_required = group.required
-        for key in sorted(group.required):
+        batch.quiesce_required = set(batch.participants)
+        for key in sorted(batch.participants):
             self._command(group, key, "REVOKE", {"batch_id": batch.plan.batch_id,
                                                   "reservation_id": batch.reservation.reservation_id,
                                                   "reason": reason,
@@ -1095,7 +1157,7 @@ class MuxController:
                         pass  # Uncertain ownership remains pinned in this fenced group.
                 if former == "HANDOFF" and all(group.registered.get(key) and
                         group.registered[key].alive for key in group.required):
-                    self._begin_quiesce(group, item, group.required)
+                    self._begin_quiesce(group, item, item.participants)
         for request in self.requests.values():
             if request.spec.model_id == group.model_id and request.state not in (
                     "FINISHED", "CANCELLED", "TIMED_OUT", "SUSPENDED", "FAILED"):
@@ -1198,6 +1260,8 @@ class MuxController:
             if stage != batch.plan.stage and kind not in ("READY", "HANDOFF_READY", "QUIESCED", "ERROR"):
                 raise IntegrationError("INVALID_REPORT", "Wrong stage for GPU completion")
             if kind == "READY":
+                if key not in batch.participants:
+                    raise IntegrationError("STALE_REPORT", "Rank does not take part in this batch")
                 if not revoked_ready and (batch.status != "PREPARING"
                         or payload != {"reservation_id": batch.reservation.reservation_id}):
                     raise IntegrationError("STALE_REPORT", "READY not for current preparation")
@@ -1206,7 +1270,7 @@ class MuxController:
                 # release storage. Obsolete readiness never votes for START.
                 if not revoked_ready:
                     batch.ready.add(key)
-                    if batch.ready == group.required and batch.ready_at is None:
+                    if batch.ready == batch.participants and batch.ready_at is None:
                         batch.ready_at = self.clock()
             elif kind == "GPU_DONE":
                 if batch.status not in ("RUNNING", "FENCED"):
@@ -1225,6 +1289,9 @@ class MuxController:
             target.reports[report_seq] = fingerprint
             target.last_report_seq = report_seq
             self._notify()
+            # A last READY, or credits freed by GPU_DONE/QUIESCED, can make a
+            # preparation startable; START it now instead of a driver pass later.
+            self._start_ready_inline()
             reply = {"accepted": True, "duplicate": False, "batch": self._batch_view(batch)}
             if revoked_ready:
                 reply["obsolete"] = True
@@ -1493,7 +1560,7 @@ class MuxController:
         if failed:
             batch.rolled_back_blocks = dict(batch.reserved_blocks)
             batch.output_metadata = {}
-            self._begin_quiesce(group, batch, group.required)
+            self._begin_quiesce(group, batch, batch.participants)
             return
         batch.committed_views = {view.identity.request_id: view for view in committed}
         for ref in batch.plan.requests:
@@ -1507,7 +1574,7 @@ class MuxController:
                     self._finish_run_tokens(group, batch)
                 else:
                     self._apply_tokens(group, batch)
-            self._begin_quiesce(group, batch, group.required)
+            self._begin_quiesce(group, batch, batch.participants)
         elif batch.plan.stage == "P":
             batch.status = "HANDOFF"
             # Credits meter SM share. Every P rank has finished its forward, so
@@ -1527,6 +1594,12 @@ class MuxController:
                 self._command(group, ("D", rank_id), "HANDOFF",
                               {**self._handoff_payload(group, batch, rank_id),
                                "_command_owner": batch.holder})
+            if self.config.prefill_early_token and batch.plan.purpose != "REBUILD":
+                # Every P rank agreed on this token and its KV is committed.
+                # Publish it now; the request stays RUNNING (not decodable)
+                # until every D rank has accepted the handoff.
+                self._apply_tokens(group, batch, settle=False)
+                batch.tokens_published = True
         else:
             if batch.plan.steps > 1:
                 if batch.run_applied != batch.run_steps_done:
@@ -1539,7 +1612,7 @@ class MuxController:
             # quiesce round trip uses no SMs. Releasing now lets a waiting
             # prefill (which needs all credits) start one round trip sooner.
             self._release_credits(batch.plan.batch_id)
-            self._begin_quiesce(group, batch, group.required)
+            self._begin_quiesce(group, batch, batch.participants)
 
     def _finish_run_tokens(self, group: _Group, batch: _Batch) -> None:
         """Tokens were published per agreed step; only settle request states."""
@@ -1616,6 +1689,9 @@ class MuxController:
                 trace.ev("park", batch_id, m=group.model_id, step=step)
                 self._release_credits(batch_id)
                 self.wake.set()
+                # The last run to park frees the credits the READY prefill
+                # waits for: START it now (inline_start), not a driver pass later.
+                self._start_ready_inline()
             # A step report changes no command, liveness or broker epoch, so
             # the ranks' long polls need no wake-up (notify_all here woke every
             # waiting poll thread four times per token). Wake only the driver,
@@ -1753,7 +1829,7 @@ class MuxController:
         for group in self.groups.values():
             for batch in group.batches.values():
                 if (batch.plan.stage == "P" and batch.status == "PREPARING"
-                        and batch.ready == group.required
+                        and batch.ready == batch.participants
                         and batch.plan.batch_id not in self.credits.leases):
                     return True
         return False
@@ -1807,7 +1883,9 @@ class MuxController:
             if batch.gpu_completed_at is not None:
                 batch.pd_handoff_ms = max(0.0, (self.clock() - batch.gpu_completed_at) * 1000)
             trace.ev("handoff_all", batch.plan.batch_id, m=batch.plan.model_id)
-            if batch.plan.purpose != "REBUILD":
+            if batch.tokens_published:
+                self._settle_published_tokens(group, batch)
+            elif batch.plan.purpose != "REBUILD":
                 self._apply_tokens(group, batch)
             else:
                 for ref in batch.plan.requests:
@@ -1815,8 +1893,25 @@ class MuxController:
                     request.state = "DECODING"
             self._begin_quiesce(group, batch, {( "P", r) for r in group.ranks})
 
-    def _apply_tokens(self, group: _Group, batch: _Batch) -> None:
-        """Emit only indexed, all-rank agreed output; reserved slots precede mutation."""
+    def _settle_published_tokens(self, group: _Group, batch: _Batch) -> None:
+        """prefill_early_token: tokens went out at commit; the handoff now
+        makes exactly the requests _apply_tokens would have settled decodable."""
+        for ref in batch.plan.requests:
+            request = self._request(group.model_id, ref.request_id)
+            if request.attempt != ref.attempt:
+                self._fence(group, batch, "output_position_changed")
+                raise IntegrationError("STALE_ATTEMPT", "Attempt changed during handoff")
+            if (group.fenced or request.state != "RUNNING"
+                    or request.pending_reason not in (None, "suspend")
+                    or len(request.output) != ref.expected_output_count + 1):
+                continue  # not published, or stopped since: _finish_batch decides
+            request.state = "FINISH_PENDING" if request.finish_reason else "DECODING"
+
+    def _apply_tokens(self, group: _Group, batch: _Batch, settle: bool = True) -> None:
+        """Emit only indexed, all-rank agreed output; reserved slots precede mutation.
+
+        settle=False (prefill_early_token) publishes without making the
+        request decodable; _settle_published_tokens does that at handoff."""
         for ref in batch.plan.requests:
             request = self._request(group.model_id, ref.request_id)
             if request.attempt != ref.attempt or len(request.output) != ref.expected_output_count:
@@ -1843,7 +1938,8 @@ class MuxController:
             if request.first_token_at is None:
                 request.first_token_at = self.clock()
             request.finish_reason = finish
-            request.state = "FINISH_PENDING" if finish else "DECODING"
+            if settle:
+                request.state = "FINISH_PENDING" if finish else "DECODING"
 
     def _begin_quiesce(self, group: _Group, batch: _Batch,
                        keys: set[tuple[str, int]]) -> None:

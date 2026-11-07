@@ -28,6 +28,14 @@ class ControllerDriver:
             receiver.last_seq = groups[model_id]["acked_event_seq"]
         self.stop_event = Event()
         self.thread = Thread(target=self.run, name="external-adbs-driver", daemon=False)
+        # A scheduling driver owns START grants; the controller may then issue
+        # them inline (config inline_start) until pause() or a failure.
+        self._inline(schedule)
+
+    def _inline(self, allowed):
+        setter = getattr(self.controller, "set_inline_start", None)
+        if setter is not None:
+            setter(allowed)
 
     def start(self):
         self.thread.start()
@@ -51,9 +59,13 @@ class ControllerDriver:
             # No cleanup/rollback proof follows an unknown driver failure.
             self.failure = exc
             self.schedule = False
+            self._inline(False)
             logger.exception("Controller driver stopped; supervisor must retain producers")
 
     def step(self):
+        inline_error = getattr(self.controller, "inline_start_error", None)
+        if inline_error is not None:
+            raise inline_error  # an inline START failed exactly where ours would have
         proposals = self.controller.tick(include_adjustments=False)
         for model_id, receiver in self.receivers.items():
             group_id = receiver.group_id
@@ -63,12 +75,13 @@ class ControllerDriver:
                 self.controller.ack_events(group_id, receiver.last_seq)
         self.maintain()
         progress = self.controller.batch_progress()
-        required = {(stage, rank) for stage in ("P", "D") for rank in range(self.config.tp_size)}
+        everyone = {(stage, rank) for stage in ("P", "D") for rank in range(self.config.tp_size)}
         for model_id, batch_id in tuple(self.pending):
             batch = progress[model_id].get(batch_id)
             if batch is None or batch["status"] in ("DONE", "ABORTED"):
                 self.pending.discard((model_id, batch_id))
-            elif batch["status"] == "PREPARING" and set(map(tuple, batch["ready"])) == required:
+            elif batch["status"] == "PREPARING" and set(map(tuple, batch["ready"])) == (
+                    set(map(tuple, batch.get("participants") or ())) or everyone):
                 try:
                     with self.grant_lock:
                         if self.schedule:
@@ -141,6 +154,7 @@ class ControllerDriver:
                 raise
 
     def stop(self):
+        self._inline(False)
         self.stop_event.set()
         wake = getattr(self.controller, "wake", None)
         if wake is not None:
@@ -151,3 +165,4 @@ class ControllerDriver:
         """Return after any current CPU grant call; issue no later grants."""
         with self.grant_lock:
             self.schedule = False
+            self._inline(False)

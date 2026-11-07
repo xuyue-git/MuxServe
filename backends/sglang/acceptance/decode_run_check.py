@@ -31,7 +31,7 @@ class Clock:
 class Sim:
     """TP ranks for every model; commands are fetched exactly like real ranks."""
 
-    def __init__(self, models=("a",), *, tp=2, run_steps=4, blocks=4096, park=False):
+    def __init__(self, models=("a",), *, tp=2, run_steps=4, blocks=4096, park=False, **flags):
         deployments = tuple(ModelDeployment(m, "unused", "0" * 40, "unused", "0" * 40,
                                             2, tp, 128 * tp, 40, 18100 + 10 * i, 18101 + 10 * i,
                                             18102 + 10 * i)
@@ -40,7 +40,7 @@ class Sim:
         self.clock = Clock()
         self.store = HeadwiseStore({rank: blocks for rank in range(tp)})
         self.config = DeploymentConfig(deployments, tp_size=tp, kv_bytes_per_rank=blocks * 8192,
-                                       decode_run_steps=run_steps, decode_run_park=park)
+                                       decode_run_steps=run_steps, decode_run_park=park, **flags)
         self.controller = MuxController(self.config, self.store, clock=self.clock,
                                         expected_lengths={m: 16 for m in models})
         self.cap = {"vocab_size": 64, "eos_token_ids": (9,), "native_pd": True, "headwise_kv": True}
