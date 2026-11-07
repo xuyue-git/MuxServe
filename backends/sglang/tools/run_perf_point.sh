@@ -20,6 +20,9 @@
 # SKIP_P=1 (decode batches involve only D ranks: config decode_skip_prefill_ranks=true),
 # EARLY_TOKEN=1 (publish the prefill token at commit, not after the D handoff:
 # config prefill_early_token=true; moves the TTFT boundary, adds the handoff to TPOT),
+# FROZEN_BUNDLE=/abs/frozen-synthetic-512-128.json (original MuxServe's fixed-workload
+# input per model; every output must equal its expected tokens), WARMUP_TOTAL=128
+# (warmup split 43/43/42 over the models as the original; overrides WARMUP),
 # PROFILE=1 (torch.profiler on each model's D rank 0 for 10 decode steps at
 # its 300th and 1600th run step; summaries in OUT_DIR/profile; diagnosis only;
 # MXS_PROFILE_RANKS=P0 MXS_PROFILE_AT=3,12 MXS_PROFILE_STEPS=4 profiles prefills;
@@ -46,6 +49,8 @@ PREFILL_GRAPH="${PREFILL_GRAPH:-}"
 INLINE_START="${INLINE_START:-}"
 SKIP_P="${SKIP_P:-}"
 EARLY_TOKEN="${EARLY_TOKEN:-}"
+FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
+WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
@@ -133,7 +138,7 @@ trap stop_launcher EXIT
 "$PY" "$RUNTIME/tools/bench_fixed.py" --port 18080 --requests "$REQUESTS" --warmup "$WARMUP" \
     --ready-timeout 7200 --supervisor-pid "$SUPERVISOR" --out "$OUT/bench.json" \
     ${PHASE_ARGS[@]+"${PHASE_ARGS[@]}"} ${TRACE:+--phase-name concurrent} \
-    ${REFERENCE:+--reference "$REFERENCE"} 2>&1 | tee "$OUT/bench.log"
+    ${REFERENCE:+--reference "$REFERENCE"} ${FROZEN_BUNDLE:+--frozen-bundle "$FROZEN_BUNDLE"}     ${WARMUP_TOTAL:+--warmup-total "$WARMUP_TOTAL"} 2>&1 | tee "$OUT/bench.log"
 echo "RESULT $OUT/bench.json"
 
 if [ -n "$SOLO" ]; then

@@ -174,17 +174,42 @@ def main() -> None:
     parser.add_argument("--supervisor-pid", type=int, help="abort the readiness wait if this PID exits")
     parser.add_argument("--phase-file", help="append '<name> <start> <end>' (time.monotonic) of the measured phase")
     parser.add_argument("--phase-name", default="measured")
+    parser.add_argument("--frozen-bundle", help="original MuxServe fixed-workload bundle (frozen-synthetic-512-128.json): "
+                        "use its per-model input_ids and require every output to equal its expected_output_ids")
+    parser.add_argument("--warmup-total", type=int, help="total warmup requests split over models in order "
+                        "(128 -> 43/43/42, as original MuxServe's fixed workload); overrides --warmup")
     args = parser.parse_args()
     models = [m for m in args.models.split(",") if m]
-    input_ids = synthetic_input(args.input_len, args.seed)
+    inputs = {m: synthetic_input(args.input_len, args.seed) for m in models}
+    expected = None
+    if args.frozen_bundle:
+        with open(args.frozen_bundle, encoding="utf-8") as stream:
+            bundle = json.load(stream)
+        if (bundle.get("input_tokens"), bundle.get("output_tokens"), bundle.get("ignore_eos"),
+                bundle.get("temperature")) != (args.input_len, args.output_len, True, 0):
+            raise SystemExit("frozen bundle shape differs from --input-len/--output-len/greedy ignore_eos")
+        # Original model names are llama-7b etc.; this backend's IDs are llama7b etc.
+        entries = {name.replace("-", ""): entry for name, entry in bundle["models"].items()}
+        if any(m not in entries for m in models):
+            raise SystemExit(f"frozen bundle lacks models {[m for m in models if m not in entries]}")
+        inputs = {m: list(entries[m]["input_ids"]) for m in models}
+        expected = {m: list(entries[m]["expected_output_ids"]) for m in models}
+        if any(len(inputs[m]) != args.input_len or len(expected[m]) != args.output_len for m in models):
+            raise SystemExit("frozen bundle token counts differ")
+    warmups = {m: args.warmup for m in models}
+    if args.warmup_total is not None:
+        base, extra = divmod(args.warmup_total, len(models))
+        warmups = {m: base + (index < extra) for index, m in enumerate(models)}
     wait_ready(args.port, args.ready_timeout, args.supervisor_pid)
-    print(f"BENCH_READY models={models} input={args.input_len} output={args.output_len}", flush=True)
+    print(f"BENCH_READY models={models} input={args.input_len} output={args.output_len} "
+          f"inputs={'frozen bundle' if expected else 'synthetic seed %d' % args.seed} warmup={warmups}", flush=True)
 
-    def run(phase: str, count: int) -> dict:
+    def run(phase: str, counts) -> dict:
         records = {m: [] for m in models}
         def loop(model):
+            count = counts[model] if isinstance(counts, dict) else counts
             for index in range(count):
-                record = generate(args.port, model, input_ids, args.output_len, args.request_timeout)
+                record = generate(args.port, model, inputs[model], args.output_len, args.request_timeout)
                 records[model].append(record)
                 if record["error"]:
                     print(f"BENCH_ERROR {phase} {model} #{index}: {record['error']}", flush=True)
@@ -198,8 +223,8 @@ def main() -> None:
             thread.join()
         return records
 
-    if args.warmup:
-        run("warmup", args.warmup)
+    if any(warmups.values()):
+        run("warmup", warmups)
     before = None
     try:
         before = get_json(args.port, "/metrics")[1]
@@ -224,14 +249,19 @@ def main() -> None:
     outputs = {m: [r["output_ids"] for r in measured[m] if not r["error"]] for m in models}
     consistency = {m: (len({tuple(o) for o in outs}) == 1 if outs else None) for m, outs in outputs.items()}
     reference_match = None
-    if args.reference:
+    if expected is not None:
+        # Every measured request, not only the first, must equal the original's output.
+        reference_match = {m: (bool(outputs[m]) and all(o == expected[m] for o in outputs[m])) for m in models}
+    elif args.reference:
         with open(args.reference, encoding="utf-8") as stream:
             reference = json.load(stream)
         reference_match = {m: (outputs[m][0] == reference["first_output_ids"].get(m)) if outputs[m] else None
                            for m in models}
     result = {"schema": 1, "workload": {"input_len": args.input_len, "output_len": args.output_len,
-                                        "seed": args.seed, "requests_per_model": args.requests,
-                                        "warmup_per_model": args.warmup,
+                                        "seed": None if expected else args.seed,
+                                        "frozen_bundle": args.frozen_bundle,
+                                        "requests_per_model": args.requests,
+                                        "warmup_per_model": warmups,
                                         "concurrency": "one in flight per model (closed loop)",
                                         "boundary": "client HTTP send to streamed token receipt"},
               "summary": summary, "stage_breakdown_ms": stage_breakdown(before, after, summary),
