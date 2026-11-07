@@ -163,6 +163,39 @@ class MetadataUploadChecks(unittest.TestCase):
         self.assertEqual(len(uploads.calls) - before, 2,
                          'Per-layer H2D uploads must be batched once per forward')
 
+    def test_prefill_write_slots_upload_once_without_a_block_table(self):
+        for mode in ('PREFILL', 'REBUILD'):
+            with self.subTest(mode=mode):
+                uploads = Uploads()
+                pool, _, _ = fixture(uploads, mode, (33, 17), layers=6, start_layer=1, end_layer=4)
+                bound = pool.bound_forward
+                before = len(uploads.calls)
+                for layer in (4, 1, 2, 3):
+                    slots = pool.layer_slots(layer)
+                    self.assertIs(slots, pool.layer_slots(layer))
+                    self.assertEqual(slots.tolist(), legacy_metadata(bound, layer)[0])
+                self.assertEqual(len(uploads.calls) - before, 1, 'Prefill needs only the slot upload')
+                self.assertIsNone(bound.table_buffer)
+                # Full metadata still matches and adds exactly the table upload.
+                for layer in (1, 4):
+                    slots, tables = pool.layer_metadata(layer)
+                    self.assertIs(slots, pool.layer_slots(layer))
+                    self.assertEqual(tables.tolist(), legacy_metadata(bound, layer)[1])
+                self.assertEqual(len(uploads.calls) - before, 2)
+
+    def test_extend_grant_rechecks_only_for_a_different_forward_batch(self):
+        uploads = Uploads()
+        pool, _, forward = fixture(uploads, 'PREFILL', (33, 17))
+        self.assertTrue(pool.bound_forward.extend_checked)
+        self.assertIs(pool.validate_forward(forward), pool.bound_forward)
+        with self.assertRaises(IntegrationError):
+            pool.validate_forward(deepcopy(forward))
+        decode, _, decode_forward = fixture(Uploads(), 'DECODE', (17, 33))
+        self.assertFalse(decode.bound_forward.extend_checked)
+        decode_forward.seq_lens_cpu[0] += 1
+        with self.assertRaises(IntegrationError):
+            decode.validate_forward(decode_forward)
+
     def test_decode_extend_rebuild_indices_match_legacy_with_padding_and_layer_offsets(self):
         for mode in ('DECODE', 'PREFILL', 'REBUILD'):
             for lengths in ((15, 16, 17, 33), (128, 143), (1792, 17)):

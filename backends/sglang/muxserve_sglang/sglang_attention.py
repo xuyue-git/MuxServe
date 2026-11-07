@@ -63,8 +63,8 @@ class HeadwiseAttentionBackend(AttentionBackend):
     def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
         if getattr(self, "_static", False):
             return self._forward_decode_static(q, k, v, layer, forward_batch, save_kv_cache, kwargs)
-        # Override the native idle fast path: an unbound or idle call must fail.
-        self.token_to_kv_pool.validate_forward(forward_batch)
+        # Override the native idle fast path: an unbound or idle call must
+        # fail. Both methods validate the grant first thing (via _inputs).
         method = self.forward_decode if forward_batch.forward_mode.is_decode() else self.forward_extend
         return method(q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs)
 
@@ -109,6 +109,12 @@ class HeadwiseAttentionBackend(AttentionBackend):
         bound, (q, k, v) = self._inputs(q, k, v, layer, forward_batch, save_kv_cache, kwargs)
         _require(bound.mode in ("PREFILL", "REBUILD"), "Extend requires full prefill or rebuild")
         self.token_to_kv_pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+        if len(bound.write_lengths) == 1:
+            # One request: same attention without slicing or a concatenation.
+            output = scaled_dot_product_attention(
+                q.transpose(0, 1).unsqueeze(0), k.transpose(0, 1).unsqueeze(0),
+                v.transpose(0, 1).unsqueeze(0), dropout_p=0.0, is_causal=True, scale=layer.scaling)
+            return output.squeeze(0).transpose(0, 1).reshape(bound.total_written, -1)
         outputs, start = [], 0
         for length in bound.write_lengths:
             end = start + length

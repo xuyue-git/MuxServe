@@ -45,6 +45,13 @@ class BoundForward:
     batch: object | None = None
     layer_metadata: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     metadata_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
+    # Per-forward write-slot buffer (all layers) and its per-layer views.
+    slot_buffer: torch.Tensor | None = None
+    layer_slot_views: dict[int, torch.Tensor] = field(default_factory=dict)
+    # A prefill/rebuild grant is one ForwardBatch executed once: after its
+    # full check, later layers of that same object skip re-reading the CPU
+    # mirrors. Decode bindings are always fully re-checked.
+    extend_checked: bool = False
     context_lens: torch.Tensor | None = None
     # Reserved token capacity per request; a decode run advances within it.
     capacities: tuple[int, ...] = ()
@@ -257,6 +264,8 @@ class HeadwiseTokenToKVPool(KVCache):
 
     def validate_forward(self, forward_batch) -> BoundForward:
         bound = self.bound_forward
+        if bound.extend_checked and bound.batch is forward_batch:
+            return bound
         _require(getattr(forward_batch.forward_mode, "name", None)
                  == ("DECODE" if bound.mode == "DECODE" else "EXTEND"),
                  "Forward mode does not match granted mode", "FORWARD_MISMATCH")
@@ -289,29 +298,23 @@ class HeadwiseTokenToKVPool(KVCache):
         bound.batch = forward_batch
         if bound.context_lens is None:
             bound.context_lens = torch.tensor(bound.target_lengths, dtype=torch.int32, device=self.device)
+        bound.extend_checked = bound.mode != "DECODE"
         return bound
 
-    def layer_metadata(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _validated_bound(self, layer_id: int) -> BoundForward:
         self._check_layer(layer_id)
         bound = self.bound_forward
         _require(bound.batch is not None, "ForwardBatch must be validated before layer use", "UNBOUND_FORWARD")
-        if bound.metadata_buffers is None:
-            # All layers retained this metadata until clear_forward already.
-            # At most two uploads per forward; a leading layer dimension gives
-            # contiguous kernel views. Index math runs in numpy, not per block.
+        if bound.np_tables is None:
+            bound.np_tables = [np.asarray(table, dtype=np.int64) for table in bound.tables]
+        return bound
+
+    def _slot_buffer(self, bound: BoundForward) -> torch.Tensor:
+        # One upload per forward for all layers; a leading layer dimension
+        # gives contiguous kernel views. Index math runs in numpy, not per block.
+        if bound.slot_buffer is None:
             selected = slice(self.start_layer, self.end_layer + 1)
             layers = self.end_layer - self.start_layer + 1
-            if bound.np_tables is None:
-                bound.np_tables = [np.asarray(table, dtype=np.int64) for table in bound.tables]
-            if bound.table_buffer is None:
-                # Pad every request to the widest reserved mapping. The kernel
-                # reads only ceil(context/16) pages; unused entries are zero or
-                # blocks this request already owns.
-                max_pages = max(table.shape[2] for table in bound.np_tables)
-                padded = np.zeros((layers, len(bound.np_tables), self.head_num, max_pages), dtype=np.int32)
-                for row, table in enumerate(bound.np_tables):
-                    padded[:, row, :, :table.shape[2]] = table[selected]
-                bound.table_buffer = torch.tensor(padded, dtype=torch.int32, device=self.device)
             slots = np.empty((layers, bound.total_written, self.head_num), dtype=np.int64)
             offset = 0
             for row, (start, count) in enumerate(zip(bound.write_starts, bound.write_lengths)):
@@ -319,15 +322,43 @@ class HeadwiseTokenToKVPool(KVCache):
                 pages = bound.np_tables[row][selected][:, :, positions // 16]
                 slots[:, offset:offset + count, :] = (pages * 16 + positions % 16).transpose(0, 2, 1)
                 offset += count
-            bound.metadata_buffers = (
-                torch.tensor(slots, dtype=torch.int64, device=self.device),
-                bound.table_buffer,
-            )
+            bound.slot_buffer = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        return bound.slot_buffer
+
+    def _table_buffer(self, bound: BoundForward) -> torch.Tensor:
+        if bound.table_buffer is None:
+            # Pad every request to the widest reserved mapping. The kernel
+            # reads only ceil(context/16) pages; unused entries are zero or
+            # blocks this request already owns.
+            selected = slice(self.start_layer, self.end_layer + 1)
+            layers = self.end_layer - self.start_layer + 1
+            max_pages = max(table.shape[2] for table in bound.np_tables)
+            padded = np.zeros((layers, len(bound.np_tables), self.head_num, max_pages), dtype=np.int32)
+            for row, table in enumerate(bound.np_tables):
+                padded[:, row, :, :table.shape[2]] = table[selected]
+            bound.table_buffer = torch.tensor(padded, dtype=torch.int32, device=self.device)
+        return bound.table_buffer
+
+    def layer_slots(self, layer_id: int) -> torch.Tensor:
+        """Write slots only: K/V stores need no block table (prefill never
+        reads one), so a prefill uploads a single metadata buffer."""
+        bound = self._validated_bound(layer_id)
+        cached = bound.layer_slot_views.get(layer_id)
+        if cached is None:
+            cached = self._slot_buffer(bound)[layer_id - self.start_layer]
+            _require(cached.is_contiguous(), "Layer metadata must be contiguous")
+            bound.layer_slot_views[layer_id] = cached
+        return cached
+
+    def layer_metadata(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        bound = self._validated_bound(layer_id)
         if layer_id not in bound.layer_metadata:
-            offset = layer_id - self.start_layer
-            slots, tables = (buffer[offset] for buffer in bound.metadata_buffers)
-            _require(slots.is_contiguous() and tables.is_contiguous(),
-                     "Layer metadata must be contiguous")
+            # All layers retain this metadata until clear_forward: at most
+            # two uploads per forward.
+            slots = self.layer_slots(layer_id)
+            tables = self._table_buffer(bound)[layer_id - self.start_layer]
+            _require(tables.is_contiguous(), "Layer metadata must be contiguous")
+            bound.metadata_buffers = (bound.slot_buffer, bound.table_buffer)
             bound.layer_metadata[layer_id] = slots, tables
         return bound.layer_metadata[layer_id]
 
@@ -421,7 +452,7 @@ class HeadwiseTokenToKVPool(KVCache):
         _require(cache_k.dtype == cache_v.dtype == self.dtype
                  and cache_k.device == cache_v.device == self.device,
                  "K/V write dtype or device mismatch")
-        slots, _ = self.layer_metadata(layer.layer_id)
+        slots = self.layer_slots(layer.layer_id)
         ops.store(cache_k.contiguous(), cache_v.contiguous(), self.pool_key, self.pool_value, slots)
 
     def get_cpu_copy(self, *args, **kwargs):
