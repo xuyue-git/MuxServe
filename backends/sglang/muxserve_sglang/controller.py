@@ -742,6 +742,7 @@ class MuxController:
         trace.ev("prep_call", getattr(plan, "batch_id", None), m=getattr(plan, "model_id", None),
                  s=getattr(plan, "stage", None))
         with self.lock:
+            trace.ev("prep_lock", getattr(plan, "batch_id", None))
             self._require_admission()
             if not isinstance(plan, BatchPlan) or plan.stage not in _STAGES or not plan.requests:
                 raise IntegrationError("INVALID_ARGUMENT", "Valid nonempty BatchPlan required")
@@ -821,6 +822,7 @@ class MuxController:
                 reserve_called = True
                 reservation = self.store.reserve_kv(plan.batch_id, targets, owner)
                 views = {view.identity.request_id: view for view in reservation.views}
+                trace.ev("prep_reserved", plan.batch_id)
                 batch = _Batch(deepcopy(plan), reservation, owner, views, prepared_at=self.clock(),
                     selected_input_tokens=sum((len(request.spec.input_ids) + len(request.output) - 1)
                         if plan.stage == "P" and plan.purpose == "REBUILD" else

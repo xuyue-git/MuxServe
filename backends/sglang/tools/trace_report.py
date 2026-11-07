@@ -88,6 +88,7 @@ def build(events):
     submits = {}
     rpcs = defaultdict(list)
     failures = []
+    gateway = defaultdict(dict)   # (model, req) -> {ev: t}
 
     def get(batch_id):
         if batch_id not in batches:
@@ -98,6 +99,12 @@ def build(events):
         name, t, b = e["ev"], e["t"], e.get("batch")
         if name == "rpc":
             rpcs[(e.get("role") or "owner/driver", e.get("m"))].append(e.get("ms", 0.0))
+            continue
+        if name in ("gw_admit", "gw_first_token", "gw_first_sse"):
+            key = (e.get("m"), e.get("req"))
+            gateway[key].setdefault(name, t)
+            if name == "gw_admit" and e.get("recv") is not None:
+                gateway[key].setdefault("gw_recv", e["recv"])
             continue
         if name == "prep_fail":
             failures.append((t, e.get("m"), e.get("s"), e.get("code")))
@@ -131,7 +138,7 @@ def build(events):
             batch.dstep[e.get("step")].setdefault(e.get("r"), t)
         else:
             batch.rank[name].setdefault(e.get("role"), t)
-    return batches, gid_model, submits, rpcs, failures
+    return batches, gid_model, submits, rpcs, failures, gateway
 
 
 def handler_ms(batch, kind, stage_letter):
@@ -230,7 +237,9 @@ def d_timeline(batch, ranks):
 TRANSITION = (
     ("prev_finished", "last token of previous batch -> previous batch quiesced/released"),
     ("driver_prepare_call", "-> driver called prepare_batch for the next D batch"),
-    ("prepare_batch", "-> prepare_batch returned (reserve + 8 PREPARE commands)"),
+    ("prepare_lock_wait", "-> prepare_batch acquired the owner lock"),
+    ("prepare_reserve", "-> KV reserve done (store.reserve_kv and its checks)"),
+    ("prepare_batch", "-> prepare_batch returned (8 PREPARE commands queued)"),
     ("all_ready", "-> last READY reached owner"),
     ("start_called", "-> driver called start_batch"),
     ("start_delivered", "-> last D rank received START"),
@@ -253,6 +262,8 @@ def transition(prev, nxt, ranks):
     timeline = {"prepare": last_token,
                 "prev_finished": prev.ctl.get("finish"),
                 "driver_prepare_call": nxt.prep_call,
+                "prepare_lock_wait": nxt.rank.get("prep_lock", {}).get(""),
+                "prepare_reserve": nxt.rank.get("prep_reserved", {}).get(""),
                 "prepare_batch": nxt.prep,
                 "all_ready": last(list(nxt.rpt.get(("READY", "P"), {}).values()) +
                                   list(nxt.rpt.get(("READY", "D"), {}).values())),
@@ -292,7 +303,7 @@ def overlaps(a0, a1, b0, b1):
 def report(directory, phases_path=None, gap_ms=150.0, ranks=4):
     events = load(directory)
     phases = load_phases(phases_path)
-    batches, gid_model, submits, rpcs, failures = build(events)
+    batches, gid_model, submits, rpcs, failures, gateway = build(events)
     result = {"events": len(events), "phases": {}}
     phase_names = [p[0] for p in phases] or ["all"]
     for phase in phase_names:
@@ -335,6 +346,20 @@ def report(directory, phases_path=None, gap_ms=150.0, ranks=4):
                             for role in b.rank.get(z, {}) if role in b.rank.get(a, {})]
                     if vals:
                         handlers[label].append(max(vals))
+            ttft = defaultdict(list)
+            for b in by_model[model]["P"]:
+                for req in b.info.get("reqs", []):
+                    g = gateway.get((model, req), {})
+                    sub = submits.get((model, req))
+                    points = [("gw_recv", g.get("gw_recv")), ("submit", sub),
+                              ("p_prepare_call", b.prep_call), ("p_handoff_all", b.ctl.get("handoff_all")),
+                              ("gw_first_token", g.get("gw_first_token")), ("gw_first_sse", g.get("gw_first_sse"))]
+                    for (_, a), (label, z) in zip(points, points[1:]):
+                        if a is not None and z is not None:
+                            ttft[label].append((z - a) * 1000)
+                    if g.get("gw_recv") is not None and g.get("gw_first_sse") is not None:
+                        ttft["total_recv_to_first_sse"].append((g["gw_first_sse"] - g["gw_recv"]) * 1000)
+            entry["ttft_breakdown_ms"] = {k: summary(v) for k, v in ttft.items()}
             entry["P_batches"] = len(by_model[model]["P"])
             entry["P_segments_ms"] = {k: summary(v) for k, v in seg.items()}
             entry["P_last_ready_stage"] = dict(last_ready)
@@ -429,6 +454,17 @@ def render(result):
         for model, e in models.items():
             lines.append(f"\n--- {model}: P batches={e['P_batches']} D batches={e['D_batches']}")
             lines.append(f"  submit->prepare_batch (driver queue) ms: {e['P_submit_to_prepare_ms']}")
+            if e.get("ttft_breakdown_ms"):
+                lines.append("  TTFT breakdown inside the server (p50 / p90 / mean ms):")
+                for key, label in (("submit", "HTTP received -> controller submit_request entered"),
+                                   ("p_prepare_call", "-> driver called prepare_batch for the P batch"),
+                                   ("p_handoff_all", "-> P handoff done (first token confirmed at owner)"),
+                                   ("gw_first_token", "-> gateway applied first TOKEN event (driver poll)"),
+                                   ("gw_first_sse", "-> first SSE chunk written to the client"),
+                                   ("total_recv_to_first_sse", "TOTAL HTTP received -> first SSE")):
+                    s = e["ttft_breakdown_ms"].get(key)
+                    if s:
+                        lines.append(f"    {key:<36}{s['p50']:>9}{s['p90']:>9}{s['mean']:>9}   {label}")
             lines.append("  P path segments (p50 / p90 / mean ms):")
             for key, label in P_MILESTONES + (("total_prepare_to_first_token_ready", "TOTAL prepare -> HANDOFF done"),
                                                ("total_prepare_to_finish", "TOTAL prepare -> P released")):

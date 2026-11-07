@@ -11,6 +11,7 @@ import time
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
+from . import trace
 from .contracts import IntegrationError, RequestSpec
 
 logger = logging.getLogger(__name__)
@@ -142,6 +143,8 @@ class GatewayState:
             if event.kind == "TOKEN":
                 if event.payload["output_index"] != len(record.tokens):
                     raise IntegrationError("EVENT_CONFLICT", "Confirmed token index changed")
+                if not record.tokens:
+                    trace.ev("gw_first_token", None, m=record.model_id, req=record.internal_id)
                 record.tokens.extend(event.payload["token_ids"])
                 self.http_counters["confirmed_output_tokens"] += len(event.payload["token_ids"])
                 record.state = "DECODING"
@@ -431,11 +434,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         is_generate = len(parts) == 3 and parts[0] == "models" and parts[2] == "generate"
         if is_generate:
             self.server.state.count_http("generate_received")
+            received = time.monotonic()
         try:
             if is_generate:
                 body = self._body()
                 self.server.finish_admission(self.connection)
                 record = self.server.state.submit(parts[1], body)
+                trace.ev("gw_admit", None, m=parts[1], req=record.internal_id, recv=received)
             elif len(parts) == 5 and parts[0] == "models" and parts[2] == "requests":
                 self.server.finish_admission(self.connection)
                 self._json(200, self.server.state.control(parts[1], parts[3], parts[4]))
@@ -483,6 +488,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if terminal or count - sent >= record.stream_interval:
                     payload = state.payload(record, terminal=terminal)
                     self._sse(payload)
+                    if sent == 0:
+                        trace.ev("gw_first_sse", None, m=record.model_id, req=record.internal_id)
                     sent = len(payload["output_ids"])
                     last_write = time.monotonic()
                 elif time.monotonic() - last_write >= 5:

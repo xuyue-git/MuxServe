@@ -78,6 +78,11 @@ class TraceChecks(unittest.TestCase):
         add(0.320, "handoff_all", "p1", m="m")
         add(0.330, "finish", "p1", m="m", s="P")
         add(0.390, "prep_call", "d1")
+        add(0.393, "prep_lock", "d1")
+        add(0.398, "prep_reserved", "d1")
+        events.append({"t": 0.002, "pid": 1, "role": "", "ev": "gw_admit", "m": "m", "req": "r1", "recv": -0.005})
+        events.append({"t": 0.335, "pid": 1, "role": "", "ev": "gw_first_token", "m": "m", "req": "r1"})
+        events.append({"t": 0.338, "pid": 1, "role": "", "ev": "gw_first_sse", "m": "m", "req": "r1"})
         add(0.400, "prep", "d1", m="m", gid="g", s="D", purpose="GENERATE", steps=3, reqs=["r1"])
         for r in range(4):
             add(0.410, "rpt", "d1", kind="READY", gid="g", s="P", r=r)
@@ -112,7 +117,13 @@ class TraceChecks(unittest.TestCase):
         self.assertEqual(m["big_gaps"]["count"], 2)
         self.assertEqual(result["rpc_ms"]["D:controller_broker_ack"]["n"], 1)
         t = m["transitions_ms"]["after_prefill"]
-        for key, ms in (("prev_finished", 10), ("driver_prepare_call", 60), ("prepare_batch", 10),
+        tt = m["ttft_breakdown_ms"]
+        for key, ms in (("submit", 5), ("p_prepare_call", 10), ("p_handoff_all", 310),
+                        ("gw_first_token", 15), ("gw_first_sse", 3), ("total_recv_to_first_sse", 343)):
+            self.assertAlmostEqual(tt[key]["p50"], ms, places=1, msg=key)
+        for key, ms in (("prepare_lock_wait", 3), ("prepare_reserve", 5)):
+            self.assertAlmostEqual(t[key]["p50"], ms, places=1, msg=key)
+        for key, ms in (("prev_finished", 10), ("driver_prepare_call", 60), ("prepare_batch", 2),
                         ("all_ready", 20), ("start_called", 30), ("start_delivered", 10),
                         ("first_forward_done", 30), ("first_step", 10), ("total", 180)):
             self.assertAlmostEqual(t[key]["p50"], ms, places=1, msg=key)
