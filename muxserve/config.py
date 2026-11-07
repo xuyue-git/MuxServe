@@ -1,5 +1,8 @@
-import torch
 from typing import List, Dict, Any
+
+# Default for JobConfig.model_dtype (torch.float16), resolved on use so that
+# importing this module does not import Torch.
+_DEFAULT_DTYPE = object()
 
 
 class JobConfig:
@@ -19,7 +22,7 @@ class JobConfig:
                  placement: List[List[int]],
                  mps_percentage: List[int],
                  max_num_seqs: int,
-                 model_dtype: torch.dtype = torch.float16):
+                 model_dtype: "torch.dtype" = _DEFAULT_DTYPE):
         self.name = name
         self.model = model
         self.pipeline_parallel_size = pipeline_parallel_size
@@ -27,6 +30,9 @@ class JobConfig:
         self.placement = placement
         self.mps_percentage = mps_percentage
         self.max_num_seqs = max_num_seqs
+        if model_dtype is _DEFAULT_DTYPE:
+            import torch
+            model_dtype = torch.float16
         self.model_dtype = model_dtype
 
 

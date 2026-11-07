@@ -2,14 +2,26 @@ import random
 import numpy as np
 from typing import Dict, List, Tuple
 
-import torch
-from transformers import AutoConfig
 from muxserve.config import MuxServeConfig
 
 
 def get_gpu_memory(gpu: int = 0) -> int:
     """Returns the total memory of the GPU in bytes."""
+    import torch
     return torch.cuda.get_device_properties(gpu).total_memory
+
+
+def num_gpu_blocks(gpu_memory_utilization: float, total_mem_each_gpu: int,
+                   key_block_shape: Tuple[int, ...],
+                   value_block_shape: Tuple[int, ...]) -> int:
+    """Number of KV blocks per GPU: CacheResource.get_num_gpu_blocks's
+    formula, as a function of its inputs (no Torch or CUDA needed)."""
+    avaliable_mem_each_gpu = gpu_memory_utilization * total_mem_each_gpu
+    avaliable_mem_each_gpu = round(avaliable_mem_each_gpu) - 1
+
+    block_mem = 2 * (np.prod(key_block_shape) + np.prod(value_block_shape))
+    max_num_blocks = (avaliable_mem_each_gpu // block_mem // 128) * 128
+    return max_num_blocks
 
 
 class SMPart:
@@ -83,6 +95,7 @@ class SMResource:
 class CacheResource:
 
     def __init__(self, muxserve_config: MuxServeConfig):
+        from transformers import AutoConfig
         self.config = muxserve_config
 
         self.block_size = self.config.block_size
@@ -107,13 +120,9 @@ class CacheResource:
         # TODO: compute
         total_mem_each_gpu = get_gpu_memory()  # get info from gpu0
         # FIXME: set gpu_memory_utilization in shell script manually
-        avaliable_mem_each_gpu = self.config.gpu_memory_utilization * total_mem_each_gpu
-        avaliable_mem_each_gpu = round(avaliable_mem_each_gpu) - 1
-
-        block_mem = 2 * (np.prod(self.get_key_block_shape()) +
-                         np.prod(self.get_value_block_shape()))
-        max_num_blocks = (avaliable_mem_each_gpu // block_mem // 128) * 128
-        return max_num_blocks
+        return num_gpu_blocks(self.config.gpu_memory_utilization,
+                              total_mem_each_gpu, self.get_key_block_shape(),
+                              self.get_value_block_shape())
 
     def get_key_block_shape(self, element_size=2) -> Tuple[int, int, int]:
         x = 16 // element_size
