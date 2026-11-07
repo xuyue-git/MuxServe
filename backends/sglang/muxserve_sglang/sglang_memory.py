@@ -14,7 +14,7 @@ import torch
 from sglang.srt.mem_cache.memory_pool import KVCache
 
 from . import ops
-from .contracts import IntegrationError, KVView, ModelLayout
+from .contracts import IntegrationError, KVView, ModelLayout, PackedBlocks
 
 
 def _require(condition: bool, message: str, code: str = "LAYOUT_MISMATCH") -> None:
@@ -128,7 +128,7 @@ class HeadwiseTokenToKVPool(KVCache):
                  and len({v.allocation_id for v in views}) == len(views),
                  "Duplicate request identity or allocation")
         tables, starts, writes = [], [], []
-        used_blocks: dict[int, set[int]] = {r: set() for r in self.layout.ranks}
+        used_blocks: dict[int, list] = {r: [] for r in self.layout.ranks}
         for view, target in zip(views, targets):
             _require(view.identity.model_id == self.layout.model_id and bool(view.allocation_id),
                      "Wrong model or absent allocation identity")
@@ -148,25 +148,34 @@ class HeadwiseTokenToKVPool(KVCache):
                 writes.append(target)
             pages = (view.capacity_tokens + 15) // 16
             for rank, rank_table in view.block_tables.items():
-                _require(len(rank_table) == self.layer_num, "Incomplete layer mapping")
-                rank_blocks = []
-                for heads in rank_table:
-                    _require(len(heads) == self.head_num, "Incomplete head mapping")
-                    for blocks in heads:
-                        _require(len(blocks) == pages, "Incomplete physical page mapping")
-                        rank_blocks.extend(blocks)
-                # ponytail: validate every block, batch the Python guards and
-                # set operations instead of dispatching them for each block.
-                _require(set(map(type, rank_blocks)) == {int}
-                         and min(rank_blocks) >= 0 and max(rank_blocks) < self.physical_block_count,
+                if isinstance(rank_table, PackedBlocks):
+                    _require(rank_table.layers == self.layer_num, "Incomplete layer mapping")
+                    _require(rank_table.heads == self.head_num, "Incomplete head mapping")
+                    _require(rank_table.pages == pages, "Incomplete physical page mapping")
+                    rank_blocks = rank_table.array().reshape(-1)
+                else:
+                    _require(len(rank_table) == self.layer_num, "Incomplete layer mapping")
+                    flat = []
+                    for heads in rank_table:
+                        _require(len(heads) == self.head_num, "Incomplete head mapping")
+                        for blocks in heads:
+                            _require(len(blocks) == pages, "Incomplete physical page mapping")
+                            flat.extend(blocks)
+                    _require(set(map(type, flat)) == {int}, "Physical block index outside imported pool")
+                    rank_blocks = np.asarray(flat, dtype=np.int64)
+                # Every block on every rank is still validated, with numpy
+                # reductions instead of per-block Python dispatch.
+                _require(rank_blocks.size > 0 and int(rank_blocks.min()) >= 0
+                         and int(rank_blocks.max()) < self.physical_block_count,
                          "Physical block index outside imported pool")
-                unique_blocks = set(rank_blocks)
-                _require(len(unique_blocks) == len(rank_blocks)
-                         and used_blocks[rank].isdisjoint(unique_blocks),
-                         "Aliased physical blocks across requests/layers/heads")
-                used_blocks[rank].update(unique_blocks)
-            tables.append(tuple(tuple(tuple(blocks) for blocks in heads)
-                                for heads in view.block_tables[self.rank]))
+                used_blocks[rank].append(rank_blocks)
+            own = view.block_tables[self.rank]
+            tables.append(own.array().astype(np.int64) if isinstance(own, PackedBlocks) else
+                          tuple(tuple(tuple(blocks) for blocks in heads) for heads in own))
+        for rank, arrays in used_blocks.items():
+            combined = np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
+            _require(np.unique(combined).size == combined.size,
+                     "Aliased physical blocks across requests/layers/heads")
         self._bound = BoundForward(mode, rows, targets, tuple(writes), tuple(starts), tuple(tables),
                                    capacities=tuple(view.capacity_tokens for view in views))
 

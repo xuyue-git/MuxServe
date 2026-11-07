@@ -1,5 +1,6 @@
 """Internal control identities and storage descriptors; never raw GPU pointers."""
 
+from array import array
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,6 +46,65 @@ class ModelLayout:
 
 
 @dataclass(frozen=True)
+class PackedBlocks:
+    """One rank's (layer, head, page) physical block table in control messages.
+
+    The owner's store keeps nested lists. Messages carry this immutable form:
+    copy and pickle move one bytes object, equality is a byte compare, and a
+    rank reads it as one numpy view instead of walking ~10^4 Python ints per
+    copy. Packing validates the rectangular shape and int32 range.
+    """
+    layers: int
+    heads: int
+    pages: int
+    data: bytes
+
+    @classmethod
+    def pack(cls, table: Any) -> "PackedBlocks":
+        if isinstance(table, PackedBlocks):
+            return table
+        try:
+            layers = len(table)
+            heads = len(table[0]) if layers else 0
+            pages = len(table[0][0]) if heads else 0
+            flat = array("i")
+            for layer in table:
+                if len(layer) != heads:
+                    raise ValueError
+                for blocks in layer:
+                    if len(blocks) != pages or (pages and set(map(type, blocks)) != _INT_ONLY):
+                        raise ValueError
+                    flat.extend(blocks)
+        except (TypeError, ValueError, IndexError, OverflowError) as exc:
+            raise IntegrationError("LAYOUT_MISMATCH", "Block table must be a rectangular int32 mapping") from exc
+        if flat.itemsize != 4:
+            raise IntegrationError("LAYOUT_MISMATCH", "Platform int is not 32-bit")
+        return cls(layers, heads, pages, flat.tobytes())
+
+    def tolist(self) -> list[list[list[int]]]:
+        flat = array("i")
+        flat.frombytes(self.data)
+        values = flat.tolist()
+        width = self.pages
+        return [[values[(layer * self.heads + head) * width:(layer * self.heads + head + 1) * width]
+                 for head in range(self.heads)] for layer in range(self.layers)]
+
+    def array(self):
+        import numpy as np
+        return np.frombuffer(self.data, dtype=np.int32).reshape(self.layers, self.heads, self.pages)
+
+    def __len__(self) -> int:
+        return self.layers
+
+
+_INT_ONLY = {int}
+
+
+def pack_tables(tables: dict[int, Any]) -> dict[int, PackedBlocks]:
+    return {rank: PackedBlocks.pack(table) for rank, table in tables.items()}
+
+
+@dataclass(frozen=True)
 class KVTarget:
     identity: RequestIdentity
     target_tokens: int
@@ -58,7 +118,8 @@ class KVView:
     capacity_tokens: int
     valid_tokens: int
     block_size: int
-    block_tables: dict[int, list[list[list[int]]]]
+    # Nested lists in the store; PackedBlocks in owner->rank control messages.
+    block_tables: dict[int, Any]
     version: int = 0
 
 

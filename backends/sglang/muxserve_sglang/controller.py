@@ -15,8 +15,8 @@ from typing import Any
 from uuid import uuid4
 
 from .config import DeploymentConfig
-from .contracts import (BatchPlan, IntegrationError, KVTarget, RequestIdentity,
-                        RequestRef, RequestSpec, ResumeRecord)
+from .contracts import (BatchPlan, IntegrationError, KVTarget, PackedBlocks, RequestIdentity,
+                        RequestRef, RequestSpec, ResumeRecord, pack_tables)
 from .events import RuntimeOutbox
 from .ipc import CommandSnapshot, copy_message
 from . import trace
@@ -131,6 +131,26 @@ class _Batch:
     run_decisions: dict[int, bool] = field(default_factory=dict)
     run_applied: int = 0
     run_steps_done: int | None = None
+    # PackedBlocks per request for this batch's reserved / committed views.
+    # Views are immutable for the batch's lifetime, so each is packed once.
+    packed: dict[str, dict[int, PackedBlocks]] = field(default_factory=dict)
+    packed_committed: dict[str, dict[int, PackedBlocks]] = field(default_factory=dict)
+
+
+def _packed_view(batch: _Batch, request_id: str, committed: bool = False) -> dict[int, PackedBlocks]:
+    cache = batch.packed_committed if committed else batch.packed
+    packed = cache.get(request_id)
+    if packed is None:
+        views = batch.committed_views if committed else batch.views
+        packed = cache[request_id] = pack_tables(views[request_id].block_tables)
+    return packed
+
+
+def _same_table(packed: PackedBlocks, supplied: Any) -> bool:
+    try:
+        return packed == PackedBlocks.pack(supplied)
+    except IntegrationError:
+        return False
 
 
 @dataclass
@@ -887,6 +907,7 @@ class MuxController:
                                               (len(request.output) - 1 if batch.plan.purpose == "REBUILD" else 0)),
                                           "state": "PREPARING", "metadata": {},
                                           "acked": set(), "destinations": {}}
+            packed = _packed_view(batch, ref.request_id)
             plans.append({"request_id": request.spec.request_id, "attempt": request.attempt,
                           "input_ids": request.spec.input_ids,
                           "output_token_ids": tuple(request.output),
@@ -907,9 +928,9 @@ class MuxController:
                               "identity": {"model_id": view.identity.model_id,
                                   "request_id": view.identity.request_id, "attempt": view.identity.attempt},
                               "capacity_tokens": view.capacity_tokens, "valid_tokens": view.valid_tokens,
-                              "block_size": view.block_size, "block_tables": view.block_tables,
+                              "block_size": view.block_size, "block_tables": packed,
                               "version": view.version},
-                          "rank_block_table": view.block_tables[key[1]]})
+                          "rank_block_table": packed[key[1]]})
         payload = {"batch_id": batch.plan.batch_id, "reservation_id": batch.reservation.reservation_id,
                    "batch_stage": batch.plan.stage, "purpose": batch.plan.purpose,
                    "requests": plans, "ordered_request_ids": tuple(ref.request_id for ref in batch.plan.requests)}
@@ -1202,7 +1223,8 @@ class MuxController:
                     or entry["allocation_id"] != allocation_id
                     or entry["reserved_version"] != reserved_version
                     or entry["target_valid_tokens"] != target_valid_tokens
-                    or view.block_tables[rank] != rank_block_table
+                    or rank not in view.block_tables
+                    or not _same_table(_packed_view(batch, view.identity.request_id)[rank], rank_block_table)
                     or type(metadata_slot) is not int or not 0 <= metadata_slot < 2 * self.config.max_model_inflight
                     or type(logical_token_count) is not int or logical_token_count != target_valid_tokens):
                 raise IntegrationError("INVALID_BROKER", "Native destination reservation mismatch")
@@ -1309,7 +1331,7 @@ class MuxController:
             return {"group_id": group_id, "room": room,
                     "identity": entry["identity"], "allocation_id": allocation_id,
                     "version": version, "valid_tokens": valid_tokens,
-                    "rank": rank, "rank_block_table": deepcopy(entry["block_tables"][rank]),
+                    "rank": rank, "rank_block_table": entry["block_tables"][rank],
                     "metadata": deepcopy(entry["metadata"][rank])}
 
     def broker_ack(self, group_id: str, room: int, rank: int, pid: int,
@@ -1324,7 +1346,8 @@ class MuxController:
                     or target is None or target.pid != pid or not target.alive or entry is None
                     or entry["state"] != "PUBLISHED" or entry["allocation_id"] != allocation_id
                     or entry["version"] != version or entry["valid_tokens"] != valid_tokens
-                    or entry["block_tables"][rank] != rank_block_table):
+                    or rank not in entry["block_tables"]
+                    or not _same_table(entry["block_tables"][rank], rank_block_table)):
                 raise IntegrationError("HANDOFF_NOT_READY", "Committed broker ACK mismatch")
             entry["acked"].add(rank)
             self._notify(group)
@@ -1455,12 +1478,17 @@ class MuxController:
             self._begin_quiesce(group, batch, group.required)
         elif batch.plan.stage == "P":
             batch.status = "HANDOFF"
+            # Credits meter SM share. Every P rank has finished its forward, so
+            # the KV handoff and quiesce that follow use none: release now and
+            # let yielded decode runs resume instead of waiting for the whole
+            # P/D protocol (release in _finish_batch then finds no lease).
+            self.credits.release(batch.plan.batch_id)
             for entry in group.broker.values():
                 if entry["batch_id"] == batch.plan.batch_id:
                     request = self._request(group.model_id, entry["identity"].request_id)
                     entry["version"] = request.version
                     entry["valid_tokens"] = request.valid_tokens
-                    entry["block_tables"] = deepcopy(batch.committed_views[request.spec.request_id].block_tables)
+                    entry["block_tables"] = _packed_view(batch, request.spec.request_id, committed=True)
                     entry["state"] = "PUBLISHED"
             self._notify(group)
             for rank_id in group.ranks:
@@ -1615,7 +1643,7 @@ class MuxController:
             items.append({"request_id": ref.request_id, "attempt": ref.attempt,
                           "bootstrap_room": room, "allocation_id": request.allocation_id,
                           "version": request.version, "valid_tokens": request.valid_tokens,
-                          "rank_block_table": deepcopy(batch.committed_views[ref.request_id].block_tables[rank]),
+                          "rank_block_table": _packed_view(batch, ref.request_id, committed=True)[rank],
                           "boundary_token_id": request.output[-1] if batch.plan.purpose == "REBUILD"
                               else batch.output_metadata[ref.request_id]["token_id"]})
         return {"batch_id": batch.plan.batch_id, "reservation_id": batch.reservation.reservation_id,
@@ -2026,8 +2054,7 @@ class MuxController:
                         event.request_id == request_id for event in group.outbox.pending.values())
                     or any(self._command_refs_request(group, cmd, request_id)
                            for rank in group.registered.values() for cmd in rank.commands.values())
-                    or any(a["identity"] == request.identity for a in
-                           self.store.snapshot()["allocations"].values())):
+                    or request.identity in self.store.allocation_identities()):
                 raise IntegrationError("NOT_READY", "Terminal, event/command ACK and physical release required")
             group.retired.add("request", request_id)
             if request.resume_record_id:
@@ -2098,7 +2125,7 @@ class MuxController:
         """Small bounded telemetry view for paired benchmark collection."""
         with self.lock:
             batches = [batch for group in self.groups.values() for batch in group.batches.values()]
-            history = self.store.snapshot()["history"]
+            history = self.store.history()
             return {"active_requests": len(self.requests),
                 "timing_boundaries": {
                     "execution_wall_ms": "rank START handler to synchronized result, maximum across compute ranks",

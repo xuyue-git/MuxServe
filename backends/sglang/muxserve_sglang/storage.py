@@ -412,6 +412,20 @@ class HeadwiseStore:
         with self._lock:
             return frozenset(self._allocations)
 
+    def allocation_identities(self) -> frozenset:
+        """Live allocation identities only; never copies block tables."""
+        with self._lock:
+            return frozenset(a.identity for a in self._allocations.values())
+
+    def history(self) -> dict:
+        """The snapshot's bounded history counters without copying any tables."""
+        with self._lock:
+            return {"retained_batches": len(self._batches),
+                    "retired_batch_ids": len(self._retired_batch_ids),
+                    "request_keys": len(self._latest_attempt),
+                    "retired_allocation_ids": len(self._retired_ids),
+                    "lifetime_batch_limit": self._batch_history_limit}
+
     def rank_usage(self) -> dict:
         """Return capacity counters without materializing allocation mappings."""
         with self._lock:

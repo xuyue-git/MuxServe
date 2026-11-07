@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'acceptance'))
 from controller_check import Fixture
-from muxserve_sglang.contracts import IntegrationError, KVTarget, RequestIdentity
+from muxserve_sglang.contracts import IntegrationError, KVTarget, RequestIdentity, pack_tables
 from muxserve_sglang.storage import HeadwiseStore
 from muxserve_sglang.startup import _InitializationController, warmup_shapes
 
@@ -94,22 +94,27 @@ class PreparationMetadataChecks(unittest.TestCase):
             snapshot = fixture.controller._snapshot_policy()
         self.assertEqual(snapshot.rank_free_blocks, {0: 64})
 
-    def test_payload_borrows_tables_until_durable_command_copy(self):
+    def test_payload_packs_tables_once_per_batch(self):
         fixture = Fixture()
         fixture.submit()
         plan, _ = fixture.prepare()
-        batch = fixture.controller.groups['m'].batches[plan.batch_id]
+        controller = fixture.controller
+        batch = controller.groups['m'].batches[plan.batch_id]
         original = batch.views['r']
-        expected = asdict(original)
+        expected = {**asdict(original), 'block_tables': pack_tables(original.block_tables)}
 
         class GuardedTables(dict):
             def items(self):
-                raise AssertionError('Payload redundantly traversed full block tables before publication')
+                raise AssertionError('Payload re-traversed full block tables after packing them once')
 
         batch.views['r'] = replace(original, block_tables=GuardedTables(original.block_tables))
-        payload = fixture.controller._command_payload(fixture.controller.groups['m'], batch, ('P', 0))
-        self.assertEqual(payload['requests'][0]['reservation_view'], expected)
-        self.assertIs(payload['requests'][0]['reservation_view']['block_tables'], batch.views['r'].block_tables)
+        for key in (('P', 0), ('D', 0)):
+            payload = controller._command_payload(controller.groups['m'], batch, key)
+            view = payload['requests'][0]['reservation_view']
+            self.assertEqual(view, expected)
+            self.assertIs(view['block_tables'], batch.packed['r'])
+            self.assertEqual(payload['requests'][0]['rank_block_table'], view['block_tables'][key[1]])
+            self.assertEqual(view['block_tables'][0].tolist(), original.block_tables[0])
 
     def test_command_owns_one_copy_and_poll_returns_independent_data(self):
         fixture = Fixture()

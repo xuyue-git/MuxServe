@@ -1054,6 +1054,25 @@ def check_independent_progress_watchdogs():
             assert f.store.snapshot()["allocations"]  # Unknown access remains pinned.
 
 
+def check_prefill_credits_release_at_gpu_done():
+    """P credits meter SM share: released once every P rank finished its
+    forward, before the CPU-only handoff/quiesce; release stays idempotent."""
+    f = Fixture()
+    f.submit(max_new=2)
+    plan, batch = f.prepare()
+    held = lambda: any(any(refs) for refs in f.controller.credits.refs.values())
+    assert held()
+    f.ready_start(plan, batch)
+    f.stage_prefill(plan)
+    assert held()
+    f.gpu(plan, batch, 4, 2)
+    assert f.controller.snapshot()["groups"]["m"]["batches"][plan.batch_id]["status"] == "HANDOFF"
+    assert not held() and f.controller.credits.can_allocate(10)
+    f.handoff(plan)
+    f.batch_quiesce(plan, batch)
+    assert not held() and f.controller.credits.leases == {}
+
+
 if __name__ == "__main__":
     check_first_token_and_replay()
     check_cancel_and_timeout()
@@ -1074,4 +1093,5 @@ if __name__ == "__main__":
     check_initialization_admission_and_event_cursor()
     check_pool_wide_and_static_recovery_scope()
     check_independent_progress_watchdogs()
+    check_prefill_credits_release_at_gpu_done()
     print("controller CPU checks passed")

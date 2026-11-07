@@ -19,7 +19,7 @@ import numpy
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from muxserve_sglang.contracts import IntegrationError, KVView, ModelLayout, RequestIdentity
+from muxserve_sglang.contracts import IntegrationError, KVView, ModelLayout, RequestIdentity, PackedBlocks
 
 
 class Tensor:
@@ -86,13 +86,14 @@ def adapter(upload):
     sys.modules[module.__name__] = module
     namespace = module.__dict__
     namespace.update(dataclass=dataclass, field=field, Sequence=Sequence, torch=upload, np=numpy,
-                     IntegrationError=IntegrationError, KVView=KVView, ModelLayout=ModelLayout)
+                     IntegrationError=IntegrationError, KVView=KVView, ModelLayout=ModelLayout,
+                     PackedBlocks=PackedBlocks)
     text = 'from __future__ import annotations\n' + '\n'.join(ast.unparse(node) for node in selected)
     exec(compile(text, 'actual-sglang-memory-methods', 'exec'), namespace)
     return namespace['Pool']
 
 
-def fixture(upload, mode='DECODE', lengths=(17, 33), *, layers=5, start_layer=0, end_layer=None):
+def fixture(upload, mode='DECODE', lengths=(17, 33), *, layers=5, start_layer=0, end_layer=None, packed=False):
     heads, ranks = 3, (0, 1, 2, 3)
     layout = ModelLayout('m', layers, heads, ranks)
     cursor, views = 0, []
@@ -111,6 +112,8 @@ def fixture(upload, mode='DECODE', lengths=(17, 33), *, layers=5, start_layer=0,
                               for blocks in local_heads] for local_heads in table]
                        for rank in ranks}
         valid = target - 1 if mode == 'DECODE' else (7 if mode == 'REBUILD' else 0)
+        if packed:
+            rank_tables = {rank: PackedBlocks.pack(t) for rank, t in rank_tables.items()}
         views.append(KVView('a-' + str(index), RequestIdentity('m', 'r-' + str(index)),
                             target, valid, 16, rank_tables))
     pool = adapter(upload)()
@@ -179,6 +182,24 @@ class MetadataUploadChecks(unittest.TestCase):
                     for layer in (0, 4):
                         with self.assertRaises(IntegrationError):
                             pool.layer_metadata(layer)
+
+    def test_packed_tables_produce_identical_layer_metadata(self):
+        for mode in ('DECODE', 'PREFILL', 'REBUILD'):
+            for lengths in ((15, 16, 17, 33), (1792, 17)):
+                with self.subTest(mode=mode, lengths=lengths):
+                    plain, _, _ = fixture(Uploads(), mode, lengths, layers=5, start_layer=1, end_layer=3)
+                    packed, _, _ = fixture(Uploads(), mode, lengths, layers=5, start_layer=1, end_layer=3,
+                                           packed=True)
+                    for layer in (3, 1, 2):
+                        a_slots, a_tables = plain.layer_metadata(layer)
+                        b_slots, b_tables = packed.layer_metadata(layer)
+                        self.assertEqual(a_slots.tolist(), b_slots.tolist())
+                        self.assertEqual(a_tables.tolist(), b_tables.tolist())
+                        self.assertEqual(b_slots.dtype, 'int64')
+                        self.assertEqual(b_tables.dtype, 'int32')
+                        expected_slots, expected_tables = legacy_metadata(packed.bound_forward, layer)
+                        self.assertEqual(b_slots.tolist(), expected_slots)
+                        self.assertEqual(b_tables.tolist(), expected_tables)
 
     def test_forward_identity_and_clear_rebind_do_not_reuse_old_metadata(self):
         uploads = Uploads()

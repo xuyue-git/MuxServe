@@ -175,6 +175,11 @@ def main():
     parser.add_argument("--run-steps", type=int, default=128)
     parser.add_argument("--requests", type=int, default=3)
     parser.add_argument("--output-len", type=int, default=32)
+    parser.add_argument("--input-len", type=int, default=64)
+    parser.add_argument("--layers", type=int, default=2, help="e.g. 60 for LLaMA-30B")
+    parser.add_argument("--heads", type=int, default=TP, help="total KV heads, e.g. 52 for LLaMA-30B")
+    parser.add_argument("--pool-blocks", type=int, default=4096, help="KV blocks per rank")
+    parser.add_argument("--profile", help="write owner-side cProfile stats of RPC handlers here")
     args = parser.parse_args()
     from muxserve_sglang.controller import MuxController
     from muxserve_sglang.driver import ControllerDriver
@@ -183,32 +188,45 @@ def main():
     from muxserve_sglang.storage import HeadwiseStore
 
     port = free_port()
-    deployments = tuple(ModelDeployment(m, "unused", "0" * 40, "unused", "0" * 40, 2, TP, 128 * TP, 40,
+    deployments = tuple(ModelDeployment(m, "unused", "0" * 40, "unused", "0" * 40, args.layers, args.heads,
+                                        128 * args.heads, 40,
                                         20100 + 10 * i, 20101 + 10 * i, 20102 + 10 * i)
                         for i, m in enumerate(MODELS))
-    config = DeploymentConfig(deployments, tp_size=TP, kv_bytes_per_rank=4096 * 8192,
+    config = DeploymentConfig(deployments, tp_size=TP, kv_bytes_per_rank=args.pool_blocks * 8192,
                               controller_port=port, decode_run_steps=args.run_steps)
-    store = HeadwiseStore({r: 4096 for r in range(TP)}, model_ids=MODELS)
+    store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
     os.chmod(directory, 0o700)
     address, key = str(Path(directory) / "store.sock"), os.urandom(32)
     owner = SimpleNamespace(export_pool=lambda *a: None, release_consumer=lambda *a: None,
                             owner_snapshot=lambda: {}, close=lambda: None)
+    profiles, profile_lock, handler_ms = [], threading.Lock(), {}
+    local = threading.local()
     def traced(name, method):
-        def call(*args, **kwargs):
+        def call(*a, **kwargs):
+            started = time.perf_counter()
             try:
-                return method(*args, **kwargs)
+                return method(*a, **kwargs)
             except IntegrationError:
                 raise
             except Exception:
                 import traceback
                 print("OWNER_INTERNAL_ERROR", name, traceback.format_exc(), flush=True)
                 raise
+            finally:
+                with profile_lock:
+                    entry = handler_ms.setdefault(name, [0, 0.0])
+                    entry[0] += 1
+                    entry[1] += (time.perf_counter() - started) * 1000
         return call
     methods = {name: traced(name, method) for name, method in controller.rpc_methods().items()}
     server = StorageRPCServer(store, owner, address, key, extra_methods=methods,
                               owner_close=owner.close)
+    if args.profile:
+        import cProfile  # Python 3.12+: one interpreter-wide profiler covers every thread
+        profiles.append(cProfile.Profile())
+        profiles[0].enable()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     context = multiprocessing.get_context("spawn")  # like the launcher; fork+threads can deadlock
@@ -244,7 +262,7 @@ def main():
     out = Path(directory) / "bench.json"
     bench = subprocess.run([sys.executable, str(ROOT / "tools/bench_fixed.py"), "--port", str(port),
                             "--models", ",".join(MODELS), "--requests", str(args.requests), "--warmup", "1",
-                            "--input-len", "64", "--output-len", str(args.output_len),
+                            "--input-len", str(args.input_len), "--output-len", str(args.output_len),
                             "--ready-timeout", "30", "--request-timeout", "120", "--out", str(out)],
                            capture_output=True, text=True, timeout=600)
     result = json.loads(out.read_text()) if out.exists() else None
@@ -270,6 +288,20 @@ def main():
     expected = [token_for(i) for i in range(args.output_len)]
     for m in MODELS:
         assert result["first_output_ids"][m] == expected, (m, result["first_output_ids"][m][:8])
+    if args.profile:
+        import pstats
+        profiles[0].disable()
+        stats = None
+        for profile in profiles:
+            if stats is None:
+                stats = pstats.Stats(profile)
+            else:
+                stats.add(profile)
+        if stats is not None:
+            stats.dump_stats(args.profile)
+        busy = {k: (v[0], round(v[1], 1)) for k, v in sorted(handler_ms.items(), key=lambda kv: -kv[1][1])
+                if k != "poll_commands_wait"}
+        print("OWNER_HANDLER_MS", busy)
     tpot = {m: round(s["mean_tpot_s"] * 1000, 2) for m, s in result["summary"]["models"].items()}
     print("E2E_PASS run_steps=%d mean_tpot_ms=%s (simulated GPU %.1f ms) ttft_ms=%s" % (
         args.run_steps, tpot, DECODE_S * 1000,

@@ -51,5 +51,26 @@ class CounterProjectionChecks(unittest.TestCase):
                 self.assertTrue(store.assert_integrity()['ok'])
 
 
+    def test_forget_and_metrics_do_not_copy_kv_tables(self):
+        store = ObservedStore({0: 64}, model_ids=('m',))
+        f = Fixture(store=store)
+        f.submit(max_new=1)
+        p, batch = f.prepare()
+        f.ready_start(p, batch)
+        f.stage_prefill(p)
+        f.gpu(p, batch, 4, 2)
+        f.handoff(p)
+        f.batch_quiesce(p, batch)
+        f.cleanup('r')
+        events = f.controller.poll_events(f.group)
+        f.controller.ack_events(f.group, events[-1].event_seq)
+        f.ack_all_commands()
+        store.snapshots = 0
+        f.controller.metrics()
+        f.controller.forget_request('m', 'r', 0)
+        self.assertEqual(store.snapshots, 0, 'forget/metrics materialized every live KV block table')
+        self.assertEqual(f.controller.metrics()['active_requests'], 0)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
