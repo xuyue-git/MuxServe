@@ -6,7 +6,8 @@
 #
 # RUN_STEPS=0 writes a config without decode_run_steps (for the original code).
 # Optional env: GPUS (default 1,2,3,4), MODELS_ROOT, REFERENCE (bench JSON to
-# compare output tokens against). The launcher is always stopped with SIGINT
+# compare output tokens against), KV_FRACTION (size the KV pool like original
+# MuxServe: gpu_memory_utilization x total GPU memory, instead of kv_bytes_per_rank). The launcher is always stopped with SIGINT
 # (normal drain); the script waits for it to exit.
 set -euo pipefail
 RUNTIME="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,14 +18,18 @@ LOCKS="${LOCKS:?set LOCKS to the personal asset lock directory}"
 MODELS_ROOT="${MODELS_ROOT:-/storage/crosspool-models/huggyllama}"
 GPUS="${GPUS:-1,2,3,4}"
 REFERENCE="${REFERENCE:-}"
+KV_FRACTION="${KV_FRACTION:-}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
-"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" "$RUN_STEPS" <<'PYEOF'
+"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" "$RUN_STEPS" "$KV_FRACTION" <<'PYEOF'
 import json, sys
-source, target, locks, root, steps = sys.argv[1:]
+source, target, locks, root, steps, fraction = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
+if fraction:
+    config.pop("kv_bytes_per_rank", None)
+    config["kv_memory_fraction"] = float(fraction)
 config.pop("decode_run_steps", None)
 if int(steps) > 0:
     config["decode_run_steps"] = int(steps)
@@ -32,7 +37,9 @@ for model, size in zip(config["models"], ("7b", "13b", "30b")):
     model["model_path"] = model["tokenizer_path"] = f"{root}/llama-{size}"
     model["decode_mps"] = 40  # paired point: all three models D40
 json.dump(config, open(target, "w"), indent=2)
-print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "absent"))
+print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "absent"),
+      "kv=%s" % (("fraction %s" % config["kv_memory_fraction"]) if "kv_memory_fraction" in config
+                 else "%d bytes" % config["kv_bytes_per_rank"]))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

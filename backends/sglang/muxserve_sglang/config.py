@@ -119,6 +119,11 @@ class DeploymentConfig:
     # Maximum consecutive decode forwards under one D grant. 1 is the original
     # per-token protocol; larger runs still yield at every step boundary.
     decode_run_steps: int = 1
+    # Original MuxServe sizing: KV = gpu_memory_utilization x total GPU memory
+    # (see kv_bytes_from_fraction). When set, the launcher resolves it into
+    # kv_bytes_per_rank before writing the runtime config; mutually exclusive
+    # with an explicit kv_bytes_per_rank.
+    kv_memory_fraction: float | None = None
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -136,9 +141,31 @@ class DeploymentConfig:
         raise IntegrationError("UNKNOWN_MODEL", "Model is not configured")
 
 
+def kv_bytes_from_fraction(fraction: float, total_memory_bytes: int) -> int:
+    """KV bytes per GPU exactly as original MuxServe FlexStore sizes its cache.
+
+    muxserve/flexstore/manager.py get_num_gpu_blocks(): available =
+    round(gpu_memory_utilization * total_memory) - 1; one block holds K and V
+    for one head of block_size=32 FP16 tokens at head_size=128; the block count
+    is rounded down to a multiple of 128. The result is a multiple of 16384
+    bytes, so it maps exactly onto this backend's 16-token (8192-byte) blocks.
+    """
+    head_size, block_size, element_size = 128, 32, 2
+    available = round(fraction * total_memory_bytes) - 1
+    block_mem = element_size * (head_size * block_size + head_size * block_size)
+    blocks = (available // block_mem // 128) * 128
+    return blocks * block_mem
+
+
 def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentConfig:
     path = safe_path(path)
     raw = json.loads(path.read_text(encoding="utf-8"))
+    fraction = raw.get("kv_memory_fraction")
+    if fraction is not None:
+        if "kv_bytes_per_rank" in raw:
+            raise IntegrationError("INVALID_CONFIG", "Use kv_memory_fraction or kv_bytes_per_rank, not both")
+        if type(fraction) not in (int, float) or not 0 < fraction < 1:
+            raise IntegrationError("INVALID_CONFIG", "kv_memory_fraction must be in (0, 1)")
     models = tuple(ModelDeployment(**item) for item in raw.pop("models"))
     config = DeploymentConfig(models=models, **raw)
     if not isinstance(config.asset_lock_dir, str):

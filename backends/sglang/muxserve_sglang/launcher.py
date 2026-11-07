@@ -12,11 +12,12 @@ import secrets
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 from threading import Event, Thread
 import time
 
-from .config import load_config, read_asset_path, safe_path
+from .config import kv_bytes_from_fraction, load_config, read_asset_path, safe_path
 from .contracts import IntegrationError
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,27 @@ def _free_loopback_port(excluded=()):
 )
 
 
+def _cuda_total_memory(cards):
+    """torch total_memory of the first selected GPU, as original MuxServe reads it.
+
+    Queried in a short-lived child before the private MPS daemon starts, so the
+    supervisor itself never creates a non-MPS CUDA context.
+    """
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=cards[0]["uuid"])
+    for key in ("CUDA_MPS_PIPE_DIRECTORY", "CUDA_MPS_LOG_DIRECTORY"):
+        env.pop(key, None)
+    result = subprocess.run([sys.executable, "-c",
+                             "import torch; print(torch.cuda.get_device_properties(0).total_memory)"],
+                            env=env, capture_output=True, text=True, timeout=120)
+    try:
+        total = int(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        total = 0
+    if result.returncode != 0 or total <= 0:
+        raise IntegrationError("STARTUP_MEMORY_UNAVAILABLE", "Could not read GPU total memory for KV sizing")
+    return total
+
+
 def _write_json(path, value):
     path = safe_path(path)
     descriptor, temporary = tempfile.mkstemp(prefix=".evidence-", dir=path.parent)
@@ -191,6 +213,16 @@ class Supervisor:
         else:
             self.directory = Path(tempfile.mkdtemp(prefix=f"mxs-{os.getuid()}-", dir=str(safe_path("/tmp"))))
         os.chmod(self.directory, 0o700)
+        kv_sizing = {"mode": "kv_bytes_per_rank"}
+        if config.kv_memory_fraction is not None:
+            total = _cuda_total_memory(cards)
+            kv_bytes = kv_bytes_from_fraction(config.kv_memory_fraction, total)
+            if kv_bytes < 8192:
+                raise IntegrationError("INVALID_CONFIG", "kv_memory_fraction leaves no KV blocks")
+            kv_sizing = {"mode": "original_muxserve_fraction", "kv_memory_fraction": config.kv_memory_fraction,
+                         "total_memory_bytes_device0": total, "kv_bytes_per_rank": kv_bytes}
+            print("KV_POOL " + json.dumps(kv_sizing), flush=True)
+            config = replace(config, kv_bytes_per_rank=kv_bytes, kv_memory_fraction=None)
         config = replace(config, runtime_dir=str(self.directory), models=tuple(
             replace(model, model_path=str(read_asset_path(model.model_path)),
                     tokenizer_path=str(read_asset_path(model.tokenizer_path))) for model in config.models))
@@ -204,7 +236,7 @@ class Supervisor:
         _write_json(self.directory / "preflight.json", {"requested_devices": requested,
                     "rank_gpus": cards, "assets": assets, "software": software,
                     "config_fingerprint": config.fingerprint,
-                    "kv_bytes_per_rank": config.kv_bytes_per_rank,
+                    "kv_bytes_per_rank": config.kv_bytes_per_rank, "kv_sizing": kv_sizing,
                     "extra_headroom_bytes_per_rank": config.extra_headroom_bytes_per_rank})
         for name in ("mps", "mps-log"):
             (self.directory / name).mkdir(mode=0o700)
