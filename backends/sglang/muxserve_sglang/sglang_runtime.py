@@ -617,6 +617,10 @@ class ControlledScheduler:
             finished = any(req.finished() for req in state.reqs)
             reply = self.rpc("decode_step", self.rank, self.pid, command["batch_id"], step,
                              results, finished)
+            while reply.get("continue") == "PARK":
+                # Parked for a waiting prefill: the GPU is idle (synchronized
+                # above) and every native/KV state stays as it is.
+                reply = self.rpc("decode_resume", self.rank, self.pid, command["batch_id"], step, 100)
             if finished or step >= steps or reply.get("continue") is not True:
                 break
             step += 1

@@ -123,6 +123,10 @@ class DeploymentConfig:
     # batch size 1..max_model_inflight). P stays eager. Off keeps every
     # forward eager, as before.
     decode_cuda_graph: bool = False
+    # A decode run that yields to a waiting prefill parks (keeps its KV
+    # reservation and native state, releases its credits) and resumes once
+    # the prefill's forward finished, instead of ending and re-preparing.
+    decode_run_park: bool = False
     # Original MuxServe sizing: KV = gpu_memory_utilization x total GPU memory
     # (see kv_bytes_from_fraction). When set, the launcher resolves it into
     # kv_bytes_per_rank before writing the runtime config; mutually exclusive
@@ -191,6 +195,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "Preparation deadline must be at most 120000 ms")
     if type(config.decode_cuda_graph) is not bool:
         raise IntegrationError("INVALID_CONFIG", "decode_cuda_graph must be a boolean")
+    if type(config.decode_run_park) is not bool:
+        raise IntegrationError("INVALID_CONFIG", "decode_run_park must be a boolean")
     if config.decode_run_steps > config.max_new_tokens:
         raise IntegrationError("INVALID_CONFIG", "Decode run length exceeds the output budget")
     if config.queue_limit > 100000:

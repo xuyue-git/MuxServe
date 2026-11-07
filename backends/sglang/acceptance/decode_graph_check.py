@@ -42,6 +42,12 @@ class DecodeGraphConfigChecks(unittest.TestCase):
         with self.assertRaises(IntegrationError):
             self.config(decode_cuda_graph=1)
 
+    def test_park_flag_defaults_off_and_must_be_boolean(self):
+        self.assertFalse(self.config().decode_run_park)
+        self.assertTrue(self.config(decode_run_park=True).decode_run_park)
+        with self.assertRaises(IntegrationError):
+            self.config(decode_run_park=1)
+
     def test_only_d_stage_enables_full_decode_graphs(self):
         ns = launcher_functions()
         model = SimpleNamespace(model_path='p', tokenizer_path='t', revision='r', prefill_port=1,

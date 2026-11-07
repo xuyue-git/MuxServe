@@ -31,7 +31,7 @@ class Clock:
 class Sim:
     """TP ranks for every model; commands are fetched exactly like real ranks."""
 
-    def __init__(self, models=("a",), *, tp=2, run_steps=4, blocks=4096):
+    def __init__(self, models=("a",), *, tp=2, run_steps=4, blocks=4096, park=False):
         deployments = tuple(ModelDeployment(m, "unused", "0" * 40, "unused", "0" * 40,
                                             2, tp, 128 * tp, 40, 18100 + 10 * i, 18101 + 10 * i,
                                             18102 + 10 * i)
@@ -40,7 +40,7 @@ class Sim:
         self.clock = Clock()
         self.store = HeadwiseStore({rank: blocks for rank in range(tp)})
         self.config = DeploymentConfig(deployments, tp_size=tp, kv_bytes_per_rank=blocks * 8192,
-                                       decode_run_steps=run_steps)
+                                       decode_run_steps=run_steps, decode_run_park=park)
         self.controller = MuxController(self.config, self.store, clock=self.clock,
                                         expected_lengths={m: 16 for m in models})
         self.cap = {"vocab_size": 64, "eos_token_ids": (9,), "native_pd": True, "headwise_kv": True}
@@ -153,6 +153,10 @@ class Sim:
         return self.controller.decode_step(self.group(model), rank, self.pid(model, "D", rank),
             plan.batch_id, step, [{"request_id": rid, "attempt": plan.requests[0].attempt,
                                    "token_id": token, "valid_tokens": start + step}], finished)
+
+    def resume(self, model, plan, rank, step, wait_ms=0):
+        return self.controller.decode_resume(self.group(model), rank, self.pid(model, "D", rank),
+                                             plan.batch_id, step, wait_ms)["continue"]
 
     def finish_run(self, model, plan, reservation, steps, token, ranks=None):
         rid = plan.requests[0].request_id
@@ -292,6 +296,93 @@ class DecodeRunChecks(unittest.TestCase):
         request = sim.controller.requests[("a", "r")]
         self.assertEqual((request.output, request.valid_tokens, request.state), ([11, 12, 13], 5, "DECODING"))
         self.assertTrue(all(not any(refs) for refs in sim.controller.credits.refs.values()))
+
+    def parked(self):
+        sim = Sim(("a", "b"), run_steps=8, park=True)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        self.assertTrue(all(sim.step("a", plan, rank, 1, 12)["continue"] for rank in range(sim.tp)))
+        sim.submit("b", "x", max_new=4)  # Needs 10 credits; the run holds 4.
+        credits = sim.controller.credits
+        self.assertEqual(sim.step("a", plan, 0, 2, 13)["continue"], "PARK")
+        # Until every rank finished step 2 the run still uses its SMs.
+        self.assertFalse(credits.can_allocate(10))
+        self.assertEqual(sim.step("a", plan, 1, 2, 13)["continue"], "PARK")
+        batch = sim.controller.groups["a"].batches[plan.batch_id]
+        self.assertEqual(batch.status, "RUNNING")
+        self.assertIsNotNone(batch.parked_at)
+        self.assertTrue(credits.can_allocate(10))
+        self.assertNotIn(plan.batch_id, credits.leases)
+        return sim, plan, reservation
+
+    def test_parked_run_frees_credits_and_resumes_after_the_prefill_forward(self):
+        sim, plan, reservation = self.parked()
+        # Free credits alone never resume a run while the prefill awaits them.
+        self.assertEqual(sim.resume("a", plan, 0, 2), "PARK")
+        free = sim.store.rank_usage()[0]["free_blocks"]
+        sim.prefill("b", "x", 21)
+        self.assertEqual(sim.resume("a", plan, 0, 2), True)
+        self.assertEqual(sim.resume("a", plan, 1, 2), True)  # replayed decision
+        self.assertIn(plan.batch_id, sim.controller.credits.leases)
+        self.assertIsNone(sim.controller.groups["a"].batches[plan.batch_id].parked_at)
+        for step, token in enumerate((14, 15, 16, 17, 18, 19), start=3):
+            decisions = {sim.step("a", plan, rank, step, token)["continue"] for rank in range(sim.tp)}
+            self.assertEqual(decisions, {step < 8})
+        sim.finish_run("a", plan, reservation, 8, 19)
+        sim.quiesce("a", plan, reservation)
+        request = sim.controller.requests[("a", "r")]
+        self.assertEqual(request.output, [11, 12, 13, 14, 15, 16, 17, 18, 19])
+        self.assertEqual((request.valid_tokens, request.state), (3 + 8, "DECODING"))
+        self.assertEqual(sim.tokens("a"), [11, 12, 13, 14, 15, 16, 17, 18, 19])
+        self.assertNotIn(plan.batch_id, sim.controller.credits.leases)
+        self.assertLessEqual(free, sim.store.rank_usage()[0]["free_blocks"] + 10_000)
+
+    def test_parked_run_ends_like_a_yield_on_cancel_or_after_the_park_limit(self):
+        for reason in ("cancel", "limit"):
+            with self.subTest(reason=reason):
+                sim, plan, reservation = self.parked()
+                if reason == "cancel":
+                    sim.controller.cancel_request("a", "r")
+                else:
+                    sim.clock.now += 2.5
+                self.assertIs(sim.resume("a", plan, 1, 2), False)
+                self.assertIs(sim.resume("a", plan, 0, 2), False)
+                expect("REPORT_GAP", lambda: sim.step("a", plan, 0, 3, 14))
+                sim.finish_run("a", plan, reservation, 2, 13)
+                sim.quiesce("a", plan, reservation)
+                request = sim.controller.requests[("a", "r")]
+                self.assertEqual(request.output, [11, 12, 13])
+                self.assertTrue(all(not any(refs) for refs in sim.controller.credits.refs.values()))
+
+    def test_resume_long_poll_wakes_when_the_prefill_releases_credits(self):
+        sim, plan, _ = self.parked()
+        result = {}
+
+        def wait():
+            result["value"] = sim.controller.decode_resume(
+                sim.group("a"), 0, sim.pid("a", "D", 0), plan.batch_id, 2, 1000)["continue"]
+            result["at"] = time.monotonic()
+
+        waiter = threading.Thread(target=wait)
+        waiter.start()
+        time.sleep(0.05)
+        self.assertNotIn("value", result)
+        sim.prefill("b", "x", 21)
+        released = time.monotonic()
+        waiter.join(2)
+        self.assertIs(result.get("value"), True)
+        self.assertLess(result["at"] - released, 0.5)
+
+    def test_resume_requires_a_parked_or_decided_step(self):
+        sim = Sim(run_steps=4, park=True)
+        sim.submit("a", "r", max_new=8)
+        sim.prefill("a", "r", 11)
+        plan, _ = sim.prepare_decode("a", "r", 4)
+        expect("STALE_REPORT", lambda: sim.resume("a", plan, 0, 1))  # not reported yet
+        self.assertIs(sim.step("a", plan, 0, 1, 12)["continue"], True)
+        self.assertIs(sim.resume("a", plan, 0, 1), True)
+        expect("INVALID_ARGUMENT", lambda: sim.resume("a", plan, 0, 1, 5000))
 
     def test_gpu_done_may_arrive_before_a_slower_rank_reports_the_last_step(self):
         sim = Sim(run_steps=2)

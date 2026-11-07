@@ -78,6 +78,15 @@ per-layer slot / page-table / length buffers sized for 2048-token contexts.
 Every replay still passes the per-forward grant check and `validate_forward`
 of the live batch; the validated grant is then copied into those buffers.
 
+`decode_run_park: true` changes how a decode run yields to a waiting prefill.
+Instead of ending (GPU_DONE, KV commit, quiesce) and being re-prepared later,
+the run parks at the step boundary: once every D rank finished that step its
+credits are released, while its KV reservation and native state stay. The
+ranks long-poll `decode_resume`; the run resumes when no prefill holds or
+awaits credits and its own credits are free again, or ends exactly like an
+ordinary yield on cancel/timeout/fence or after 2 s parked. D wall-time
+feedback then includes the parked time.
+
 ## Known limitations
 
 Prefill CUDA graphs, overlap scheduling and custom all-reduce remain disabled.

@@ -38,7 +38,8 @@ def token_for(output_count: int) -> int:
     return 10 + (output_count * 7) % 50
 
 
-def rank_main(address, key, group, model, stage, rank, pid_tag, stop):
+def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None):
+    prefill_s, decode_s = timing or (PREFILL_S, DECODE_S)
     from muxserve_sglang.ipc import StorageRPCClient
     rpc = StorageRPCClient(address, key, 30)
     pid = os.getpid()
@@ -87,17 +88,17 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop):
                             "bootstrap_room": item["bootstrap_room"], "allocation_id": view["allocation_id"],
                             "reserved_version": view["version"], "target_valid_tokens": item["target_valid_tokens"],
                             "rank": rank, "native_payload": {}})
-                    time.sleep(PREFILL_S)
+                    time.sleep(prefill_s)
                     results = [{"request_id": i["request_id"], "attempt": i["attempt"],
                                 "token_id": token_for(len(i["output_token_ids"])),
                                 "valid_tokens": i["target_valid_tokens"]} for i in prep["requests"]]
                     payload = {"reservation_id": prep["reservation_id"], "results": results,
-                               "duration_ms": (time.monotonic() - start) * 1000, "gpu_forward_ms": PREFILL_S * 1000}
+                               "duration_ms": (time.monotonic() - start) * 1000, "gpu_forward_ms": prefill_s * 1000}
                 else:
                     steps = prep.get("run_steps", 1)
                     step = 1
                     while True:
-                        time.sleep(DECODE_S)
+                        time.sleep(decode_s)
                         results = [{"request_id": i["request_id"], "attempt": i["attempt"],
                                     "token_id": token_for(len(i["output_token_ids"]) + step - 1),
                                     "valid_tokens": i["target_valid_tokens"] - 1 + step} for i in prep["requests"]]
@@ -106,12 +107,14 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop):
                         finished = any(len(i["output_token_ids"]) + step >= i["max_new_tokens"]
                                        for i in prep["requests"])
                         decision = call("decode_step", rank, pid, command["batch_id"], step, results, finished)
-                        if finished or step >= steps or not decision["continue"]:
+                        while decision["continue"] == "PARK":
+                            decision = call("decode_resume", rank, pid, command["batch_id"], step, 100)
+                        if finished or step >= steps or decision["continue"] is not True:
                             break
                         step += 1
                     payload = {"reservation_id": prep["reservation_id"], "results": results,
                                "duration_ms": (time.monotonic() - start) * 1000,
-                               "gpu_forward_ms": DECODE_S * 1000 * step}
+                               "gpu_forward_ms": decode_s * 1000 * step}
                     if steps > 1:
                         payload["steps"] = step
                 report(command["batch_id"], "GPU_DONE", payload)
@@ -181,6 +184,9 @@ def main():
     parser.add_argument("--pool-blocks", type=int, default=4096, help="KV blocks per rank")
     parser.add_argument("--bench-models", default=",".join(MODELS), help="models the bench drives")
     parser.add_argument("--profile", help="write owner-side cProfile stats of RPC handlers here")
+    parser.add_argument("--park", action="store_true", help="config decode_run_park=true")
+    parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
+    parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
     from muxserve_sglang.controller import MuxController
     from muxserve_sglang.driver import ControllerDriver
@@ -194,7 +200,8 @@ def main():
                                         20100 + 10 * i, 20101 + 10 * i, 20102 + 10 * i)
                         for i, m in enumerate(MODELS))
     config = DeploymentConfig(deployments, tp_size=TP, kv_bytes_per_rank=args.pool_blocks * 8192,
-                              controller_port=port, decode_run_steps=args.run_steps)
+                              controller_port=port, decode_run_steps=args.run_steps,
+                              decode_run_park=args.park)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -232,8 +239,11 @@ def main():
     server_thread.start()
     context = multiprocessing.get_context("spawn")  # like the launcher; fork+threads can deadlock
     stop = context.Event()
+    per_model = lambda text, default: ([float(x) / 1000 for x in text.split(",")] if text
+                                       else [default] * len(MODELS))
+    timing = dict(zip(MODELS, zip(per_model(args.prefill_ms, PREFILL_S), per_model(args.decode_ms, DECODE_S))))
     processes = [context.Process(target=rank_main, args=(address, key, controller.group_id(m), m, stage, rank,
-                                                         0, stop), daemon=True)
+                                                         0, stop, timing[m]), daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()
@@ -304,8 +314,9 @@ def main():
                 if k != "poll_commands_wait"}
         print("OWNER_HANDLER_MS", busy)
     tpot = {m: round(s["mean_tpot_s"] * 1000, 2) for m, s in result["summary"]["models"].items()}
-    print("E2E_PASS run_steps=%d mean_tpot_ms=%s (simulated GPU %.1f ms) ttft_ms=%s" % (
-        args.run_steps, tpot, DECODE_S * 1000,
+    print("E2E_PASS run_steps=%d park=%s tok_s=%.2f mean_tpot_ms=%s (simulated decode ms %s) ttft_ms=%s" % (
+        args.run_steps, args.park, result["summary"]["overall"]["output_tokens_per_second"], tpot,
+        {m: round(t[1] * 1000, 1) for m, t in timing.items()},
         {m: round(s["mean_ttft_s"] * 1000, 1) for m, s in result["summary"]["models"].items()}))
 
 

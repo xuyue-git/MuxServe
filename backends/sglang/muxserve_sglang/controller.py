@@ -29,6 +29,8 @@ _REPORTS = frozenset(("READY", "GPU_DONE", "HANDOFF_READY", "QUIESCED", "ERROR")
 _COMMAND_WINDOW = 1024
 _REPORT_WINDOW = 4096
 _INT64_MAX = (1 << 63) - 1
+# A parked decode run ends normally if it could not resume within this.
+_PARK_LIMIT_S = 2.0
 
 
 class _RetiredIds:
@@ -128,7 +130,9 @@ class _Batch:
     run_start_output: dict[str, int] = field(default_factory=dict)
     run_published: dict[str, int] = field(default_factory=dict)
     run_reports: dict[int, dict[int, tuple]] = field(default_factory=dict)
-    run_decisions: dict[int, bool] = field(default_factory=dict)
+    run_decisions: dict[int, bool | str] = field(default_factory=dict)
+    # Set while a parked run (decision PARK) has released its credits.
+    parked_at: float | None = None
     run_applied: int = 0
     run_steps_done: int | None = None
     # PackedBlocks per request for this batch's reserved / committed views.
@@ -206,6 +210,8 @@ class MuxController:
         # Rank long-polls wait here (releasing the owner lock); the driver
         # thread waits on ``wake`` instead of a fixed sleep.
         self._cv = Condition(self.lock)
+        # Parked decode runs wait here for credits to come back.
+        self._park_cv = Condition(self.lock)
         self.wake = Event()
         if type(initializing) is not bool:
             raise IntegrationError("INVALID_ARGUMENT", "Initialization gate must be boolean")
@@ -264,8 +270,13 @@ class MuxController:
                  "broker_lookup", "broker_ack", "broker_poll", "broker_register_destination",
                  "broker_bootstrap", "begin_drain", "close_ready",
                  "forget_request", "metrics", "request_capacity",
-                 "poll_commands_wait", "decode_step")
+                 "poll_commands_wait", "decode_step", "decode_resume")
         return {"controller_" + name: getattr(self, name) for name in names}
+
+    def _release_credits(self, batch_id: str) -> None:
+        """Caller holds the lock. Parked decode runs re-check on every release."""
+        self.credits.release(batch_id)
+        self._park_cv.notify_all()
 
     def _notify(self, group: _Group | None = None) -> None:
         """Caller holds the lock. Wake the driver; with a group, wake its waiting ranks."""
@@ -853,7 +864,7 @@ class MuxController:
                     # before the optional store read used for recovery advice.
                     group.outbox.release(owner)
                     self._release_commands(group, owner)
-                    self.credits.release(plan.batch_id)
+                    self._release_credits(plan.batch_id)
                     if exc.code == "OUT_OF_CAPACITY":
                         try:
                             if not self._single_decode_fits(plan.model_id):
@@ -1041,7 +1052,7 @@ class MuxController:
             if group.broker[room]["batch_id"] == batch.plan.batch_id:
                 del group.broker[room]
         batch.status = "ABORTED"
-        self.credits.release(batch.plan.batch_id)
+        self._release_credits(batch.plan.batch_id)
         group.outbox.release(batch.holder)
         self._release_commands(group, batch.holder)
         for ref in batch.plan.requests:
@@ -1485,7 +1496,7 @@ class MuxController:
             # the KV handoff and quiesce that follow use none: release now and
             # let yielded decode runs resume instead of waiting for the whole
             # P/D protocol (release in _finish_batch then finds no lease).
-            self.credits.release(batch.plan.batch_id)
+            self._release_credits(batch.plan.batch_id)
             for entry in group.broker.values():
                 if entry["batch_id"] == batch.plan.batch_id:
                     request = self._request(group.model_id, entry["identity"].request_id)
@@ -1509,7 +1520,7 @@ class MuxController:
             # Same as P above: every D rank finished its forwards, so the
             # quiesce round trip uses no SMs. Releasing now lets a waiting
             # prefill (which needs all credits) start one round trip sooner.
-            self.credits.release(batch.plan.batch_id)
+            self._release_credits(batch.plan.batch_id)
             self._begin_quiesce(group, batch, group.required)
 
     def _finish_run_tokens(self, group: _Group, batch: _Batch) -> None:
@@ -1544,7 +1555,9 @@ class MuxController:
                 raise IntegrationError("INVALID_REPORT", "Invalid decode step report")
             entry = (tuple(deepcopy(dict(item)) if isinstance(item, dict) else item for item in results),
                      finished)
-            reported = batch.run_reports.setdefault(step, {})
+            # A rejected report must not create a step entry (GPU_DONE treats
+            # any entry after the last step as a protocol error).
+            reported = batch.run_reports.get(step, {})
             if rank in reported:
                 if reported[rank] != entry:
                     self._fence(group, batch, "decode_step_conflict")
@@ -1565,6 +1578,7 @@ class MuxController:
                 self._fence(group, batch, "cross_rank_token_conflict")
                 raise IntegrationError("IDENTITY_CONFLICT", "Greedy ranks disagree")
             reported[rank] = entry
+            batch.run_reports[step] = reported
             batch.progress_at = self.clock()
             applied = False
             if (len(reported) == len(group.ranks) and batch.run_applied == step - 1
@@ -1575,6 +1589,15 @@ class MuxController:
             if decision is None:
                 decision = self._run_continues(group, batch, step, finished)
                 batch.run_decisions[step] = decision
+            if (decision == "PARK" and len(reported) == len(group.ranks)
+                    and batch.parked_at is None):
+                # Every rank finished (and synchronized) forward ``step``: the
+                # run uses no SMs until it resumes, so its credits go to the
+                # waiting prefill. KV reservation and native state stay.
+                batch.parked_at = self.clock()
+                trace.ev("park", batch_id, m=group.model_id, step=step)
+                self._release_credits(batch_id)
+                self.wake.set()
             # A step report changes no command, liveness or broker epoch, so
             # the ranks' long polls need no wake-up (notify_all here woke every
             # waiting poll thread four times per token). Wake only the driver,
@@ -1582,6 +1605,62 @@ class MuxController:
             if applied or decision is False:
                 self.wake.set()
             return {"continue": decision}
+
+    def decode_resume(self, group_id: str, rank: int, pid: int, batch_id: str, step: int,
+                      wait_ms: int | float = 100) -> dict:
+        """Long-poll of a D rank whose run parked after ``step``.
+
+        Returns PARK (poll again), True (run step + 1) or False (end the run
+        exactly as an ordinary stop: GPU_DONE with ``step`` as the last step).
+        The outcome is decided once and replayed to every rank.
+        """
+        if type(wait_ms) not in (int, float) or not 0 <= wait_ms <= 1000:
+            raise IntegrationError("INVALID_ARGUMENT", "Resume wait must be 0..1000 ms")
+        deadline = time.monotonic() + wait_ms / 1000
+        with self.lock:
+            group = self._group(group_id)
+            target = group.registered.get(("D", rank))
+            if target is None or target.pid != pid or not target.alive:
+                raise IntegrationError("UNKNOWN_RANK", "Registered D rank/PID required")
+            batch = self._batch(group, batch_id)
+            if (batch.plan.stage != "D" or batch.plan.steps < 2 or type(step) is not int
+                    or rank not in batch.run_reports.get(step, {})
+                    or batch.run_decisions.get(step) not in ("PARK", True, False)):
+                raise IntegrationError("STALE_REPORT", "No parked decode step")
+            while True:
+                decision = batch.run_decisions[step]
+                if decision != "PARK":
+                    return {"continue": decision}
+                decision = self._park_outcome(group, batch, step)
+                if decision != "PARK":
+                    batch.run_decisions[step] = decision
+                    trace.ev("unpark", batch_id, m=group.model_id, step=step, go=decision)
+                    if decision is True:
+                        batch.progress_at = self.clock()
+                    batch.parked_at = None
+                    self._park_cv.notify_all()
+                    self.wake.set()
+                    return {"continue": decision}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"continue": "PARK"}
+                self._park_cv.wait(remaining)
+
+    def _park_outcome(self, group: _Group, batch: _Batch, step: int) -> bool | str:
+        """Caller holds the lock. Stop for any reason an ordinary run stops;
+        resume once no prefill holds or awaits credits and ours are free."""
+        if not self._run_continues(group, batch, step, False, park=False):
+            return False
+        if batch.parked_at is None:
+            return "PARK"  # Slower ranks have not finished this step yet.
+        if self.clock() - batch.parked_at >= _PARK_LIMIT_S:
+            return False  # Fall back to an ordinary yield (end, re-prepare later).
+        if self._prefill_pending():
+            return "PARK"
+        credits = self.config.model(batch.plan.model_id).decode_mps // 10
+        if not self.credits.acquire(batch.plan.batch_id, batch.plan.model_id, "D", credits):
+            return "PARK"
+        return True
 
     def _apply_run_step(self, group: _Group, batch: _Batch, step: int, results) -> None:
         batch.run_applied = step
@@ -1611,7 +1690,8 @@ class MuxController:
                 request.first_token_at = self.clock()
             request.finish_reason = finish
 
-    def _run_continues(self, group: _Group, batch: _Batch, step: int, finished: bool) -> bool:
+    def _run_continues(self, group: _Group, batch: _Batch, step: int, finished: bool,
+                       park: bool = True) -> bool | str:
         if (finished or step >= batch.plan.steps or batch.status != "RUNNING"
                 or group.fenced or group.draining or self.protected_failure is not None):
             return False
@@ -1625,13 +1705,28 @@ class MuxController:
         if protected is not None and {(group.model_id, ref.request_id)
                                       for ref in batch.plan.requests} != {protected}:
             return False
+        if not park:
+            return True
         # Source ADBS gives a waiting prefill priority: per-token grants stop
-        # new D batches until P can take its credits. A run yields the same way.
-        return not self._prefill_waiting_for_credits()
+        # new D batches until P can take its credits. A run yields the same
+        # way: it ends, or with decode_run_park it parks until P's forward ends.
+        if not self._prefill_waiting_for_credits():
+            return True
+        return "PARK" if self.config.decode_run_park else False
 
     def _prefill_waiting_for_credits(self) -> bool:
         if self.credits.can_allocate(10):
             return False
+        return self._prefill_eligible()
+
+    def _prefill_pending(self) -> bool:
+        """A prefill holds credits (before its forward finished) or could be
+        prepared now: parked runs stay parked, even while credits are free."""
+        if any(lease[0][1] == "P" for lease in self.credits.leases.values()):
+            return True
+        return self._prefill_eligible()
+
+    def _prefill_eligible(self) -> bool:
         for model in self.config.models:
             group = self.groups[model.model_id]
             if not group.ready or model.model_id in self.capacity_blocked:
@@ -1773,7 +1868,7 @@ class MuxController:
             for room in tuple(group.broker):
                 if group.broker[room]["batch_id"] == batch.plan.batch_id:
                     del group.broker[room]
-        self.credits.release(batch.plan.batch_id)
+        self._release_credits(batch.plan.batch_id)
         group.outbox.release(batch.holder)
         self._release_commands(group, batch.holder)
         for ref in batch.plan.requests:
