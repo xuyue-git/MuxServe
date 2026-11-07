@@ -1506,6 +1506,10 @@ class MuxController:
                 self._finish_run_tokens(group, batch)
             else:
                 self._apply_tokens(group, batch)
+            # Same as P above: every D rank finished its forwards, so the
+            # quiesce round trip uses no SMs. Releasing now lets a waiting
+            # prefill (which needs all credits) start one round trip sooner.
+            self.credits.release(batch.plan.batch_id)
             self._begin_quiesce(group, batch, group.required)
 
     def _finish_run_tokens(self, group: _Group, batch: _Batch) -> None:

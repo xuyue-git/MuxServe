@@ -1073,6 +1073,28 @@ def check_prefill_credits_release_at_gpu_done():
     assert not held() and f.controller.credits.leases == {}
 
 
+def check_decode_credits_release_at_gpu_done():
+    """D credits are released once every D rank reported GPU_DONE (before quiesce)."""
+    f = Fixture()
+    f.submit(max_new=3)
+    plan, batch = f.prepare()
+    f.ready_start(plan, batch)
+    f.stage_prefill(plan)
+    f.gpu(plan, batch, 4, 2)
+    f.handoff(plan)
+    f.batch_quiesce(plan, batch)
+    held = lambda: any(any(refs) for refs in f.controller.credits.refs.values())
+    d_plan, d_batch = f.prepare(stage="D", batch_id="d")
+    assert held()
+    f.ready_start(d_plan, d_batch)
+    f.gpu(d_plan, d_batch, 5, 3)
+    status = f.controller.snapshot()["groups"]["m"]["batches"][d_plan.batch_id]["status"]
+    assert status == "QUIESCE", status
+    assert not held() and f.controller.credits.can_allocate(10)
+    f.batch_quiesce(d_plan, d_batch)
+    assert f.controller.credits.leases == {}
+
+
 if __name__ == "__main__":
     check_first_token_and_replay()
     check_cancel_and_timeout()
@@ -1094,4 +1116,5 @@ if __name__ == "__main__":
     check_pool_wide_and_static_recovery_scope()
     check_independent_progress_watchdogs()
     check_prefill_credits_release_at_gpu_done()
+    check_decode_credits_release_at_gpu_done()
     print("controller CPU checks passed")
