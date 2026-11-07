@@ -3,7 +3,11 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 import time
+from muxserve.muxsched.resource import SMResource  # original MuxServe SM accounting
+from . import original_muxserve_path
 from .contracts import IntegrationError
+
+original_muxserve_path()  # this checkout's muxserve, not another installed copy
 
 
 @dataclass(frozen=True)
@@ -241,22 +245,41 @@ class ADBS:
 
 
 class CreditLedger:
-    """Ten abstract parts PER RANK. multiplier means source repeat threshold1/3."""
+    """Ten SM parts PER TP RANK, each rank one original MuxServe SMResource
+    (muxserve/muxsched/resource.py), which allocates and frees the parts.
+
+    This ledger adds only what the external grant protocol needs: one lease
+    per batch id (a repeated acquire with the same contents is a no-op, a
+    changed one a conflict), at most one lease per (model, stage), and the
+    all-or-nothing allocation across ranks. ``multiplier`` (1 or 3) is passed
+    to SMResource as its overload_threshold explicitly; SMResource's own
+    default (4) is never used. Like the original scheduler, every allocation
+    uses overload=True and an overloaded part is picked with random.choice.
+    """
     def __init__(self, multiplier=3, ranks=(0,)):
         if multiplier not in (1, 3) or not ranks or len(set(ranks)) != len(ranks):
             raise ValueError('Invalid software-credit profile')
         self.capacity, self.threshold = 10, multiplier
-        self.refs = {r: [0] * 10 for r in ranks}
-        self.free = {r: list(range(10)) for r in ranks}
-        self.unoverloaded = {r: list(range(10)) for r in ranks}
+        self.resources = {r: SMResource(overload_threshold=multiplier) for r in ranks}
+        if any(len(res._sm_parts) != self.capacity for res in self.resources.values()):
+            raise ValueError('Original SMResource no longer has ten parts per GPU')
         self.leases = {}
+        self._parts = {}  # batch id -> {rank: [SMPart, ...]} handed back to SMResource.free
+
+    @property
+    def refs(self):
+        """Per-rank reference count of each part (diagnostics and checks)."""
+        return {r: [res._sm_parts[i].ref_count for i in range(self.capacity)]
+                for r, res in self.resources.items()}
 
     @property
     def available(self):
-        return min(len(self.free[r]) + min(self.threshold, len(self.unoverloaded[r])) for r in self.refs)
+        return min(res.num_free_sms + min(res.overload_threshold, len(res.unoverloaded_sms))
+                   for res in self.resources.values())
 
     def can_allocate(self, credits):
-        return type(credits) is int and 0 < credits <= 10 and credits <= self.available
+        return (type(credits) is int and 0 < credits <= self.capacity
+                and all(res.can_allocate(credits, overload=True) for res in self.resources.values()))
 
     def acquire(self, batch_id, model_id, stage, credits):
         signature = (model_id, stage, credits)
@@ -266,25 +289,15 @@ class CreditLedger:
             return True
         if any(item[0][:2] == signature[:2] for item in self.leases.values()) or not self.can_allocate(credits):
             return False
-        acquired = {}
-        for rank in self.refs:
-            parts = []
-            for _ in range(credits):
-                part = self.free[rank].pop() if self.free[rank] else self.unoverloaded[rank].pop(0)
-                self.refs[rank][part] += 1
-                parts.append(part)
-            acquired[rank] = tuple(parts)
-        self.leases[batch_id] = (signature, acquired)
+        parts = {rank: res.allocate(credits, overload=True) for rank, res in self.resources.items()}
+        self._parts[batch_id] = parts
+        self.leases[batch_id] = (signature, {rank: tuple(part.id for part in items)
+                                             for rank, items in parts.items()})
         return True
 
     def release(self, batch_id):
         lease = self.leases.pop(batch_id, None)
         if lease is None:
             return
-        for rank, parts in lease[1].items():
-            for part in parts:
-                self.refs[rank][part] -= 1
-                if self.refs[rank][part] == 0:
-                    self.free[rank].append(part)
-                if self.refs[rank][part] <= 1 and part not in self.unoverloaded[rank]:
-                    self.unoverloaded[rank].append(part)
+        for rank, items in self._parts.pop(batch_id).items():
+            self.resources[rank].free(items)

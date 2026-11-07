@@ -12,7 +12,7 @@ CHECKS = (
     'shutdown_check', 'mps_exit_check', 'startup_smoke_check', 'startup_budget_check',
     'startup_regression_check', 'weight_owner_collectives_check', 'idle_cuda_cache_check',
     'revoked_ready_check', 'decode_run_check', 'kv_fraction_check', 'trace_check', 'decode_graph_check',
-    'fast_path_check',
+    'fast_path_check', 'original_reuse_check',
 )
 
 

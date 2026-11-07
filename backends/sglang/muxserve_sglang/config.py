@@ -167,18 +167,23 @@ class DeploymentConfig:
 
 
 def kv_bytes_from_fraction(fraction: float, total_memory_bytes: int) -> int:
-    """KV bytes per GPU exactly as original MuxServe FlexStore sizes its cache.
+    """KV bytes per GPU exactly as original MuxServe sizes its cache.
 
-    muxserve/flexstore/manager.py get_num_gpu_blocks(): available =
-    round(gpu_memory_utilization * total_memory) - 1; one block holds K and V
-    for one head of block_size=32 FP16 tokens at head_size=128; the block count
-    is rounded down to a multiple of 128. The result is a multiple of 16384
-    bytes, so it maps exactly onto this backend's 16-token (8192-byte) blocks.
+    The block count comes from the original code itself:
+    muxserve/muxsched/resource.py num_gpu_blocks() (the formula of
+    get_num_gpu_blocks(), identical in muxserve/flexstore/manager.py):
+    available = round(gpu_memory_utilization * total_memory) - 1, one block
+    holds K and V for one head of block_size=32 FP16 tokens at head_size=128
+    (MuxServeArgs defaults), rounded down to a multiple of 128 blocks. The
+    result is a multiple of 16384 bytes, so it maps exactly onto this
+    backend's 16-token (8192-byte) blocks.
     """
+    from muxserve.muxsched.resource import num_gpu_blocks
     head_size, block_size, element_size = 128, 32, 2
-    available = round(fraction * total_memory_bytes) - 1
+    x = 16 // element_size  # CacheResource.get_key_block_shape / get_value_block_shape
+    key_block_shape, value_block_shape = (head_size // x, block_size, x), (head_size, block_size)
+    blocks = int(num_gpu_blocks(fraction, total_memory_bytes, key_block_shape, value_block_shape))
     block_mem = element_size * (head_size * block_size + head_size * block_size)
-    blocks = (available // block_mem // 128) * 128
     return blocks * block_mem
 
 
