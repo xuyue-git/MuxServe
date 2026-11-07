@@ -1,2 +1,4 @@
 * text=auto eol=lf
 native/headwise/** -text -whitespace
+# The original fixed-workload bundle is kept byte-identical (CRLF), sha256 59b0ba91...
+benchmark/frozen-synthetic-512-128.json -text
