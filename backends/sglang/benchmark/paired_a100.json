@@ -1,0 +1,63 @@
+{
+  "tp_size": 4,
+  "kv_pool_mode": "shared",
+  "batch_history_limit": 4000000,
+  "kv_bytes_per_rank": 2147483648,
+  "extra_headroom_bytes_per_rank": 1073741824,
+  "max_model_inflight": 1,
+  "credit_multiplier": 3,
+  "runtime_dir": "",
+  "asset_lock_dir": "",
+  "controller_port": 18080,
+  "models": [
+    {
+      "model_id": "llama7b",
+      "model_path": "/path/to/models/huggyllama/llama-7b",
+      "revision": "4782ad278652c7c71b72204d462d6d01eaaf7549",
+      "tokenizer_path": "/path/to/models/huggyllama/llama-7b",
+      "tokenizer_revision": "4782ad278652c7c71b72204d462d6d01eaaf7549",
+      "num_layers": 32,
+      "num_heads": 32,
+      "hidden_size": 4096,
+      "decode_mps": 40,
+      "prefill_port": 18101,
+      "decode_port": 18201,
+      "bootstrap_port": 18301
+    },
+    {
+      "model_id": "llama13b",
+      "model_path": "/path/to/models/huggyllama/llama-13b",
+      "revision": "bf57045473f207bb1de1ed035ace226f4d9f9bba",
+      "tokenizer_path": "/path/to/models/huggyllama/llama-13b",
+      "tokenizer_revision": "bf57045473f207bb1de1ed035ace226f4d9f9bba",
+      "num_layers": 40,
+      "num_heads": 40,
+      "hidden_size": 5120,
+      "decode_mps": 40,
+      "prefill_port": 18102,
+      "decode_port": 18202,
+      "bootstrap_port": 18302
+    },
+    {
+      "model_id": "llama30b",
+      "model_path": "/path/to/models/huggyllama/llama-30b",
+      "revision": "2b1edcdb3c7ced7bce6c1aa75c94545777c3118b",
+      "tokenizer_path": "/path/to/models/huggyllama/llama-30b",
+      "tokenizer_revision": "2b1edcdb3c7ced7bce6c1aa75c94545777c3118b",
+      "num_layers": 60,
+      "num_heads": 52,
+      "hidden_size": 6656,
+      "decode_mps": 40,
+      "prefill_port": 18103,
+      "decode_port": 18203,
+      "bootstrap_port": 18303
+    }
+  ],
+  "decode_cuda_graph": true,
+  "decode_run_park": true,
+  "prefill_cuda_graph": true,
+  "inline_start": true,
+  "decode_skip_prefill_ranks": true,
+  "prefill_early_token": true,
+  "decode_run_steps": 128
+}

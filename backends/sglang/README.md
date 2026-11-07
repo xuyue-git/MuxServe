@@ -61,6 +61,12 @@ python -I -B tools/check_cpu.py
 These checks exercise CPU storage, control, transport and source contracts.
 They do not load model weights or validate CUDA execution/performance.
 
+## Evaluation
+
+[`benchmark/`](benchmark/README.md) holds the paired fixed-workload point used
+against original MuxServe: the frozen 512/128 workload, its deployment config,
+the commands to run it and `compare_results.py` to compare the results.
+
 ## Decode runs and control-plane performance
 
 `decode_run_steps` (default 1 = original per-token grants; the sample config

@@ -143,3 +143,5 @@ accounting (`muxserve/muxsched/resource.py` `SMResource`) and KV block sizing
 (`num_gpu_blocks`). The original MuxServe/vLLM code and history are preserved.
 See the [migration and original-code comparison](backends/sglang/MIGRATION.md)
 for what is reused, what is reimplemented, and validation limits.
+The paired evaluation against original MuxServe is in
+[`backends/sglang/benchmark`](backends/sglang/benchmark/README.md).
