@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+from itertools import islice
 import pickle
 from threading import RLock
 from typing import Any, Sequence
@@ -230,9 +231,11 @@ class HeadwiseStore:
                     model_id = allocation.identity.model_id
                     source = (self._model_free[model_id][rank] if self._pool_mode == "static"
                               else self._free[rank])
-                    # Same assignment as taking ascending free blocks one by
-                    # one: each (layer, head) receives the next ``groups``.
-                    chosen = sorted(source)[:groups * sum(len(heads) for heads in layers)]
+                    # Take any ``needed`` free blocks in O(needed): iterating
+                    # the set yields them in its (deterministic) slot order, so
+                    # no O(pool) sort of every free block per rank.
+                    needed = groups * sum(len(heads) for heads in layers)
+                    chosen = list(islice(source, needed))
                     offset = 0
                     for heads in layers:
                         for blocks in heads:

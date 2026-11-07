@@ -578,12 +578,44 @@ def cuda_ipc_checks(ordinals):
     print("Real CUDA IPC sharing and producer lifetime checks passed")
 
 
+def allocation_cost_checks():
+    """Reserving new blocks must not sort every free block per rank."""
+    import muxserve_sglang.storage as storage_module
+    store = HeadwiseStore({r: 129408 for r in range(4)}, model_ids=("m",))
+    store.register_model(ModelLayout("m", 60, 13, (0, 1, 2, 3)))
+    identity = RequestIdentity("m", "r")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("reserve_kv sorted the free pool")
+
+    storage_module.sorted = forbidden
+    try:
+        first = store.reserve_kv("p", [KVTarget(identity, 512)], "h")
+    finally:
+        del storage_module.sorted
+    aid = first.views[0].allocation_id
+    store.start_kv_batch(first.reservation_id)
+    store.finish_kv_batch(first.reservation_id, "SUCCESS", {aid: 512}, (0, 1, 2, 3))
+    storage_module.sorted = forbidden
+    try:
+        store.reserve_kv("d", [KVTarget(identity, 640, aid)], "h2")
+    finally:
+        del storage_module.sorted
+    tables = store._allocations[aid].tables
+    for rank in range(4):
+        flat = [b for heads in tables[rank] for blocks in heads for b in blocks]
+        assert len(flat) == 60 * 13 * 40 and len(set(flat)) == len(flat)
+        assert not set(flat) & store._free[rank]
+    store.assert_integrity()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cuda-ipc", action="store_true")
     parser.add_argument("--gpu-ordinals", default="0")
     args = parser.parse_args()
     allocator_checks()
+    allocation_cost_checks()
     batch_history_budget_checks()
     static_pool_partition_checks()
     reconciliation_checks()
