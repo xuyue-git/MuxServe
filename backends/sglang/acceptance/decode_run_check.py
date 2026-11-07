@@ -257,6 +257,25 @@ class DecodeRunChecks(unittest.TestCase):
         self.assertEqual(totals["output_tokens"], 5)
         self.assertEqual(totals["batches"], 2)
 
+    def test_step_reports_wake_only_the_driver_once_per_published_step(self):
+        sim = Sim(run_steps=4)
+        sim.submit("a", "r", max_new=8)
+        sim.prefill("a", "r", 11)
+        plan, _ = sim.prepare_decode("a", "r", 4)
+        notified = []
+        original = sim.controller._cv.notify_all
+        sim.controller._cv.notify_all = lambda: notified.append(1) or original()
+        try:
+            sim.controller.wake.clear()
+            self.assertTrue(sim.step("a", plan, 0, 1, 12)["continue"])
+            self.assertFalse(sim.controller.wake.is_set())  # step not yet published
+            self.assertTrue(sim.step("a", plan, 1, 1, 12)["continue"])
+            self.assertTrue(sim.controller.wake.is_set())   # published: driver drains the token
+            self.assertEqual(notified, [])                  # rank long polls were not woken
+        finally:
+            sim.controller._cv.notify_all = original
+        self.assertEqual(sim.tokens("a")[-1:], [12])
+
     def test_run_yields_to_waiting_prefill_at_a_step_boundary(self):
         sim = Sim(("a", "b"), run_steps=8)
         sim.submit("a", "r", max_new=10)

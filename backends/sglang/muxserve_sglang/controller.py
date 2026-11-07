@@ -1562,14 +1562,21 @@ class MuxController:
                 raise IntegrationError("IDENTITY_CONFLICT", "Greedy ranks disagree")
             reported[rank] = entry
             batch.progress_at = self.clock()
+            applied = False
             if (len(reported) == len(group.ranks) and batch.run_applied == step - 1
                     and batch.status == "RUNNING"):
                 self._apply_run_step(group, batch, step, entry[0])
+                applied = True
             decision = batch.run_decisions.get(step)
             if decision is None:
                 decision = self._run_continues(group, batch, step, finished)
                 batch.run_decisions[step] = decision
-            self._notify()
+            # A step report changes no command, liveness or broker epoch, so
+            # the ranks' long polls need no wake-up (notify_all here woke every
+            # waiting poll thread four times per token). Wake only the driver,
+            # once per published step or when the run stops.
+            if applied or decision is False:
+                self.wake.set()
             return {"continue": decision}
 
     def _apply_run_step(self, group: _Group, batch: _Batch, step: int, results) -> None:
