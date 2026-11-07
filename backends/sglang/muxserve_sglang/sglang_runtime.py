@@ -526,6 +526,11 @@ class ControlledScheduler:
         start = time.monotonic()
         previous_output_counts = [len(req.output_ids) for req in state.reqs]
         self.s.cur_batch_for_debug = state.batch
+        # Opt-in diagnosis: on P ranks one profiled "step" is one prefill
+        # forward (run_batch/forward .. result handling .. sync).
+        profiler = getattr(self, "step_profiler", None) if self.ctx.stage == "P" else None
+        if profiler is not None:
+            profiler.before()
         if state.command["purpose"] == "REBUILD":
             # EXTEND executes the historical prefix but never enters sampling
             # or native prefill result handling that would append a new token.
@@ -555,6 +560,8 @@ class ControlledScheduler:
                 for req in state.reqs:
                     self._validate_finish(req)
         self.sync()
+        if profiler is not None:
+            profiler.after()
         self.s.cur_batch_for_debug = None
         require(self.runner._muxserve_permit["consumed"], "Granted native forward was not consumed")
         permit = self.runner._muxserve_permit

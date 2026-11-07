@@ -194,5 +194,25 @@ class TraceChecks(unittest.TestCase):
                 os.environ.pop(key, None)
 
 
+    def test_step_profiler_selects_prefill_ranks_and_hooks_single_forward(self):
+        from muxserve_sglang import step_profile
+        saved = step_profile._DIR
+        try:
+            step_profile._DIR = "/nonexistent-profile-dir"
+            os.environ.update(MXS_PROFILE_AT="3,12", MXS_PROFILE_STEPS="4", MXS_PROFILE_RANKS="P0")
+            self.assertTrue(step_profile.StepProfiler("m", "P", 0).enabled)
+            self.assertFalse(step_profile.StepProfiler("m", "D", 0).enabled)
+            self.assertEqual(step_profile.StepProfiler("m", "P", 0).at, [3, 12])
+        finally:
+            step_profile._DIR = saved
+            for key in ("MXS_PROFILE_AT", "MXS_PROFILE_STEPS", "MXS_PROFILE_RANKS"):
+                os.environ.pop(key, None)
+        source = open(os.path.join(ROOT, "muxserve_sglang", "sglang_runtime.py"), encoding="utf-8").read()
+        start = source[source.index("    def _start(self, command):"):source.index("    def _start_run(self, command, state):")]
+        self.assertIn('if self.ctx.stage == "P" else None', start)
+        self.assertLess(start.index("profiler.before()"), start.index('if state.command["purpose"] == "REBUILD":'))
+        self.assertLess(start.index("self.sync()\n        if profiler is not None:\n            profiler.after()"),
+                        start.index("gpu_forward_ms = permit"))
+
 if __name__ == "__main__":
     unittest.main()

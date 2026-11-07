@@ -3,7 +3,10 @@
 Enabled with ``MXS_PROFILE_DIR``. Selected ranks (``MXS_PROFILE_RANKS``,
 default ``D0``) profile ``MXS_PROFILE_STEPS`` (default 10) consecutive decode
 steps starting at each count in ``MXS_PROFILE_AT`` (default ``300,1600``) of
-that rank's executed decode-run steps, and write a text/JSON summary:
+that rank's executed decode-run steps, and write a text/JSON summary. On a
+P rank (e.g. ``MXS_PROFILE_RANKS=P0``) one step is one prefill forward
+(START .. sync), counted from that rank's first prefill, so use small
+``MXS_PROFILE_AT`` values (e.g. ``3,12``):
 
 * forward wall per step, measured both just before the window (no profiler)
   and inside it, around ``run_batch`` + ``process_batch_result`` + sync;
@@ -85,7 +88,8 @@ class StepProfiler:
         self.baseline = []
         self.started = None
 
-    # Called around each decode-run forward (run_batch .. sync).
+    # Called around each decode-run forward (run_batch .. sync), or around
+    # each prefill forward on P ranks.
     def before(self) -> None:
         if not self.enabled:
             return

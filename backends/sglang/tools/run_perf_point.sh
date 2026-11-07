@@ -15,7 +15,8 @@
 # same deployment, afterwards run each model alone: SOLO_REQUESTS, default 8),
 # DECODE_GRAPH=1 (D-stage decode CUDA graphs: config decode_cuda_graph=true),
 # PROFILE=1 (torch.profiler on each model's D rank 0 for 10 decode steps at
-# its 300th and 1600th run step; summaries in OUT_DIR/profile; diagnosis only). The launcher is always stopped with SIGINT
+# its 300th and 1600th run step; summaries in OUT_DIR/profile; diagnosis only;
+# MXS_PROFILE_RANKS=P0 MXS_PROFILE_AT=3,12 MXS_PROFILE_STEPS=4 profiles prefills). The launcher is always stopped with SIGINT
 # (normal drain); the script waits for it to exit.
 set -euo pipefail
 RUNTIME="$(cd "$(dirname "$0")/.." && pwd)"
