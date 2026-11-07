@@ -18,7 +18,7 @@ from .config import DeploymentConfig
 from .contracts import (BatchPlan, IntegrationError, KVTarget, PackedBlocks, RequestIdentity,
                         RequestRef, RequestSpec, ResumeRecord, pack_tables)
 from .events import RuntimeOutbox
-from .ipc import CommandSnapshot, copy_message
+from .ipc import CommandSnapshot
 from . import trace
 from .policy import (ADBS, BatchFeedback, BatchSuggestion, CreditLedger, ModelDemand,
                      PolicySnapshot)

@@ -21,10 +21,17 @@ See [the original-to-backend mapping](MIGRATION.md) and [source notices](NOTICE)
 ## Build and launch
 
 Run backend commands from this directory. Keep its environment separate from
-the legacy root project. `muxserve_sglang` appends the repository root to the
-import path and imports only vLLM-free original modules, so the root package
-needs no installation, but the backend must stay inside this checkout. The prototype targets Linux, Python 3.10, four reserved
+the legacy root project. The prototype targets Linux, Python 3.10, four reserved
 A100 40 GB GPUs, CUDA 13.2 and the package pins in `requirements.txt`.
+
+`muxserve_sglang` imports original MuxServe modules (`muxserve.muxsched.resource`)
+from this repository: on import it appends the repository root, three levels
+above `muxserve_sglang/`, to the import path, so the root package needs no
+installation. Run the backend from this checkout, or install it in editable
+mode (`pip install -e .`); a regular `pip install .` copies the package away
+from the repository and the first import of the policy then fails with
+`ImportError: muxserve_sglang needs this repository's muxserve package ...`
+(also when a different `muxserve` copy is installed).
 
 1. Materialize SGLang with `python tools/bootstrap_source.py`. For offline use,
    pass `--archive /path/to/sglang-v0.5.20-source.tar.gz`; size and SHA256 are checked.
@@ -51,12 +58,16 @@ without updating those checks. The materialized upstream tree is ignored by Git.
 
 ## CPU checks
 
-With Linux Python 3.12 (WSL works), install `pyzmq` for the native-channel check,
-materialize the pinned source as above, and run:
+With Linux Python 3.10 or newer (WSL works), install `numpy` and `pyzmq`
+(native-channel check), materialize the pinned source as above, and run:
 
 ```bash
 python -I -B tools/check_cpu.py
 ```
+
+Without the materialized source, the three checks that read it are reported
+as `CPU_CHECK_SKIPPED` and the suite ends with `CPU_SUITE_PASS_WITH_SKIPS`;
+`--require-source` turns a missing source into an error.
 
 These checks exercise CPU storage, control, transport and source contracts.
 They do not load model weights or validate CUDA execution/performance.

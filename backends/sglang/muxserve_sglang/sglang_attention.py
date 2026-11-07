@@ -10,7 +10,6 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 
 from . import ops
-from .contracts import IntegrationError
 from .sglang_memory import GRAPH_MAX_CONTEXT, HeadwiseTokenToKVPool, _require
 
 try:  # SGLang breakable (segmented) prefill CUDA graphs run attention eagerly.

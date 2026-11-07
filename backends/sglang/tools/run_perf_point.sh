@@ -54,7 +54,9 @@ WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
-"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" <<'PYEOF'
+"$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
+    "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early) = sys.argv[1:]
@@ -138,7 +140,8 @@ trap stop_launcher EXIT
 "$PY" "$RUNTIME/tools/bench_fixed.py" --port 18080 --requests "$REQUESTS" --warmup "$WARMUP" \
     --ready-timeout 7200 --supervisor-pid "$SUPERVISOR" --out "$OUT/bench.json" \
     ${PHASE_ARGS[@]+"${PHASE_ARGS[@]}"} ${TRACE:+--phase-name concurrent} \
-    ${REFERENCE:+--reference "$REFERENCE"} ${FROZEN_BUNDLE:+--frozen-bundle "$FROZEN_BUNDLE"}     ${WARMUP_TOTAL:+--warmup-total "$WARMUP_TOTAL"} 2>&1 | tee "$OUT/bench.log"
+    ${REFERENCE:+--reference "$REFERENCE"} ${FROZEN_BUNDLE:+--frozen-bundle "$FROZEN_BUNDLE"} \
+    ${WARMUP_TOTAL:+--warmup-total "$WARMUP_TOTAL"} 2>&1 | tee "$OUT/bench.log"
 echo "RESULT $OUT/bench.json"
 
 if [ -n "$SOLO" ]; then

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 import os
-from pathlib import Path
 
 from .config import load_config, safe_path, visible_devices
 from .contracts import IntegrationError

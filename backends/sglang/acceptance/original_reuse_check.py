@@ -150,6 +150,31 @@ class Imports(unittest.TestCase):
         """)
         self.assertIn("LAZY_OK", out)
 
+    def test_a_copy_outside_the_repository_fails_clearly(self):
+        # A regular (non-editable) install copies the package away from the
+        # repository; the policy import must say why instead of a bare
+        # "No module named 'muxserve'".
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "site" / "lib" / "pkgs"
+            shutil.copytree(ROOT / "muxserve_sglang", target / "muxserve_sglang",
+                            ignore=shutil.ignore_patterns("__pycache__", "*.so"))
+            code = textwrap.dedent(f"""
+                import sys
+                sys.path.insert(0, {str(target)!r})
+                try:
+                    import muxserve_sglang.policy
+                except ImportError as exc:
+                    assert "needs this repository's muxserve package" in str(exc), exc
+                    print('CLEAR_ERROR_OK')
+                else:
+                    raise AssertionError('imported without the original package')
+            """)
+            result = subprocess.run([sys.executable, "-I", "-B", "-c", code], capture_output=True,
+                                    text=True, timeout=120, cwd=directory)
+        self.assertIn("CLEAR_ERROR_OK", result.stdout, result.stdout + result.stderr)
+
     def test_jobconfig_default_dtype_is_still_float16(self):
         out = run_isolated("""
             import types

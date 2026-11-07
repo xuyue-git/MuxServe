@@ -127,6 +127,21 @@ class TraceChecks(unittest.TestCase):
                         ("all_ready", 20), ("start_called", 30), ("start_delivered", 10),
                         ("first_forward_done", 30), ("first_step", 10), ("total", 180)):
             self.assertAlmostEqual(t[key]["p50"], ms, places=1, msg=key)
+        self.assertEqual(m["ttft_first_token_after"], {"handoff_all": 1})
+        # prefill_early_token: the token reaches the gateway after the P commit,
+        # before the D handoff; the breakdown then splits at GPU_DONE.
+        early = [dict(e, t=0.185) if e["ev"] == "gw_first_token" else
+                 dict(e, t=0.188) if e["ev"] == "gw_first_sse" else e for e in events]
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "trace-1.jsonl"), "w") as handle:
+                handle.write("\n".join(json.dumps(e) for e in early) + "\n")
+            m = trace_report.report(directory, gap_ms=150)["phases"]["all"]["m"]
+        tt = m["ttft_breakdown_ms"]
+        self.assertEqual(m["ttft_first_token_after"], {"gpu_all": 1})
+        self.assertNotIn("p_handoff_all", tt)
+        for key, ms in (("p_prepare_call", 10), ("p_gpu_all", 170), ("gw_first_token", 5),
+                        ("gw_first_sse", 3), ("total_recv_to_first_sse", 193)):
+            self.assertAlmostEqual(tt[key]["p50"], ms, places=1, msg=key)
 
     def test_step_profiler_is_inert_without_dir_and_counts_windows(self):
         from muxserve_sglang import step_profile

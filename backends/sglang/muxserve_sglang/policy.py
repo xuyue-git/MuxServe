@@ -3,9 +3,17 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 import time
-from muxserve.muxsched.resource import SMResource  # original MuxServe SM accounting
-from . import original_muxserve_path
+from . import REPOSITORY_ROOT, original_muxserve_path
 from .contracts import IntegrationError
+
+try:
+    from muxserve.muxsched.resource import SMResource  # original MuxServe SM accounting
+except ModuleNotFoundError as exc:
+    if exc.name not in ("muxserve", "muxserve.muxsched", "muxserve.muxsched.resource"):
+        raise
+    raise ImportError(f"muxserve_sglang needs this repository's muxserve package "
+                      f"({REPOSITORY_ROOT / 'muxserve'}); run the backend from its checkout "
+                      "or install it in editable mode") from exc
 
 original_muxserve_path()  # this checkout's muxserve, not another installed copy
 

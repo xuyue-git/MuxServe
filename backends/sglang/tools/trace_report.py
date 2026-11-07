@@ -347,19 +347,27 @@ def report(directory, phases_path=None, gap_ms=150.0, ranks=4):
                     if vals:
                         handlers[label].append(max(vals))
             ttft = defaultdict(list)
+            first_token_after = defaultdict(int)
             for b in by_model[model]["P"]:
                 for req in b.info.get("reqs", []):
                     g = gateway.get((model, req), {})
                     sub = submits.get((model, req))
+                    # prefill_early_token publishes at the all-rank GPU_DONE
+                    # commit; otherwise the token follows the D handoff.
+                    handoff, first = b.ctl.get("handoff_all"), g.get("gw_first_token")
+                    early = handoff is not None and first is not None and first < handoff
+                    commit = ("p_gpu_all", b.ctl.get("gpu_all")) if early else ("p_handoff_all", handoff)
+                    first_token_after["gpu_all" if early else "handoff_all"] += 1
                     points = [("gw_recv", g.get("gw_recv")), ("submit", sub),
-                              ("p_prepare_call", b.prep_call), ("p_handoff_all", b.ctl.get("handoff_all")),
-                              ("gw_first_token", g.get("gw_first_token")), ("gw_first_sse", g.get("gw_first_sse"))]
+                              ("p_prepare_call", b.prep_call), commit,
+                              ("gw_first_token", first), ("gw_first_sse", g.get("gw_first_sse"))]
                     for (_, a), (label, z) in zip(points, points[1:]):
                         if a is not None and z is not None:
                             ttft[label].append((z - a) * 1000)
                     if g.get("gw_recv") is not None and g.get("gw_first_sse") is not None:
                         ttft["total_recv_to_first_sse"].append((g["gw_first_sse"] - g["gw_recv"]) * 1000)
             entry["ttft_breakdown_ms"] = {k: summary(v) for k, v in ttft.items()}
+            entry["ttft_first_token_after"] = dict(first_token_after)
             entry["P_batches"] = len(by_model[model]["P"])
             entry["P_segments_ms"] = {k: summary(v) for k, v in seg.items()}
             entry["P_last_ready_stage"] = dict(last_ready)
@@ -455,9 +463,11 @@ def render(result):
             lines.append(f"\n--- {model}: P batches={e['P_batches']} D batches={e['D_batches']}")
             lines.append(f"  submit->prepare_batch (driver queue) ms: {e['P_submit_to_prepare_ms']}")
             if e.get("ttft_breakdown_ms"):
-                lines.append("  TTFT breakdown inside the server (p50 / p90 / mean ms):")
+                lines.append("  TTFT breakdown inside the server (p50 / p90 / mean ms); first token published after "
+                             f"{e.get('ttft_first_token_after')}:")
                 for key, label in (("submit", "HTTP received -> controller submit_request entered"),
                                    ("p_prepare_call", "-> driver called prepare_batch for the P batch"),
+                                   ("p_gpu_all", "-> every P rank GPU_DONE (token committed and published early)"),
                                    ("p_handoff_all", "-> P handoff done (first token confirmed at owner)"),
                                    ("gw_first_token", "-> gateway applied first TOKEN event (driver poll)"),
                                    ("gw_first_sse", "-> first SSE chunk written to the client"),
