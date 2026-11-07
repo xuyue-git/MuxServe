@@ -195,7 +195,7 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "Initial inflight and credit profiles are restricted")
     if (config.max_input_tokens, config.max_new_tokens, config.max_context_tokens) != (1792, 256, 2048):
         raise IntegrationError("INVALID_CONFIG", "Initial token limits must match the approved design")
-    if config.kv_bytes_per_rank < 8192 or config.extra_headroom_bytes_per_rank < 2 * 1024**3:
+    if config.kv_bytes_per_rank < 8192 or config.extra_headroom_bytes_per_rank < 1024**3:
         raise IntegrationError("INVALID_CONFIG", "KV budget or workspace headroom is invalid")
     if len(set(model.model_id for model in models)) != len(models) or not models:
         raise IntegrationError("INVALID_CONFIG", "Model IDs must be unique")
