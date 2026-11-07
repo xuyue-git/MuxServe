@@ -87,6 +87,7 @@ def build(events):
     gid_model = {}
     submits = {}
     rpcs = defaultdict(list)
+    failures = []
 
     def get(batch_id):
         if batch_id not in batches:
@@ -97,6 +98,9 @@ def build(events):
         name, t, b = e["ev"], e["t"], e.get("batch")
         if name == "rpc":
             rpcs[(e.get("role") or "owner/driver", e.get("m"))].append(e.get("ms", 0.0))
+            continue
+        if name == "prep_fail":
+            failures.append((t, e.get("m"), e.get("s"), e.get("code")))
             continue
         if name == "submit":
             submits.setdefault((e.get("m"), e.get("req")), t)
@@ -127,7 +131,7 @@ def build(events):
             batch.dstep[e.get("step")].setdefault(e.get("r"), t)
         else:
             batch.rank[name].setdefault(e.get("role"), t)
-    return batches, gid_model, submits, rpcs
+    return batches, gid_model, submits, rpcs, failures
 
 
 def handler_ms(batch, kind, stage_letter):
@@ -223,6 +227,45 @@ def d_timeline(batch, ranks):
     return m
 
 
+TRANSITION = (
+    ("prev_finished", "last token of previous batch -> previous batch quiesced/released"),
+    ("driver_prepare_call", "-> driver called prepare_batch for the next D batch"),
+    ("prepare_batch", "-> prepare_batch returned (reserve + 8 PREPARE commands)"),
+    ("all_ready", "-> last READY reached owner"),
+    ("start_called", "-> driver called start_batch"),
+    ("start_delivered", "-> last D rank received START"),
+    ("first_forward_done", "-> last D rank finished step-1 forward (run_batch..sync)"),
+    ("first_step", "-> owner had step 1 from every D rank"),
+)
+
+
+def transition(prev, nxt, ranks):
+    """Timeline from prev's last token to nxt's first step (same model)."""
+    if prev.info["s"] == "P":
+        last_token = prev.ctl.get("handoff_all")
+    else:
+        steps = step_done(prev, ranks)
+        last_token = steps[max(steps)] if steps else None
+    if last_token is None or nxt.prep is None:
+        return None
+    first = step_done(nxt, ranks).get(1)
+    fwd = [t for role, t in nxt.rank.get("step_fwd", {}).items() if role and "-D" in role]
+    timeline = {"prepare": last_token,
+                "prev_finished": prev.ctl.get("finish"),
+                "driver_prepare_call": nxt.prep_call,
+                "prepare_batch": nxt.prep,
+                "all_ready": last(list(nxt.rpt.get(("READY", "P"), {}).values()) +
+                                  list(nxt.rpt.get(("READY", "D"), {}).values())),
+                "start_called": nxt.ctl.get("start"),
+                "start_delivered": last(nxt.dlv.get(("START", "D"), {}).values()),
+                "first_forward_done": last(fwd) if len(fwd) >= ranks else None,
+                "first_step": first}
+    out = segments(timeline, TRANSITION)
+    if first is not None:
+        out["total"] = (first - last_token) * 1000
+    return out
+
+
 def segments(timeline, milestones):
     out = {}
     previous = timeline.get("prepare")
@@ -249,7 +292,7 @@ def overlaps(a0, a1, b0, b1):
 def report(directory, phases_path=None, gap_ms=150.0, ranks=4):
     events = load(directory)
     phases = load_phases(phases_path)
-    batches, gid_model, submits, rpcs = build(events)
+    batches, gid_model, submits, rpcs, failures = build(events)
     result = {"events": len(events), "phases": {}}
     phase_names = [p[0] for p in phases] or ["all"]
     for phase in phase_names:
@@ -312,6 +355,27 @@ def report(directory, phases_path=None, gap_ms=150.0, ranks=4):
             entry["D_batches"] = len(by_model[model]["D"])
             entry["D_segments_ms"] = {k: summary(v) for k, v in dseg.items()}
             entry["D_in_run_step_ms"] = summary(step_ms)
+            # ---- transitions into each D batch (closed loop, same model)
+            ordered = sorted((b for b in by_model[model]["P"] + by_model[model]["D"]), key=lambda b: b.prep)
+            trans = {"after_prefill": defaultdict(list), "between_runs": defaultdict(list)}
+            fail_counts = {"after_prefill": defaultdict(int), "between_runs": defaultdict(int)}
+            for prev, nxt in zip(ordered, ordered[1:]):
+                if nxt.info["s"] != "D":
+                    continue
+                result_t = transition(prev, nxt, ranks)
+                if result_t is None:
+                    continue
+                kind = "after_prefill" if prev.info["s"] == "P" else "between_runs"
+                for key, value in result_t.items():
+                    trans[kind][key].append(value)
+                window_start = prev.ctl.get("finish") or prev.prep
+                window_end = nxt.prep_call or nxt.prep
+                for t, fm, fs, code in failures:
+                    if fm == model and fs == "D" and window_start <= t <= window_end:
+                        fail_counts[kind][code] += 1
+            entry["transitions_ms"] = {kind: {k: summary(v) for k, v in seg_map.items()}
+                                       for kind, seg_map in trans.items()}
+            entry["transition_prepare_failures"] = {k: dict(v) for k, v in fail_counts.items()}
             # ---- token gaps (closed loop: one request in flight per model)
             tokens = []
             for b in by_model[model]["P"]:
@@ -382,6 +446,16 @@ def render(result):
                 if s:
                     lines.append(f"    {key:<36}{s['p50']:>9}{s['p90']:>9}{s['mean']:>9}   {label}")
             lines.append(f"  in-run step interval ms: {e['D_in_run_step_ms']}")
+            for kind, seg_map in e.get("transitions_ms", {}).items():
+                if not seg_map:
+                    continue
+                lines.append(f"  transition {kind} (last token -> next D first step; p50 / p90 / mean ms):")
+                for key, label in TRANSITION + (("total", "TOTAL"),):
+                    s = seg_map.get(key)
+                    if s:
+                        lines.append(f"    {key:<36}{s['p50']:>9}{s['p90']:>9}{s['mean']:>9}   {label}")
+                lines.append(f"    D prepare_batch refusals in these windows: "
+                             f"{e.get('transition_prepare_failures', {}).get(kind, {})}")
             lines.append(f"  decode time by gap kind: {e['decode_time_by_gap_kind_ms']}")
             g = e["big_gaps"]
             lines.append(f"  gaps >= {g['threshold_ms']} ms: count={g['count']} total={g['total_ms']} ms "

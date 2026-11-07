@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from .contracts import BatchPlan, IntegrationError, RequestRef
 from .events import EventReceiver
+from . import trace
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +38,15 @@ class ControllerDriver:
         wake = getattr(self.controller, "wake", None)
         try:
             while not self.stop_event.is_set():
+                if wake is not None:
+                    # Clear before stepping: activity during step() keeps the
+                    # flag set, so the wait below returns at once (no lost wake).
+                    wake.clear()
                 self.step()
                 if wake is None:
                     self.stop_event.wait(0.005)
                 else:
                     wake.wait(0.02)
-                    wake.clear()
         except Exception as exc:
             # No cleanup/rollback proof follows an unknown driver failure.
             self.failure = exc
@@ -114,6 +118,7 @@ class ControllerDriver:
                 self.pending.add((proposal.model_id, plan.batch_id))
                 return
             except IntegrationError as exc:
+                trace.ev("prep_fail", None, m=proposal.model_id, s=proposal.stage, code=exc.code)
                 if exc.code == "OUT_OF_CAPACITY" and steps is not None and steps > 1:
                     # A shorter run needs less reserved KV; fall back to one step
                     # before shrinking the request set.

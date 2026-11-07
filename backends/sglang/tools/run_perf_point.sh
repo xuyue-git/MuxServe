@@ -12,7 +12,9 @@
 # config, minimum 1024; lowering it is a deviation from the approved design),
 # TRACE=1 (record a timing trace into OUT_DIR/trace and write
 # OUT_DIR/trace-report.txt after stopping; recording only), SOLO=1 (with the
-# same deployment, afterwards run each model alone: SOLO_REQUESTS, default 8). The launcher is always stopped with SIGINT
+# same deployment, afterwards run each model alone: SOLO_REQUESTS, default 8),
+# PROFILE=1 (torch.profiler on each model's D rank 0 for 10 decode steps at
+# its 300th and 1600th run step; summaries in OUT_DIR/profile; diagnosis only). The launcher is always stopped with SIGINT
 # (normal drain); the script waits for it to exit.
 set -euo pipefail
 RUNTIME="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,6 +30,7 @@ HEADROOM_MIB="${HEADROOM_MIB:-}"
 TRACE="${TRACE:-}"
 SOLO="${SOLO:-}"
 SOLO_REQUESTS="${SOLO_REQUESTS:-8}"
+PROFILE="${PROFILE:-}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
@@ -66,6 +69,11 @@ if [ -n "$TRACE" ]; then
     export MXS_TRACE_DIR="$OUT/trace"
     PHASE_ARGS=(--phase-file "$OUT/phases.txt")
     echo "TRACE dir=$MXS_TRACE_DIR"
+fi
+if [ -n "$PROFILE" ]; then
+    rm -rf "$OUT/profile"
+    export MXS_PROFILE_DIR="$OUT/profile"
+    echo "PROFILE dir=$MXS_PROFILE_DIR at=${MXS_PROFILE_AT:-300,1600} steps=${MXS_PROFILE_STEPS:-10} ranks=${MXS_PROFILE_RANKS:-D0}"
 fi
 CUDA_VISIBLE_DEVICES="$GPUS" setsid nohup "$PY" -m muxserve_sglang.launcher "$OUT/config.json" \
     --startup-timeout 7200 > "$OUT/launcher.log" 2>&1 &
@@ -106,4 +114,12 @@ if [ -n "$TRACE" ]; then
     "$PY" "$RUNTIME/tools/trace_report.py" "$OUT/trace" --phases "$OUT/phases.txt" \
         --json "$OUT/trace-report.json" | tee "$OUT/trace-report.txt"
     echo "TRACE_REPORT $OUT/trace-report.txt"
+fi
+
+if [ -n "$PROFILE" ]; then
+    stop_launcher
+    for file in "$OUT"/profile/*.txt "$OUT"/profile/*.error; do
+        [ -e "$file" ] || continue
+        echo "===== $(basename "$file")"; cat "$file"
+    done
 fi

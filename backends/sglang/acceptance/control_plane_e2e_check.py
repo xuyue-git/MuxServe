@@ -179,6 +179,7 @@ def main():
     parser.add_argument("--layers", type=int, default=2, help="e.g. 60 for LLaMA-30B")
     parser.add_argument("--heads", type=int, default=TP, help="total KV heads, e.g. 52 for LLaMA-30B")
     parser.add_argument("--pool-blocks", type=int, default=4096, help="KV blocks per rank")
+    parser.add_argument("--bench-models", default=",".join(MODELS), help="models the bench drives")
     parser.add_argument("--profile", help="write owner-side cProfile stats of RPC handlers here")
     args = parser.parse_args()
     from muxserve_sglang.controller import MuxController
@@ -261,7 +262,7 @@ def main():
         threading.Thread(target=monitor, daemon=True).start()
     out = Path(directory) / "bench.json"
     bench = subprocess.run([sys.executable, str(ROOT / "tools/bench_fixed.py"), "--port", str(port),
-                            "--models", ",".join(MODELS), "--requests", str(args.requests), "--warmup", "1",
+                            "--models", args.bench_models, "--requests", str(args.requests), "--warmup", "1",
                             "--input-len", str(args.input_len), "--output-len", str(args.output_len),
                             "--ready-timeout", "30", "--request-timeout", "120", "--out", str(out)],
                            capture_output=True, text=True, timeout=600)
@@ -286,7 +287,7 @@ def main():
         print(bench.stdout[-3000:], bench.stderr[-3000:])
         raise SystemExit(f"E2E_FAILED bench={bench.returncode} alive_ranks={len(alive)}")
     expected = [token_for(i) for i in range(args.output_len)]
-    for m in MODELS:
+    for m in args.bench_models.split(","):
         assert result["first_output_ids"][m] == expected, (m, result["first_output_ids"][m][:8])
     if args.profile:
         import pstats

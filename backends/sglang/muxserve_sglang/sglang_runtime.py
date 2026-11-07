@@ -32,6 +32,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import DynamicGradMode
 
 from . import trace
+from .step_profile import StepProfiler
 from .contracts import IntegrationError, KVView, RequestIdentity
 from .ipc import CommandSnapshot, copy_message
 
@@ -126,6 +127,7 @@ class ControlledScheduler:
     @DynamicGradMode()
     def run(self):
         trace.set_role(f"{self.ctx.model.model_id}-{self.ctx.stage}{self.rank}")
+        self.step_profiler = StepProfiler(self.ctx.model.model_id, self.ctx.stage, self.rank)
         eos = self.s.model_config.hf_eos_token_id
         eos = () if eos is None else tuple(eos) if isinstance(eos, (tuple, list, set)) else (eos,)
         tokenizer = self.s.tokenizer
@@ -575,6 +577,9 @@ class ControlledScheduler:
         while True:
             previous_output_counts = [len(req.output_ids) for req in state.reqs]
             self.s.cur_batch_for_debug = state.batch
+            profiler = getattr(self, "step_profiler", None)
+            if profiler is not None:
+                profiler.before()
             result = self.s.run_batch(state.batch)
             require(result.delay_sample_func is None, "Delayed sampling is unsupported on controlled non-overlap path")
             self.s.process_batch_result(state.batch, result)
@@ -584,6 +589,9 @@ class ControlledScheduler:
             for req in state.reqs:
                 self._validate_finish(req)
             self.sync()
+            if profiler is not None:
+                profiler.after()
+            trace.ev("step_fwd", command["batch_id"], step=step)
             permit = self.runner._muxserve_permit
             require(permit["consumed"] and permit.get("gpu_timing_finished"),
                     "Granted native forward was not consumed or timed")

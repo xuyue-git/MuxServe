@@ -739,7 +739,8 @@ class MuxController:
                                     "fenced": g.fenced} for m, g in self.groups.items()}}
 
     def prepare_batch(self, plan: BatchPlan) -> dict:
-        trace.ev("prep_call", getattr(plan, "batch_id", None))
+        trace.ev("prep_call", getattr(plan, "batch_id", None), m=getattr(plan, "model_id", None),
+                 s=getattr(plan, "stage", None))
         with self.lock:
             self._require_admission()
             if not isinstance(plan, BatchPlan) or plan.stage not in _STAGES or not plan.requests:

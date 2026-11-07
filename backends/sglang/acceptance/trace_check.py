@@ -77,7 +77,14 @@ class TraceChecks(unittest.TestCase):
         add(0.310, "ho_sync", "p1", role="m-D0")
         add(0.320, "handoff_all", "p1", m="m")
         add(0.330, "finish", "p1", m="m", s="P")
+        add(0.390, "prep_call", "d1")
         add(0.400, "prep", "d1", m="m", gid="g", s="D", purpose="GENERATE", steps=3, reqs=["r1"])
+        for r in range(4):
+            add(0.410, "rpt", "d1", kind="READY", gid="g", s="P", r=r)
+            add(0.420, "rpt", "d1", kind="READY", gid="g", s="D", r=r)
+            add(0.460, "dlv", "d1", kind="START", m="m", s="D", r=r)
+            add(0.490, "step_fwd", "d1", role=f"m-D{r}", step=1)
+        add(0.450, "start", "d1", m="m", s="D")
         for step, t in ((1, 0.500), (2, 0.530), (3, 0.900)):
             for r in range(4):
                 add(t, "dstep", "d1", gid="g", r=r, step=step)
@@ -104,6 +111,71 @@ class TraceChecks(unittest.TestCase):
         self.assertAlmostEqual(kinds["in_run"]["total"], 400.0, places=1)
         self.assertEqual(m["big_gaps"]["count"], 2)
         self.assertEqual(result["rpc_ms"]["D:controller_broker_ack"]["n"], 1)
+        t = m["transitions_ms"]["after_prefill"]
+        for key, ms in (("prev_finished", 10), ("driver_prepare_call", 60), ("prepare_batch", 10),
+                        ("all_ready", 20), ("start_called", 30), ("start_delivered", 10),
+                        ("first_forward_done", 30), ("first_step", 10), ("total", 180)):
+            self.assertAlmostEqual(t[key]["p50"], ms, places=1, msg=key)
+
+    def test_step_profiler_is_inert_without_dir_and_counts_windows(self):
+        from muxserve_sglang import step_profile
+        saved = step_profile._DIR
+        try:
+            step_profile._DIR = None
+            idle = step_profile.StepProfiler("m", "D", 0)
+            idle.before(); idle.after()
+            self.assertFalse(idle.enabled)
+            with tempfile.TemporaryDirectory() as directory:
+                step_profile._DIR = directory
+                os.environ.update(MXS_PROFILE_AT="3", MXS_PROFILE_STEPS="2", MXS_PROFILE_RANKS="D0")
+                other = step_profile.StepProfiler("m", "D", 1)
+                self.assertFalse(other.enabled)
+                prof = step_profile.StepProfiler("m", "D", 0)
+                self.assertTrue(prof.enabled)
+
+                class Event:
+                    def __init__(self, name, start, end, device):
+                        self.name, self.device_type = name, device
+                        self.time_range = type("R", (), {"start": start, "end": end})()
+                        self.self_cpu_time_total = end - start
+
+                class FakeProfile:
+                    def __init__(self, **_):
+                        pass
+                    def start(self):
+                        pass
+                    def stop(self):
+                        pass
+                    def events(self):
+                        return [Event("single_query_cached_kv_headwise_attention_kernel", 0, 400, "DeviceType.CUDA"),
+                                Event("ncclDevKernel_AllReduce", 300, 900, "DeviceType.CUDA"),
+                                Event("sm80_xmma_gemm", 1000, 3000, "DeviceType.CUDA"),
+                                Event("aten::mm", 0, 50, "DeviceType.CPU")]
+                fake = type(sys)("torch")
+                fake.profiler = type("P", (), {"profile": FakeProfile,
+                                               "ProfilerActivity": type("A", (), {"CPU": 1, "CUDA": 2})})
+                saved_torch = sys.modules.get("torch")
+                sys.modules["torch"] = fake
+                try:
+                    for _ in range(6):
+                        prof.before(); prof.after()
+                finally:
+                    if saved_torch is None:
+                        sys.modules.pop("torch", None)
+                    else:
+                        sys.modules["torch"] = saved_torch
+                summary = json.load(open(os.path.join(directory, "profile-m-D0-at3.json")))
+                self.assertEqual(summary["steps"], 2)
+                self.assertAlmostEqual(summary["gpu_busy_ms_per_step"], 1.45, places=3)  # union 2.9 ms / 2 steps
+                cats = summary["kernel_ms_per_step_by_category"]
+                self.assertAlmostEqual(cats["attention"]["ms"], 0.2, places=3)
+                self.assertAlmostEqual(cats["allreduce"]["ms"], 0.3, places=3)
+                self.assertAlmostEqual(cats["gemm"]["ms"], 1.0, places=3)
+                self.assertEqual(summary["kernel_launches_per_step"], 1.5)
+        finally:
+            step_profile._DIR = saved
+            for key in ("MXS_PROFILE_AT", "MXS_PROFILE_STEPS", "MXS_PROFILE_RANKS"):
+                os.environ.pop(key, None)
 
 
 if __name__ == "__main__":
