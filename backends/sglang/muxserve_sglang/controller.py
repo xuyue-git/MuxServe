@@ -601,9 +601,12 @@ class MuxController:
             busy.update((model.model_id, b.plan.stage) for b in active)
             counts[model.model_id] = sum(self._occupies_slot(r) for r in rows)
         rank_free = {rank: data["free_blocks"] for rank, data in self.store.rank_usage().items()}
+        # With decode_run_park a prefill prepares without credits (it takes
+        # them at START), so it is always credit-admissible.
         admissible = frozenset((m.model_id, stage) for m in self.config.models
-                               for stage in _STAGES if self.credits.can_allocate(
-                                   10 if stage == "P" else m.decode_mps // 10))
+                               for stage in _STAGES
+                               if (stage == "P" and self.config.decode_run_park)
+                               or self.credits.can_allocate(10 if stage == "P" else m.decode_mps // 10))
         return PolicySnapshot(tuple(demands), self.credits.available, frozenset(busy),
                               frozenset(blocked), counts, self.config.max_model_inflight,
                               rank_free, admissible, pause_prefill=frozenset(self.capacity_blocked))
@@ -821,7 +824,13 @@ class MuxController:
             if plan.stage == "P" and group.next_room + len(requests) - 1 > _INT64_MAX:
                 raise IntegrationError("ROOM_EXHAUSTED", "Native bootstrap room IDs exhausted")
             credits = 10 if plan.stage == "P" else self.config.model(plan.model_id).decode_mps // 10
-            if not self.credits.acquire(plan.batch_id, plan.model_id, plan.stage, credits):
+            if self.config.decode_run_park and plan.stage == "D" and self._prefill_awaiting_credits():
+                # A READY prefill waits for running decodes to park; a new
+                # decode batch must not take the credits it is waiting for.
+                raise IntegrationError("OUT_OF_CREDITS", "A ready prefill is waiting for credits")
+            if self.config.decode_run_park and plan.stage == "P":
+                pass  # Overlaps decoding; credits are taken at START.
+            elif not self.credits.acquire(plan.batch_id, plan.model_id, plan.stage, credits):
                 raise IntegrationError("OUT_OF_CREDITS", "Per-rank software credits unavailable")
             owner = "batch:" + group.group_id + ":" + plan.batch_id
             reservation = None
@@ -977,9 +986,18 @@ class MuxController:
                 raise IntegrationError("NOT_READY", "Preparation or request deadline expired")
             if not group.outbox.owner_can_complete(batch.holder):
                 raise IntegrationError("EVENT_BACKPRESSURE", "Start grant window unavailable")
+            deferred = (self.config.decode_run_park and batch.plan.stage == "P"
+                        and batch.plan.batch_id not in self.credits.leases)
+            if deferred:
+                # Running decode runs park at their next step boundary and
+                # release credits; the driver retries this START then.
+                if not self.credits.acquire(batch.plan.batch_id, batch.plan.model_id, "P", 10):
+                    raise IntegrationError("NOT_READY", "Prefill waits for decode runs to park")
             try:
                 self.store.start_kv_batch(batch.reservation.reservation_id)
             except IntegrationError as exc:
+                if deferred:
+                    self._release_credits(batch.plan.batch_id)
                 if exc.code in ("RPC_TIMEOUT", "RPC_UNAVAILABLE", "BATCH_FENCED"):
                     self._fence(group, batch, "start_uncertain:" + exc.code)
                 raise
@@ -1715,16 +1733,30 @@ class MuxController:
         return "PARK" if self.config.decode_run_park else False
 
     def _prefill_waiting_for_credits(self) -> bool:
+        if self.config.decode_run_park:
+            # Prefills prepare alongside decoding; runs yield only to one
+            # that is READY and needs the credits to START.
+            return self._prefill_awaiting_credits()
         if self.credits.can_allocate(10):
             return False
         return self._prefill_eligible()
 
     def _prefill_pending(self) -> bool:
-        """A prefill holds credits (before its forward finished) or could be
-        prepared now: parked runs stay parked, even while credits are free."""
+        """A prefill holds credits (before its forward finished) or is READY
+        and waiting for them: parked runs stay parked, even while credits
+        are free."""
         if any(lease[0][1] == "P" for lease in self.credits.leases.values()):
             return True
-        return self._prefill_eligible()
+        return self._prefill_awaiting_credits()
+
+    def _prefill_awaiting_credits(self) -> bool:
+        for group in self.groups.values():
+            for batch in group.batches.values():
+                if (batch.plan.stage == "P" and batch.status == "PREPARING"
+                        and batch.ready == group.required
+                        and batch.plan.batch_id not in self.credits.leases):
+                    return True
+        return False
 
     def _prefill_eligible(self) -> bool:
         for model in self.config.models:

@@ -85,7 +85,10 @@ credits are released, while its KV reservation and native state stay. The
 ranks long-poll `decode_resume`; the run resumes when no prefill holds or
 awaits credits and its own credits are free again, or ends exactly like an
 ordinary yield on cancel/timeout/fence or after 2 s parked. D wall-time
-feedback then includes the parked time.
+feedback then includes the parked time. In this mode a prefill also prepares
+(KV reservation, PREPARE/READY handshake) without credits while decode runs
+keep going; it takes all credits at START. Runs park only for a READY
+prefill, and no new decode batch is prepared while one waits.
 
 ## Known limitations
 

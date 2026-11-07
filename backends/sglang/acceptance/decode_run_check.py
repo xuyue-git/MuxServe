@@ -94,6 +94,11 @@ class Sim:
                 self.report(model, stage, rank, batch_id, "READY", {"reservation_id": reservation})
 
     def prefill(self, model, rid, token):
+        plan, out, reservation = self.prefill_ready(model, rid)
+        self.controller.start_batch(self.group(model), plan.batch_id)
+        return self.prefill_finish(model, rid, token, plan, out, reservation)
+
+    def prefill_ready(self, model, rid):
         out = self.controller.request_output(model, rid)
         plan = BatchPlan(self.group(model), "p-" + rid + str(out["attempt"]), model, "P",
                          (RequestRef(rid, out["attempt"], out["output_count"]),))
@@ -108,7 +113,9 @@ class Sim:
                 view["version"], item["target_valid_tokens"], item["rank_block_table"], 0,
                 item["target_valid_tokens"])
         self._ready_all(model, plan.batch_id, reservation)
-        self.controller.start_batch(self.group(model), plan.batch_id)
+        return plan, out, reservation
+
+    def prefill_finish(self, model, rid, token, plan, out, reservation):
         for rank in range(self.tp):
             cmd = next(c for c in self.commands(model, "P", rank, "PREPARE") if c["batch_id"] == plan.batch_id)
             item = cmd["requests"][0]
@@ -303,25 +310,61 @@ class DecodeRunChecks(unittest.TestCase):
         sim.prefill("a", "r", 11)
         plan, reservation = sim.prepare_decode("a", "r", 8)
         self.assertTrue(all(sim.step("a", plan, rank, 1, 12)["continue"] for rank in range(sim.tp)))
-        sim.submit("b", "x", max_new=4)  # Needs 10 credits; the run holds 4.
+        sim.submit("b", "x", max_new=4)
         credits = sim.controller.credits
+        # The prefill prepares while the run keeps decoding (no credits yet).
+        p_plan, p_out, p_reservation = sim.prefill_ready("b", "x")
+        self.assertNotIn(p_plan.batch_id, credits.leases)
+        self.assertIn(plan.batch_id, credits.leases)
+        # READY, it needs all credits: START waits, the run parks at step 2.
+        expect("NOT_READY", lambda: sim.controller.start_batch(sim.group("b"), p_plan.batch_id))
         self.assertEqual(sim.step("a", plan, 0, 2, 13)["continue"], "PARK")
         # Until every rank finished step 2 the run still uses its SMs.
-        self.assertFalse(credits.can_allocate(10))
+        expect("NOT_READY", lambda: sim.controller.start_batch(sim.group("b"), p_plan.batch_id))
         self.assertEqual(sim.step("a", plan, 1, 2, 13)["continue"], "PARK")
         batch = sim.controller.groups["a"].batches[plan.batch_id]
         self.assertEqual(batch.status, "RUNNING")
         self.assertIsNotNone(batch.parked_at)
-        self.assertTrue(credits.can_allocate(10))
         self.assertNotIn(plan.batch_id, credits.leases)
-        return sim, plan, reservation
-
-    def test_parked_run_frees_credits_and_resumes_after_the_prefill_forward(self):
-        sim, plan, reservation = self.parked()
         # Free credits alone never resume a run while the prefill awaits them.
         self.assertEqual(sim.resume("a", plan, 0, 2), "PARK")
-        free = sim.store.rank_usage()[0]["free_blocks"]
-        sim.prefill("b", "x", 21)
+        prefill = (p_plan, p_out, p_reservation)
+        return sim, plan, reservation, prefill
+
+    def test_prefill_prepares_while_decoding_and_parks_runs_only_when_ready(self):
+        sim = Sim(("a", "b"), run_steps=8, park=True)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, _ = sim.prepare_decode("a", "r", 8)
+        sim.submit("b", "x", max_new=4)
+        # Eligible but not prepared: decoding continues.
+        self.assertIs(sim.step("a", plan, 0, 1, 12)["continue"], True)
+        self.assertIs(sim.step("a", plan, 1, 1, 12)["continue"], True)
+        p_plan, _, _ = sim.prefill_ready("b", "x")
+        self.assertEqual(sim.step("a", plan, 0, 2, 13)["continue"], "PARK")
+        # A new decode batch cannot take the credits the ready prefill awaits.
+        self.assertTrue(sim.controller._prefill_awaiting_credits())
+        self.assertNotIn(p_plan.batch_id, sim.controller.credits.leases)
+
+    def test_ready_prefill_blocks_new_decode_batches_until_it_starts(self):
+        sim = Sim(("a", "b", "c"), run_steps=8, park=True)
+        sim.submit("c", "y", max_new=10)
+        sim.prefill("c", "y", 31)
+        sim.submit("b", "x", max_new=4)
+        p_plan, p_out, p_reservation = sim.prefill_ready("b", "x")
+        expect("OUT_OF_CREDITS", lambda: sim.prepare_decode("c", "y", 8))
+        sim.controller.start_batch(sim.group("b"), p_plan.batch_id)  # credits were free
+        expect("OUT_OF_CREDITS", lambda: sim.prepare_decode("c", "y", 8))  # P holds all 10
+        sim.prefill_finish("b", "x", 21, p_plan, p_out, p_reservation)
+        plan, _ = sim.prepare_decode("c", "y", 8)  # the prefill's forward finished
+        self.assertIn(plan.batch_id, sim.controller.credits.leases)
+
+    def test_parked_run_frees_credits_and_resumes_after_the_prefill_forward(self):
+        sim, plan, reservation, (p_plan, p_out, p_reservation) = self.parked()
+        sim.controller.start_batch(sim.group("b"), p_plan.batch_id)
+        self.assertIn(p_plan.batch_id, sim.controller.credits.leases)
+        self.assertEqual(sim.resume("a", plan, 0, 2), "PARK")  # prefill holds credits
+        sim.prefill_finish("b", "x", 21, p_plan, p_out, p_reservation)
         self.assertEqual(sim.resume("a", plan, 0, 2), True)
         self.assertEqual(sim.resume("a", plan, 1, 2), True)  # replayed decision
         self.assertIn(plan.batch_id, sim.controller.credits.leases)
@@ -336,12 +379,12 @@ class DecodeRunChecks(unittest.TestCase):
         self.assertEqual((request.valid_tokens, request.state), (3 + 8, "DECODING"))
         self.assertEqual(sim.tokens("a"), [11, 12, 13, 14, 15, 16, 17, 18, 19])
         self.assertNotIn(plan.batch_id, sim.controller.credits.leases)
-        self.assertLessEqual(free, sim.store.rank_usage()[0]["free_blocks"] + 10_000)
+        self.assertEqual(sim.controller.requests[("b", "x")].output, [21])
 
     def test_parked_run_ends_like_a_yield_on_cancel_or_after_the_park_limit(self):
         for reason in ("cancel", "limit"):
             with self.subTest(reason=reason):
-                sim, plan, reservation = self.parked()
+                sim, plan, reservation, _ = self.parked()
                 if reason == "cancel":
                     sim.controller.cancel_request("a", "r")
                 else:
@@ -353,10 +396,10 @@ class DecodeRunChecks(unittest.TestCase):
                 sim.quiesce("a", plan, reservation)
                 request = sim.controller.requests[("a", "r")]
                 self.assertEqual(request.output, [11, 12, 13])
-                self.assertTrue(all(not any(refs) for refs in sim.controller.credits.refs.values()))
+                self.assertNotIn(plan.batch_id, sim.controller.credits.leases)
 
     def test_resume_long_poll_wakes_when_the_prefill_releases_credits(self):
-        sim, plan, _ = self.parked()
+        sim, plan, _, (p_plan, p_out, p_reservation) = self.parked()
         result = {}
 
         def wait():
@@ -368,7 +411,10 @@ class DecodeRunChecks(unittest.TestCase):
         waiter.start()
         time.sleep(0.05)
         self.assertNotIn("value", result)
-        sim.prefill("b", "x", 21)
+        sim.controller.start_batch(sim.group("b"), p_plan.batch_id)
+        time.sleep(0.05)
+        self.assertNotIn("value", result)  # the prefill now holds the credits
+        sim.prefill_finish("b", "x", 21, p_plan, p_out, p_reservation)
         released = time.monotonic()
         waiter.join(2)
         self.assertIs(result.get("value"), True)
