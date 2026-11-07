@@ -150,6 +150,10 @@ class TraceChecks(unittest.TestCase):
                         return [Event("single_query_cached_kv_headwise_attention_kernel", 0, 400, "DeviceType.CUDA"),
                                 Event("ncclDevKernel_AllReduce", 300, 900, "DeviceType.CUDA"),
                                 Event("sm80_xmma_gemm", 1000, 3000, "DeviceType.CUDA"),
+                                Event("scheduler.run_batch", 0, 9000, "DeviceType.CUDA"),
+                                Event("nccl:all_reduce", 300, 900, "DeviceType.CUDA"),
+                                Event("kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnorm", 3000, 3100,
+                                      "DeviceType.CUDA"),
                                 Event("aten::mm", 0, 50, "DeviceType.CPU")]
                 fake = type(sys)("torch")
                 fake.profiler = type("P", (), {"profile": FakeProfile,
@@ -166,12 +170,13 @@ class TraceChecks(unittest.TestCase):
                         sys.modules["torch"] = saved_torch
                 summary = json.load(open(os.path.join(directory, "profile-m-D0-at3.json")))
                 self.assertEqual(summary["steps"], 2)
-                self.assertAlmostEqual(summary["gpu_busy_ms_per_step"], 1.45, places=3)  # union 2.9 ms / 2 steps
+                self.assertAlmostEqual(summary["gpu_busy_ms_per_step"], 1.5, places=3)  # union 3.0 ms / 2 steps
                 cats = summary["kernel_ms_per_step_by_category"]
                 self.assertAlmostEqual(cats["attention"]["ms"], 0.2, places=3)
                 self.assertAlmostEqual(cats["allreduce"]["ms"], 0.3, places=3)
                 self.assertAlmostEqual(cats["gemm"]["ms"], 1.0, places=3)
-                self.assertEqual(summary["kernel_launches_per_step"], 1.5)
+                self.assertAlmostEqual(cats["norm_rope_act"]["ms"], 0.05, places=3)
+                self.assertEqual(summary["kernel_launches_per_step"], 2.0)
         finally:
             step_profile._DIR = saved
             for key in ("MXS_PROFILE_AT", "MXS_PROFILE_STEPS", "MXS_PROFILE_RANKS"):

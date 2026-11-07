@@ -114,7 +114,7 @@ class PreparationMetadataChecks(unittest.TestCase):
             self.assertEqual(view, expected)
             self.assertIs(view['block_tables'], batch.packed['r'])
             self.assertEqual(payload['requests'][0]['rank_block_table'], view['block_tables'][key[1]])
-            self.assertEqual(view['block_tables'][0].tolist(), original.block_tables[0])
+            self.assertEqual(view['block_tables'][0], original.block_tables[0])
 
     def test_command_owns_one_copy_and_poll_returns_independent_data(self):
         fixture = Fixture()

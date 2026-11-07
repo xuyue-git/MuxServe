@@ -66,15 +66,19 @@ class SnapshotChecks(unittest.TestCase):
         target = KVTarget(identity, 1)
         first = store.reserve_kv('first', [target], 'holder')
         allocation = store._allocations[first.views[0].allocation_id]
-        allocation.tables = Mapping(allocation.tables)
         original = allocation.tables[0][0][0][0]
         detached = store.bind_kv(allocation.allocation_id, 'other')
-        detached.block_tables[0][0][0][0] = 999
-        self.assertEqual(allocation.tables[0][0][0][0], original)
+        # Views are immutable packed snapshots; neither binds nor replays alias
+        # the store's mutable lists.
+        with self.assertRaises(Exception):
+            detached.block_tables[0].data = b''
+        self.assertIsNot(detached.block_tables, first.views[0].block_tables)
+        self.assertEqual(detached.block_tables[0].tolist(), allocation.tables[0])
         replay = store.reserve_kv('first', [target], 'holder')
-        replay.views[0].block_tables[0][0][0][0] = 888
+        replay.views[0].block_tables.clear()
         again = store.reserve_kv('first', [target], 'holder')
-        self.assertEqual(again.views[0].block_tables[0][0][0][0], original)
+        self.assertEqual(again.views[0].block_tables[0].tolist()[0][0][0], original)
+        self.assertEqual(allocation.tables[0][0][0][0], original)
 
     def test_ready_validates_global_mapping_once_and_keeps_passive_rank_unbound(self):
         bindings = []

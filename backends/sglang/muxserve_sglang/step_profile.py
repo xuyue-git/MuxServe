@@ -25,11 +25,11 @@ _DIR = os.environ.get("MXS_PROFILE_DIR") or None
 
 _CATEGORIES = (
     ("memcpy", re.compile(r"^memcpy|^memset", re.I)),
-    ("attention", re.compile(r"headwise_attention|single_query|flash|attn|paged_attention", re.I)),
+    ("norm_rope_act", re.compile(r"rmsnorm|layernorm|_norm|rotary|rope|silu|gelu|act_and_mul|swiglu", re.I)),
+    ("attention", re.compile(r"headwise_attention|single_query|flash_?attn|paged_attention|attention_kernel", re.I)),
     ("kv_store", re.compile(r"reshape_and_cache|headwise_reshape|store_kv|set_kv", re.I)),
-    ("allreduce", re.compile(r"nccl|allreduce|all_reduce|cross_device|custom_ar", re.I)),
+    ("allreduce", re.compile(r"nccl|allreduce|all_reduce|allgather|all_gather|cross_device|custom_ar", re.I)),
     ("gemm", re.compile(r"gemm|gemv|cutlass|xmma|cublas|sm80_|sm90_|ampere_|matmul|splitk", re.I)),
-    ("norm_rope_act", re.compile(r"rms|norm|rotary|rope|silu|gelu|act_and_mul|swiglu", re.I)),
     ("sampling", re.compile(r"argmax|topk|top_k|softmax|sample|sort|cumsum", re.I)),
 )
 
@@ -39,6 +39,18 @@ def _category(name: str) -> str:
         if pattern.search(name):
             return label
     return "other"
+
+
+# GPU-side user annotations (record_function ranges mirrored on the device
+# timeline, e.g. "scheduler.run_batch", "step[DECODE bs=1]", "nccl:all_reduce")
+# span real kernels; counting them would double-count the whole step.
+_ANNOTATION = re.compile(r"^(scheduler\.|step\[|nccl:|ProfilerStep|forward_|## )")
+
+
+def _is_annotation(event) -> bool:
+    if getattr(event, "is_user_annotation", False):
+        return True
+    return bool(_ANNOTATION.match(getattr(event, "name", "") or ""))
 
 
 def _union_us(intervals):
@@ -125,6 +137,8 @@ class StepProfiler:
         kernels, cpu_ops, intervals = {}, {}, []
         for event in profiler.events():
             device_type = str(getattr(event, "device_type", ""))
+            if device_type.endswith("CUDA") and _is_annotation(event):
+                continue
             if device_type.endswith("CUDA"):
                 start = event.time_range.start
                 stop = event.time_range.end
@@ -143,7 +157,8 @@ class StepProfiler:
             for item in profiler.key_averages():
                 total = (getattr(item, "self_device_time_total", None)
                          or getattr(item, "self_cuda_time_total", 0.0) or 0.0)
-                if total > 0 and str(getattr(item, "device_type", "")).endswith("CUDA"):
+                if (total > 0 and str(getattr(item, "device_type", "")).endswith("CUDA")
+                        and not _ANNOTATION.match(item.key or "")):
                     kernels[item.key] = [item.count, total]
             intervals = []
         busy_us = _union_us(intervals) if intervals else sum(v[1] for v in kernels.values())

@@ -12,7 +12,8 @@ from threading import RLock
 from typing import Any, Sequence
 from uuid import uuid4
 
-from .contracts import IntegrationError, KVTarget, KVView, ModelLayout, RequestIdentity, Reservation
+from .contracts import (IntegrationError, KVTarget, KVView, ModelLayout, RequestIdentity, Reservation,
+                        pack_tables)
 
 
 def _copy_metadata(value: Any) -> Any:
@@ -31,6 +32,9 @@ class _Allocation:
     version: int = 0
     holders: set[str] = field(default_factory=set)
     active: str | None = None
+    # Bumped on every physical mapping change; keys the packed view cache.
+    epoch: int = 0
+    packed: tuple | None = None
 
 
 @dataclass
@@ -237,6 +241,8 @@ class HeadwiseStore:
                     self._free[rank].difference_update(chosen)
                     if self._pool_mode == "static":
                         self._model_free[model_id][rank].difference_update(chosen)
+                if groups:
+                    allocation.epoch += 1
                 allocation.capacity = capacity
                 allocation.active = rid
                 if holder not in allocation.holders:
@@ -545,8 +551,12 @@ class HeadwiseStore:
 
     @staticmethod
     def _view(a: _Allocation) -> KVView:
+        # Views carry immutable PackedBlocks: callers cannot alias or mutate
+        # the store's mapping, and copying a view no longer walks every block.
+        if a.packed is None or a.packed[0] != a.epoch:
+            a.packed = (a.epoch, pack_tables(a.tables))
         return KVView(a.allocation_id, a.identity, a.capacity, a.valid,
-                      a.layout.block_size, _copy_metadata(a.tables), a.version)
+                      a.layout.block_size, dict(a.packed[1]), a.version)
 
     def _rollback(self, batch: _Batch) -> None:
         for aid, capacity in batch.old_capacity.items():
@@ -562,6 +572,7 @@ class HeadwiseStore:
                         if self._pool_mode == "static":
                             self._model_free[allocation.identity.model_id][rank].update(released)
                         del blocks[groups:]
+            allocation.epoch += 1
             allocation.capacity = capacity
             allocation.version += 1
             allocation.active = None

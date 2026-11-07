@@ -102,8 +102,16 @@ def allocator_checks():
     assert store.reserve_kv("prefill", [target], "P") == reservation
     expect_code("IDENTITY_CONFLICT", lambda: store.reserve_kv("prefill", [KVTarget(identity, 18)], "P"))
     expect_code("ALLOCATION_BUSY", lambda: store.reserve_kv("busy", [KVTarget(identity, 33, aid)], "P"))
-    # Mutating returned tables cannot corrupt allocator bookkeeping.
-    reservation.views[0].block_tables[0][0][0].clear()
+    # Returned tables are immutable PackedBlocks: callers cannot corrupt
+    # allocator bookkeeping, and the packed view matches the store mapping.
+    returned = reservation.views[0].block_tables[0]
+    try:
+        returned.data = b""
+    except Exception:
+        pass
+    else:
+        raise AssertionError("Returned block table is mutable")
+    assert returned.tolist() == store._allocations[aid].tables[0]
     store.assert_integrity()
     store.start_kv_batch(reservation.reservation_id)
     store.start_kv_batch(reservation.reservation_id)
