@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import threading
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -789,6 +792,212 @@ class ProtocolFastPaths(unittest.TestCase):
             expect("INVALID_CONFIG", lambda: load(**{name: 1}))
         expect("INVALID_CONFIG", lambda: load(slot_free_at_cleanup=True))
         self.assertTrue(load(slot_free_at_cleanup=True, cleanup_skip_prefill_ranks=True).slot_free_at_cleanup)
+
+
+class HandoffRoundTrips(unittest.TestCase):
+    def chained(self, **flags):
+        return HandoffFastPaths.chained(self, **flags)
+
+    def flow(self, **flags):
+        sim = Sim(run_steps=4, inline_start=True, prefill_early_token=True, decode_skip_prefill_ranks=True,
+                  handoff_prepare_decode=True, handoff_deliver_first=True, **flags)
+        sim.controller.set_inline_start(True)
+        sim.submit("a", "r", max_new=5)
+        plan, out, reservation = sim.prefill_ready("a", "r")
+        sim.controller.start_batch(sim.group("a"), plan.batch_id)
+        return sim, plan, out, reservation
+
+    def test_handoff_is_readable_before_the_decode_batch_is_reserved(self):
+        sim, plan, out, reservation = self.flow()
+        group = sim.controller.groups["a"]
+        seen = {}
+
+        def during(_):
+            free = []
+
+            def try_lock():
+                free.append(sim.controller.lock.acquire(blocking=False))
+                if free[0]:
+                    sim.controller.lock.release()
+            worker = threading.Thread(target=try_lock)
+            worker.start()
+            worker.join()
+            seen.update(lock_free=free[0], last=sim.commands("a", "D", 0)[-1]["kind"],
+                        decode=[b for b in group.batches.values() if b.plan.stage == "D"])
+        with mock.patch("muxserve_sglang.controller.time.sleep", side_effect=during):
+            stage_and_gpu_done(sim, "a", "r", 11, plan, out, reservation)
+        self.assertEqual((seen["lock_free"], seen["last"], seen["decode"]), (True, "HANDOFF", []))
+        for rank in range(sim.tp):
+            self.assertEqual([c["kind"] for c in sim.commands("a", "D", rank)][-2:], ["HANDOFF", "PREPARE"])
+        self.assertEqual(sim.controller._deferred_prepares, [])
+
+    def test_deferred_prepare_is_dropped_once_the_prefill_left_handoff(self):
+        sim, plan, out, reservation = self.flow()
+        group = sim.controller.groups["a"]
+
+        def during(_):
+            group.batches[plan.batch_id].status = "QUIESCE"
+        with mock.patch("muxserve_sglang.controller.time.sleep", side_effect=during):
+            stage_and_gpu_done(sim, "a", "r", 11, plan, out, reservation)
+        self.assertEqual([b for b in group.batches.values() if b.plan.stage == "D"], [])
+
+    def poll(self, sim, rank, wait_ms, epoch, acks=(), stage="D"):
+        target = sim.controller.groups["a"].registered[(stage, rank)]
+        started = time.monotonic()
+        reply = sim.controller.poll_commands_wait(sim.group("a"), stage, rank, sim.pid("a", stage, rank),
+                                                  target.next_command - 1, None, wait_ms, epoch, acks)
+        return reply, time.monotonic() - started
+
+    def acks(self, sim, rank):
+        item = sim.commands("a", "D", rank, "HANDOFF")[-1]["requests"][0]
+        return ((item["bootstrap_room"], item["allocation_id"], item["version"], item["valid_tokens"],
+                 item["rank_block_table"]),)
+
+    def published(self, **flags):
+        sim = Sim(run_steps=4, broker_status_in_poll=True, **flags)
+        sim.submit("a", "r", max_new=5)
+        plan, out, reservation = sim.prefill_ready("a", "r")
+        sim.controller.start_batch(sim.group("a"), plan.batch_id)
+        stage_and_gpu_done(sim, "a", "r", 11, plan, out, reservation)
+        return sim
+
+    def test_ack_rides_on_the_poll_and_only_the_last_returns_at_once(self):
+        sim = self.published(handoff_ack_in_poll=True)
+        room = self.acks(sim, 0)[0][0]
+        epoch = self.poll(sim, 0, 0, None)[0]["epoch"]
+        reply, elapsed = self.poll(sim, 0, 40, epoch, self.acks(sim, 0))
+        self.assertGreaterEqual(elapsed, 0.03)  # its own ACK does not end the wait
+        self.assertEqual(dict(reply["broker_status"]), {room: "PENDING"})
+        reply, elapsed = self.poll(sim, 1, 900, reply["epoch"], self.acks(sim, 1))
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(dict(reply["broker_status"]), {room: "SUCCESS"})
+        self.assertEqual(sim.controller.groups["a"].broker[room]["acked"], {0, 1})
+
+    def test_a_poll_ack_gets_the_same_checks_as_the_ack_rpc(self):
+        sim = self.published(handoff_ack_in_poll=True)
+        (ack,) = self.acks(sim, 0)
+        expect("HANDOFF_NOT_READY", lambda: self.poll(sim, 0, 0, None, ((ack[0], "other", *ack[2:]),)))
+        expect("INVALID_ARGUMENT", lambda: self.poll(sim, 0, 0, None, (ack[:4],)))
+        expect("INVALID_ARGUMENT", lambda: self.poll(sim, 0, 0, None, (ack,), stage="P"))
+        sim = self.published()
+        expect("INVALID_ARGUMENT", lambda: self.poll(sim, 0, 0, None, self.acks(sim, 0)))
+
+    def acked_all(self, sim):
+        for rank in range(sim.tp):
+            (ack,) = self.acks(sim, rank)
+            sim.controller.broker_ack(sim.group("a"), ack[0], rank, sim.pid("a", "D", rank), *ack[1:])
+
+    def combined(self, sim, rank, plan, decode):
+        key = ("a", "D", rank)
+        base = sim.seq[key]
+        first = (str(base + 1), plan.batch_id, "HANDOFF_READY",
+                 {"requests": sim.commands("a", "D", rank, "HANDOFF")[-1]["requests"]})
+        second = (str(base + 2), decode.plan.batch_id, "READY",
+                  {"reservation_id": decode.reservation.reservation_id})
+        sim.seq[key] = base + 2
+        return (first, second)
+
+    def test_handoff_ready_and_ready_are_one_report_call(self):
+        sim, plan, reservation, decode = self.chained(handoff_report_with_ready=True)
+        self.acked_all(sim)
+        call = lambda rank, pair: sim.controller.rank_reports(sim.group("a"), "D", rank, sim.pid("a", "D", rank), pair)
+        pairs = [self.combined(sim, rank, plan, decode) for rank in range(sim.tp)]
+        for rank, pair in enumerate(pairs):
+            self.assertTrue(call(rank, pair)["accepted"])
+        self.assertEqual(decode.status, "RUNNING")  # the last pair STARTed it inline
+        self.assertEqual(sim.controller.groups["a"].batches[plan.batch_id].handoff, set(range(sim.tp)))
+        self.assertTrue(call(0, pairs[0])["duplicate"])  # a replay is idempotent
+
+    def test_combined_report_is_only_for_a_handoff_ready_pair(self):
+        sim, plan, reservation, decode = self.chained()
+        self.acked_all(sim)
+        call = lambda pair: sim.controller.rank_reports(sim.group("a"), "D", 0, sim.pid("a", "D", 0), pair)
+        pair = self.combined(sim, 0, plan, decode)
+        expect("INVALID_REPORT", lambda: call(pair))  # switch off
+        sim, plan, reservation, decode = self.chained(handoff_report_with_ready=True)
+        self.acked_all(sim)
+        pair = self.combined(sim, 0, plan, decode)
+        expect("INVALID_REPORT", lambda: call((pair[1], pair[0])))
+        expect("INVALID_REPORT", lambda: call((pair[0],)))
+
+    def test_only_the_ready_that_starts_the_batch_returns_start(self):
+        for flag in (False, True):
+            with self.subTest(start_in_report_reply=flag):
+                sim, plan, reservation, decode = self.chained(start_in_report_reply=flag)
+                handoff_ready(sim, "a", plan)
+                replies = []
+                for rank in range(sim.tp):
+                    key = ("a", "D", rank)
+                    sim.seq[key] += 1
+                    replies.append(sim.controller.rank_report(
+                        sim.group("a"), "D", rank, sim.pid("a", "D", rank), str(sim.seq[key]),
+                        decode.plan.batch_id, "READY", {"reservation_id": decode.reservation.reservation_id}))
+                self.assertNotIn("commands", replies[0])
+                if not flag:
+                    self.assertNotIn("commands", replies[-1])
+                    continue
+                (command,) = replies[-1]["commands"]
+                target = sim.controller.groups["a"].registered[("D", sim.tp - 1)]
+                self.assertEqual((command["kind"], command["batch_id"], command["command_seq"]),
+                                 ("START", decode.plan.batch_id, target.next_command - 1))
+
+    def test_long_poll_wakes_only_for_its_own_command_or_group_change(self):
+        sim = Sim(run_steps=4, targeted_wake=True)
+        controller, group = sim.controller, sim.controller.groups["a"]
+        epoch = self.poll(sim, 0, 0, None)[0]["epoch"]
+        results = {}
+
+        def waiter(rank):
+            results[rank] = self.poll(sim, rank, 900, epoch)
+        threads = [threading.Thread(target=waiter, args=(rank,)) for rank in (0, 1)]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + 2
+        targets = [group.registered[("D", rank)] for rank in (0, 1)]
+        while time.monotonic() < deadline and any(t.poll_cv is None for t in targets):
+            time.sleep(0.005)
+        time.sleep(0.05)
+        with mock.patch.object(targets[1].poll_cv, "notify_all", wraps=targets[1].poll_cv.notify_all) as other:
+            with controller.lock:
+                controller._command(group, ("D", 0), "QUIESCE", {"batch_id": "x"})
+            threads[0].join(1)
+            self.assertFalse(threads[0].is_alive())
+            self.assertEqual(other.call_count, 0)
+            self.assertEqual(results[0][0]["commands"][0]["kind"], "QUIESCE")
+            with controller.lock:
+                controller._notify(group)  # a broker change wakes the group
+            threads[1].join(1)
+            self.assertFalse(threads[1].is_alive())
+            self.assertEqual(other.call_count, 1)
+        self.assertLess(results[1][1], 0.8)
+
+    def test_new_round_trip_switches_validate(self):
+        import json, tempfile
+        from muxserve_sglang.config import load_config
+        root = Path(__file__).resolve().parents[1]
+
+        def load(**extra):
+            raw = json.loads((root / "configs/sglang_a100.json").read_text())
+            raw.update(extra)
+            directory = tempfile.mkdtemp()
+            raw["asset_lock_dir"] = raw["runtime_dir"] = directory
+            path = Path(directory) / "c.json"
+            path.write_text(json.dumps(raw))
+            return load_config(path, require_assets=False)
+        chain = dict(inline_start=True, prefill_early_token=True, decode_skip_prefill_ranks=True,
+                     handoff_prepare_decode=True)
+        config = load()
+        for name in ("handoff_deliver_first", "handoff_ack_in_poll", "handoff_report_with_ready",
+                     "start_in_report_reply", "targeted_wake"):
+            self.assertFalse(getattr(config, name))
+            expect("INVALID_CONFIG", lambda: load(**{name: 1}))
+        for name in ("start_in_report_reply", "targeted_wake"):
+            self.assertTrue(getattr(load(**{name: True}), name))
+        for name in ("handoff_deliver_first", "handoff_report_with_ready"):
+            expect("INVALID_CONFIG", lambda: load(**{name: True}))
+            self.assertTrue(getattr(load(**chain, **{name: True}), name))
+        expect("INVALID_CONFIG", lambda: load(handoff_ack_in_poll=True))
+        self.assertTrue(load(handoff_ack_in_poll=True, broker_status_in_poll=True).handoff_ack_in_poll)
 
 
 class EventPumpLock(unittest.TestCase):

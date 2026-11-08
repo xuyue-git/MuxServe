@@ -388,6 +388,8 @@ def report(directory, phases_path=None, gap_ms=150.0, ranks=4):
             entry["D_batches"] = len(by_model[model]["D"])
             entry["D_segments_ms"] = {k: summary(v) for k, v in dseg.items()}
             entry["D_in_run_step_ms"] = summary(step_ms)
+            entry["D_run_prepare_handler_ms"] = summary(
+                [handler_ms(b, "PREPARE", "D") for b in by_model[model]["D"]])
             # ---- transitions into each D batch (closed loop, same model)
             ordered = sorted((b for b in by_model[model]["P"] + by_model[model]["D"]), key=lambda b: b.prep)
             trans = {"after_prefill": defaultdict(list), "between_runs": defaultdict(list)}
@@ -492,6 +494,7 @@ def render(result):
                 if s:
                     lines.append(f"    {key:<36}{s['p50']:>9}{s['p90']:>9}{s['mean']:>9}   {label}")
             lines.append(f"  in-run step interval ms: {e['D_in_run_step_ms']}")
+            lines.append(f"  D run PREPARE handler ms (max over ranks): {e['D_run_prepare_handler_ms']}")
             for kind, seg_map in e.get("transitions_ms", {}).items():
                 if not seg_map:
                     continue

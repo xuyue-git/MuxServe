@@ -71,6 +71,7 @@ class _Rank:
     last_report_seq: int = 0
     alive: bool = True
     exit_code: int | None = None
+    poll_cv: Condition | None = None  # targeted_wake: this rank's long poll
 
 
 @dataclass
@@ -278,6 +279,7 @@ class MuxController:
         # (ControllerDriver enables it and clears it on pause/failure). An
         # unexpected inline START failure is kept for the driver to raise.
         self._inline_start_allowed = False
+        self._deferred_prepares: list = []  # handoff_deliver_first
         self._inline_starting = False
         self.inline_start_error: BaseException | None = None
         self.inline_start_count = 0
@@ -330,7 +332,7 @@ class MuxController:
 
     def rpc_methods(self) -> dict[str, Any]:
         """Explicit allowlist for StorageRPCServer(extra_methods=...)."""
-        names = ("register_rank", "poll_commands", "rank_report", "rank_failed", "rank_exited",
+        names = ("register_rank", "poll_commands", "rank_report", "rank_reports", "rank_failed", "rank_exited",
                  "submit_request", "cancel_request", "suspend_request", "resume_request",
                  "prepare_batch", "start_batch", "abort_batch", "tick", "snapshot",
                  "request_output", "poll_events", "ack_events", "broker_stage",
@@ -350,7 +352,14 @@ class MuxController:
         with self.lock:  # Re-entrant; also safe for direct helper calls.
             if group is not None:
                 group.epoch += 1
-            self._cv.notify_all()
+            if not self.config.targeted_wake:
+                self._cv.notify_all()
+            elif group is not None:
+                # Only an epoch change alters a long poll's condition here;
+                # new commands wake their own rank in _command.
+                for rank in group.registered.values():
+                    if rank.poll_cv is not None:
+                        rank.poll_cv.notify_all()
         self.wake.set()
 
     def group_id(self, model_id: str) -> str:
@@ -484,6 +493,8 @@ class MuxController:
                  m=group.model_id, s=key[0], r=key[1])
         if owner is not None:
             held[owner] -= 1
+        if target.poll_cv is not None:
+            target.poll_cv.notify_all()
         self._notify()
 
     @staticmethod
@@ -523,7 +534,8 @@ class MuxController:
 
     def poll_commands_wait(self, group_id: str, stage: str, rank: int, pid: int,
                            after_seq: int = 0, ack_seq: int | None = None,
-                           wait_ms: int | float = 0, seen_epoch: int | None = None) -> dict:
+                           wait_ms: int | float = 0, seen_epoch: int | None = None,
+                           broker_acks: tuple | list = ()) -> dict:
         """Long-poll variant: return at once if commands exist or the group's
         broker epoch differs from ``seen_epoch``; otherwise wait up to wait_ms."""
         if type(wait_ms) not in (int, float) or not 0 <= wait_ms <= 1000:
@@ -550,12 +562,25 @@ class MuxController:
                 raise IntegrationError("COMMAND_GAP", "Command replay precedes retained history")
             if acked:
                 self._retire_completed(group)
+            if broker_acks:
+                if (not self.config.handoff_ack_in_poll or stage != "D"
+                        or not isinstance(broker_acks, (tuple, list))
+                        or not all(isinstance(a, (tuple, list)) and len(a) == 5 for a in broker_acks)):
+                    raise IntegrationError("INVALID_ARGUMENT", "Long-poll broker ACKs are not accepted here")
+                for room, allocation_id, version, valid_tokens, table in broker_acks:
+                    self.broker_ack(group_id, room, rank, pid, allocation_id, version, valid_tokens, table)
+                if not all(group.broker[a[0]]["acked"] == set(group.ranks) for a in broker_acks):
+                    # This rank's own ACK changed the epoch: keep waiting for
+                    # the other ranks' ACKs. The last ACK returns at once.
+                    seen_epoch = group.epoch
+            if self.config.targeted_wake and target.poll_cv is None:
+                target.poll_cv = Condition(self.lock)
             while (target.next_command - 1 <= after_seq and target.alive
                    and (seen_epoch is None or seen_epoch == group.epoch)):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                self._cv.wait(remaining)
+                (target.poll_cv or self._cv).wait(remaining)
             commands = tuple(cmd.detach() if isinstance(cmd, CommandSnapshot) else deepcopy(cmd)
                              for seq, cmd in target.commands.items() if seq > after_seq)
             if trace.enabled():
@@ -1279,6 +1304,8 @@ class MuxController:
             if target is None or target.pid != pid or not isinstance(reason, str) or not reason:
                 raise IntegrationError("UNKNOWN_RANK", "Registered rank/PID and reason required")
             target.alive = False
+            if target.poll_cv is not None:
+                target.poll_cv.notify_all()
             for batch in group.batches.values():
                 if batch.status not in ("DONE", "ABORTED"):
                     self._fence(group, batch, "rank_failed:" + reason)
@@ -1307,6 +1334,40 @@ class MuxController:
 
     def rank_report(self, group_id: str, stage: str, rank: int, pid: int,
                     report_id: str, batch_id: str, kind: str, payload: dict) -> dict:
+        try:
+            return self._rank_report(group_id, stage, rank, pid, report_id, batch_id, kind, payload)
+        finally:
+            self._prepare_deferred()
+
+    def rank_reports(self, group_id: str, stage: str, rank: int, pid: int, reports: tuple | list) -> dict:
+        """handoff_report_with_ready: a D rank's HANDOFF_READY and the report
+        that followed it, applied in order exactly as two rank_report calls
+        (each keeps its own sequence number, so a replay is idempotent)."""
+        if (not self.config.handoff_report_with_ready or stage != "D"
+                or not isinstance(reports, (tuple, list)) or len(reports) != 2
+                or not all(isinstance(r, (tuple, list)) and len(r) == 4 for r in reports)
+                or reports[0][2] != "HANDOFF_READY"):
+            raise IntegrationError("INVALID_REPORT", "HANDOFF_READY and one following report required")
+        with self.lock:
+            self._rank_report(group_id, stage, rank, pid, *reports[0])
+            return self._rank_report(group_id, stage, rank, pid, *reports[1])
+
+    def _prepare_deferred(self) -> None:
+        """handoff_deliver_first: prepare the first decode batch after the
+        lock was released, so the woken D ranks read their HANDOFF first."""
+        if not self._deferred_prepares:
+            return
+        # A plain release/re-acquire would barge past the waiters; PREPARE has
+        # time to spare, since each D rank runs it only after its handoff.
+        time.sleep(0.001)
+        with self.lock:
+            pending, self._deferred_prepares = self._deferred_prepares, []
+            for group, batch in pending:
+                if batch.status == "HANDOFF":
+                    self._prepare_after_handoff(group, batch)
+
+    def _rank_report(self, group_id: str, stage: str, rank: int, pid: int,
+                     report_id: str, batch_id: str, kind: str, payload: dict) -> dict:
         trace.ev("rpt", batch_id, kind=kind, gid=group_id, s=stage, r=rank)
         with self.lock:
             group = self._group(group_id)
@@ -1393,6 +1454,14 @@ class MuxController:
             reply = {"accepted": True, "duplicate": False, "batch": self._batch_view(batch)}
             if revoked_ready:
                 reply["obsolete"] = True
+            if kind == "READY" and self.config.start_in_report_reply:
+                # This READY may just have STARTed the batch: give this rank
+                # its START now. The rank drops it unless it is contiguous.
+                last = target.commands.get(target.next_command - 1)
+                if isinstance(last, dict) and last["kind"] == "START" and last.get("batch_id") == batch_id:
+                    trace.ev("dlv", batch_id, kind="START", m=group.model_id, s=stage, r=rank,
+                             seq=last["command_seq"])
+                    reply["commands"] = (deepcopy(last),)
             return reply
 
     def broker_register_destination(self, group_id: str, room: int, rank: int, pid: int,
@@ -1730,7 +1799,10 @@ class MuxController:
                 self._apply_tokens(group, batch, settle=False)
                 batch.tokens_published = True
                 if self.config.handoff_prepare_decode and batch.plan.purpose == "GENERATE":
-                    self._prepare_after_handoff(group, batch)
+                    if self.config.handoff_deliver_first:
+                        self._deferred_prepares.append((group, batch))
+                    else:
+                        self._prepare_after_handoff(group, batch)
         else:
             if batch.plan.steps > 1:
                 if batch.run_applied != batch.run_steps_done:

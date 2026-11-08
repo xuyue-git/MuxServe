@@ -39,7 +39,7 @@ def token_for(output_count: int) -> int:
 
 
 def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False,
-              register_ready=False):
+              register_ready=False, ack_in_poll=False, combined=False, start_reply=False):
     """final_step: config final_step_in_gpu_done (a locally final run step is
     reported inside GPU_DONE). HANDOFF native_metadata and long-poll
     bootstrap_ready are used whenever the owner provides them."""
@@ -51,25 +51,45 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
     call("register_rank", stage, rank, pid, {"vocab_size": 32000, "eos_token_ids": (2,),
                                              "native_pd": True, "headwise_kv": True})
     report_seq = 0
+    deferred, pending_acks, reply_commands = None, [], ()
     def report(batch_id, kind, payload):
-        nonlocal report_seq
-        reply = call("rank_report", stage, rank, pid, str(report_seq + 1), batch_id, kind, payload)
+        nonlocal report_seq, deferred, reply_commands
+        if deferred is not None:
+            pair = ((str(report_seq + 1), *deferred), (str(report_seq + 2), batch_id, kind, payload))
+            deferred = None
+            reply = call("rank_reports", stage, rank, pid, pair)
+            report_seq += 2
+        else:
+            reply = call("rank_report", stage, rank, pid, str(report_seq + 1), batch_id, kind, payload)
+            report_seq += 1
         assert reply["accepted"], reply
-        report_seq += 1
+        reply_commands = reply.get("commands", ())
+    def absorb():
+        nonlocal reply_commands
+        for held in reply_commands:
+            if held["command_seq"] == (backlog[-1]["command_seq"] if backlog else cursor) + 1:
+                backlog.append(held)
+        reply_commands = ()
     cursor, epoch, wait_ms, backlog = 0, None, 0, []
+    skip_poll = False
     prepared, waiting_bootstrap, waiting_handoff = {}, {}, None
     bootstrap_ready = None
     broker_status = None
     drained = False
     while not drained and not stop.is_set():
-        after = backlog[-1]["command_seq"] if backlog else cursor
-        reply = call("poll_commands_wait", stage, rank, pid, after, cursor or None, wait_ms, epoch)
-        epoch = reply["epoch"]
-        if "bootstrap_ready" in reply:
-            bootstrap_ready = {tuple(room) for room in reply["bootstrap_ready"]}
-        if "broker_status" in reply:
-            broker_status = dict(reply["broker_status"])
-        backlog.extend(reply["commands"])
+        if not skip_poll:
+            after = backlog[-1]["command_seq"] if backlog else cursor
+            acks = tuple(pending_acks)
+            reply = call("poll_commands_wait", stage, rank, pid, after, cursor or None, wait_ms, epoch,
+                         *((acks,) if acks else ()))
+            del pending_acks[:len(acks)]
+            epoch = reply["epoch"]
+            if "bootstrap_ready" in reply:
+                bootstrap_ready = {tuple(room) for room in reply["bootstrap_ready"]}
+            if "broker_status" in reply:
+                broker_status = dict(reply["broker_status"])
+            backlog.extend(reply["commands"])
+        skip_poll = False
         accepted = 0
         while backlog and waiting_handoff is None:
             command = backlog.pop(0)
@@ -151,8 +171,12 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                     if "native_metadata" not in item:
                         call("broker_lookup", item["bootstrap_room"], rank, pid, model, item["request_id"],
                              item["attempt"], item["allocation_id"], item["version"], item["valid_tokens"])
-                    call("broker_ack", item["bootstrap_room"], rank, pid, item["allocation_id"],
-                         item["version"], item["valid_tokens"], item["rank_block_table"])
+                    if ack_in_poll:
+                        pending_acks.append((item["bootstrap_room"], item["allocation_id"], item["version"],
+                                             item["valid_tokens"], item["rank_block_table"]))
+                    else:
+                        call("broker_ack", item["bootstrap_room"], rank, pid, item["allocation_id"],
+                             item["version"], item["valid_tokens"], item["rank_block_table"])
                 waiting_handoff = command
             elif kind in ("QUIESCE", "REVOKE"):
                 prep = prepared.pop(command["batch_id"])
@@ -164,6 +188,7 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
             elif kind == "DRAIN":
                 drained = True
             cursor = command["command_seq"]
+            absorb()
             accepted += 1
             if drained or waiting_handoff is not None:
                 break
@@ -187,10 +212,16 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                    if broker_status is not None and i["bootstrap_room"] in broker_status else
                    call("broker_poll", i["bootstrap_room"], rank, pid, "D")["status"] == "SUCCESS"
                    for i in waiting_handoff["requests"]):
-                report(waiting_handoff["batch_id"], "HANDOFF_READY",
-                       {"requests": waiting_handoff["requests"]})
+                if combined and backlog and backlog[0]["kind"] == "PREPARE" and backlog[0]["batch_stage"] == "D":
+                    deferred = (waiting_handoff["batch_id"], "HANDOFF_READY",
+                                {"requests": waiting_handoff["requests"]})
+                else:
+                    report(waiting_handoff["batch_id"], "HANDOFF_READY",
+                           {"requests": waiting_handoff["requests"]})
                 waiting_handoff = None
-        wait_ms = 0 if accepted or (backlog and waiting_handoff is None) else (
+        absorb()
+        skip_poll = (combined or start_reply) and bool(backlog) and waiting_handoff is None
+        wait_ms = 20 if pending_acks else 0 if accepted or (backlog and waiting_handoff is None) else (
             20 if (waiting_bootstrap or waiting_handoff is not None or prepared) else 200)
     if drained:
         call("poll_commands", stage, rank, pid, cursor, cursor)
@@ -236,6 +267,11 @@ def main():
     parser.add_argument("--broker-poll", action="store_true", help="config broker_status_in_poll=true")
     parser.add_argument("--early-terminal", action="store_true", help="config terminal_before_cleanup=true")
     parser.add_argument("--slot-at-cleanup", action="store_true", help="config slot_free_at_cleanup=true")
+    parser.add_argument("--deliver-first", action="store_true", help="config handoff_deliver_first=true")
+    parser.add_argument("--ack-in-poll", action="store_true", help="config handoff_ack_in_poll=true")
+    parser.add_argument("--combined-report", action="store_true", help="config handoff_report_with_ready=true")
+    parser.add_argument("--start-in-reply", action="store_true", help="config start_in_report_reply=true")
+    parser.add_argument("--targeted-wake", action="store_true", help="config targeted_wake=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -266,7 +302,12 @@ def main():
                               register_in_ready=args.register_ready,
                               broker_status_in_poll=args.broker_poll,
                               terminal_before_cleanup=args.early_terminal,
-                              slot_free_at_cleanup=args.slot_at_cleanup)
+                              slot_free_at_cleanup=args.slot_at_cleanup,
+                              handoff_deliver_first=args.deliver_first,
+                              handoff_ack_in_poll=args.ack_in_poll,
+                              handoff_report_with_ready=args.combined_report,
+                              start_in_report_reply=args.start_in_reply,
+                              targeted_wake=args.targeted_wake)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -309,7 +350,8 @@ def main():
     timing = dict(zip(MODELS, zip(per_model(args.prefill_ms, PREFILL_S), per_model(args.decode_ms, DECODE_S))))
     processes = [context.Process(target=rank_main, args=(address, key, controller.group_id(m), m, stage, rank,
                                                          0, stop, timing[m], args.final_step,
-                                                         args.register_ready), daemon=True)
+                                                         args.register_ready, args.ack_in_poll,
+                                                         args.combined_report, args.start_in_reply), daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()

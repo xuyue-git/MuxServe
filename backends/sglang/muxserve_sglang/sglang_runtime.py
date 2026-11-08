@@ -82,6 +82,9 @@ class ControlledScheduler:
         self.history_offsets = {}
         self.handoff_pending = None
         self.pending_report = None
+        self.deferred_report = None  # handoff_report_with_ready
+        self.backlog = []  # commands fetched but not yet accepted
+        self.reply_commands = ()  # start_in_report_reply
         self.drained = False
         require(self.pool.headwise_shared and not scheduler.enable_overlap
                 and scheduler.spec_algorithm.is_none() and self.runner.ps.pp_size == 1
@@ -126,7 +129,21 @@ class ControlledScheduler:
     def sync(self):
         torch.cuda.synchronize(self.runner.gpu_id)
 
+    def _flag(self, name):
+        return getattr(getattr(self.ctx, "config", None), name, False)
+
+    def _absorb_reply_commands(self):
+        """start_in_report_reply: queue a START the owner returned with READY,
+        if it is the next command; anything else arrives by the normal poll."""
+        for command in self.reply_commands:
+            last = self.backlog[-1]["command_seq"] if self.backlog else self.cursor
+            if command["command_seq"] == last + 1:
+                self.backlog.append(command)
+        self.reply_commands = ()
+
     def _report(self, batch_id, kind, payload):
+        if getattr(self, "deferred_report", None) is not None:
+            return self._report_with_deferred(batch_id, kind, payload)
         envelope = (str(self.report_seq + 1), batch_id, kind, deepcopy(payload))
         require(self.pending_report is None or self.pending_report == envelope,
                 "An uncertain report must be replayed before advancing its sequence")
@@ -136,6 +153,21 @@ class ControlledScheduler:
         require(reply["accepted"], "Controller refused a rank report")
         self.report_seq += 1
         self.pending_report = None
+        self.reply_commands = reply.get("commands", ())
+
+    def _report_with_deferred(self, batch_id, kind, payload):
+        """Send the held HANDOFF_READY and this report in one RPC, in order."""
+        first = (str(self.report_seq + 1), *deepcopy(self.deferred_report))
+        second = (str(self.report_seq + 2), batch_id, kind, deepcopy(payload))
+        self.deferred_report = None
+        self.pending_report = first  # an uncertain RPC replays the first report
+        trace.ev("rep_send", first[1], kind=first[2])
+        trace.ev("rep_send", batch_id, kind=kind)
+        reply = self.rpc("rank_reports", self.ctx.stage, self.rank, self.pid, (first, second))
+        require(reply["accepted"], "Controller refused a rank report")
+        self.report_seq += 2
+        self.pending_report = None
+        self.reply_commands = reply.get("commands", ())
 
     @DynamicGradMode()
     def run(self):
@@ -157,19 +189,28 @@ class ControlledScheduler:
             # pending). Long polls ask only for newer commands, and wake early
             # when this group's broker state changes (epoch), so neither idle
             # ranks nor pending handoffs spin on the owner.
-            backlog = []
+            backlog = self.backlog
             epoch = None
             wait_ms = 0
+            # Held commands (a decode PREPARE behind its HANDOFF, a START from
+            # a report reply) run at once: nothing a poll returns gates them.
+            run_held = self._flag("handoff_report_with_ready") or self._flag("start_in_report_reply")
+            skip_poll = False
             while not self.drained:
-                after = backlog[-1]["command_seq"] if backlog else self.cursor
-                reply = self.rpc("poll_commands_wait", self.ctx.stage, self.rank, self.pid,
-                                 after, self.cursor or None, wait_ms, epoch)
-                epoch = reply["epoch"]
-                if "bootstrap_ready" in reply:
-                    self.manager.bootstrap_ready = frozenset(tuple(room) for room in reply["bootstrap_ready"])
-                if "broker_status" in reply:
-                    self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
-                backlog.extend(reply["commands"])
+                if not skip_poll:
+                    after = backlog[-1]["command_seq"] if backlog else self.cursor
+                    acks = tuple(getattr(self.manager, "pending_acks", ()))
+                    reply = self.rpc("poll_commands_wait", self.ctx.stage, self.rank, self.pid,
+                                     after, self.cursor or None, wait_ms, epoch, *((acks,) if acks else ()))
+                    if acks:
+                        del self.manager.pending_acks[:len(acks)]
+                    epoch = reply["epoch"]
+                    if "bootstrap_ready" in reply:
+                        self.manager.bootstrap_ready = frozenset(tuple(room) for room in reply["bootstrap_ready"])
+                    if "broker_status" in reply:
+                        self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
+                    backlog.extend(reply["commands"])
+                skip_poll = False
                 accepted = 0
                 while backlog:
                     # HANDOFF contains a native TP all-reduce. Every rank must
@@ -182,6 +223,7 @@ class ControlledScheduler:
                     trace.ev("acc", tag, kind=command.get("kind"), seq=command.get("command_seq"))
                     self._accept(command)
                     trace.ev("acc_end", tag, kind=command.get("kind"), seq=command.get("command_seq"))
+                    self._absorb_reply_commands()
                     accepted += 1
                     if self.drained or self.handoff_pending is not None:
                         break
@@ -194,7 +236,11 @@ class ControlledScheduler:
                     trace.flush()
                     return
                 self._progress()
-                if accepted or (backlog and self.handoff_pending is None):
+                self._absorb_reply_commands()
+                skip_poll = run_held and bool(backlog) and self.handoff_pending is None
+                if getattr(self.manager, "pending_acks", None):
+                    wait_ms = 20  # this poll carries the ACK and waits for the other ranks
+                elif accepted or (backlog and self.handoff_pending is None):
                     wait_ms = 0
                 elif self.prepared or self.handoff_pending is not None:
                     wait_ms = 20
@@ -550,8 +596,15 @@ class ControlledScheduler:
                     self.sync()
                     trace.ev("ho_sync", state.command["batch_id"])
                     state.handoff_done = True
-                    self._report(state.command["batch_id"], "HANDOFF_READY",
-                                 {"requests": state.handoff["requests"]})
+                    following = self.backlog[0] if self.backlog else {}
+                    if (self._flag("handoff_report_with_ready") and following.get("kind") == "PREPARE"
+                            and following.get("batch_stage") == "D"):
+                        # Sent with that batch's READY (one RPC, not two).
+                        self.deferred_report = (state.command["batch_id"], "HANDOFF_READY",
+                                                {"requests": state.handoff["requests"]})
+                    else:
+                        self._report(state.command["batch_id"], "HANDOFF_READY",
+                                     {"requests": state.handoff["requests"]})
                     # D is not sent the P-only batch QUIESCE. This preparation
                     # owns no forward binding; retain Req, discard batch state.
                     del self.prepared[state.command["batch_id"]]

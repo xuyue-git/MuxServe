@@ -208,6 +208,25 @@ class DeploymentConfig:
     # still holds its KV until the cleanup completes. Requires
     # cleanup_skip_prefill_ranks.
     slot_free_at_cleanup: bool = False
+    # The last prefill GPU_DONE releases the owner lock (so the D ranks can
+    # read their HANDOFF) before reserving the first decode batch, instead of
+    # holding it through that reservation. Requires handoff_prepare_decode.
+    handoff_deliver_first: bool = False
+    # A D rank's broker ACK rides on its next command long-poll, which also
+    # returns the all-rank result: one round trip instead of an ACK RPC and a
+    # poll. The ACK's checks and the all-rank proof before the native
+    # collective are unchanged. Requires broker_status_in_poll.
+    handoff_ack_in_poll: bool = False
+    # A D rank whose next command prepares the first decode batch sends
+    # HANDOFF_READY and that batch's READY in one RPC, and runs commands it
+    # already holds without polling first. Requires handoff_prepare_decode.
+    handoff_report_with_ready: bool = False
+    # The reply to the READY that STARTs a batch carries that rank's START, so
+    # the last rank to report needs no poll to receive it.
+    start_in_report_reply: bool = False
+    # A long-polling rank is woken only by its own command or its group's
+    # broker change, not by every owner state change.
+    targeted_wake: bool = False
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -285,9 +304,16 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "handoff_inline_metadata", "final_step_in_gpu_done", "event_pump_thread",
                  "bootstrap_in_poll", "inline_prepare", "prepare_own_rank_table",
                  "register_in_ready", "broker_status_in_poll", "terminal_before_cleanup",
-                 "slot_free_at_cleanup"):
+                 "slot_free_at_cleanup", "handoff_deliver_first", "handoff_ack_in_poll",
+                 "handoff_report_with_ready", "start_in_report_reply", "targeted_wake"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
+    if config.handoff_deliver_first and not config.handoff_prepare_decode:
+        raise IntegrationError("INVALID_CONFIG", "handoff_deliver_first requires handoff_prepare_decode")
+    if config.handoff_report_with_ready and not config.handoff_prepare_decode:
+        raise IntegrationError("INVALID_CONFIG", "handoff_report_with_ready requires handoff_prepare_decode")
+    if config.handoff_ack_in_poll and not config.broker_status_in_poll:
+        raise IntegrationError("INVALID_CONFIG", "handoff_ack_in_poll requires broker_status_in_poll")
     if config.slot_free_at_cleanup and not config.cleanup_skip_prefill_ranks:
         raise IntegrationError("INVALID_CONFIG", "slot_free_at_cleanup requires cleanup_skip_prefill_ranks")
     if config.handoff_prepare_decode and not (config.inline_start and config.prefill_early_token

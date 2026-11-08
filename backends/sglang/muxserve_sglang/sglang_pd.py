@@ -43,6 +43,7 @@ class SharedHeadwiseKVManager(BaseKVManager):
         # register_in_ready: destinations registered locally, not yet reported
         # (the rank's READY for that prefill batch carries and clears them).
         self.pending_destinations = []
+        self.pending_acks = []  # handoff_ack_in_poll: sent with the next long poll
         # broker_status_in_poll: {room: broker_poll status} from the latest
         # command long-poll (None: not provided, ask the owner).
         self.broker_status = None
@@ -264,9 +265,13 @@ class SharedHeadwiseKVReceiver(_Room, BaseKVReceiver):
         buffers.cached_tokens[self.aux_index].copy_(torch.tensor(payload["cached_tokens"], dtype=torch.int32))
         buffers.bootstrap_room[self.aux_index].zero_()
         buffers.bootstrap_room[self.aux_index, 0] = self.bootstrap_room
-        self.kv_mgr.rpc("broker_ack", self.bootstrap_room, self.kv_mgr.rank, self.kv_mgr.pid,
-                       handoff["allocation_id"], handoff["version"], handoff["valid_tokens"],
-                       handoff["rank_block_table"])
+        if getattr(self.kv_mgr.ctx.config, "handoff_ack_in_poll", False):
+            self.kv_mgr.pending_acks.append((self.bootstrap_room, handoff["allocation_id"], handoff["version"],
+                                             handoff["valid_tokens"], handoff["rank_block_table"]))
+        else:
+            self.kv_mgr.rpc("broker_ack", self.bootstrap_room, self.kv_mgr.rank, self.kv_mgr.pid,
+                           handoff["allocation_id"], handoff["version"], handoff["valid_tokens"],
+                           handoff["rank_block_table"])
         self.validated = True
 
     def poll(self):
