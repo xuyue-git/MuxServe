@@ -285,7 +285,6 @@ def main():
     parser.add_argument("--broker-poll", action="store_true", help="config broker_status_in_poll=true")
     parser.add_argument("--early-terminal", action="store_true", help="config terminal_before_cleanup=true")
     parser.add_argument("--slot-at-cleanup", action="store_true", help="config slot_free_at_cleanup=true")
-    parser.add_argument("--deliver-first", action="store_true", help="config handoff_deliver_first=true")
     parser.add_argument("--ack-in-poll", action="store_true", help="config handoff_ack_in_poll=true")
     parser.add_argument("--combined-report", action="store_true", help="config handoff_report_with_ready=true")
     parser.add_argument("--start-in-reply", action="store_true", help="config start_in_report_reply=true")
@@ -324,7 +323,6 @@ def main():
                               broker_status_in_poll=args.broker_poll,
                               terminal_before_cleanup=args.early_terminal,
                               slot_free_at_cleanup=args.slot_at_cleanup,
-                              handoff_deliver_first=args.deliver_first,
                               handoff_ack_in_poll=args.ack_in_poll,
                               handoff_report_with_ready=args.combined_report,
                               start_in_report_reply=args.start_in_reply,

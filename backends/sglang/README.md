@@ -84,7 +84,9 @@ the commands to run it and `compare_results.py` to compare the results.
 uses 128) lets one D grant cover several consecutive decode forwards. KV for
 the whole run is reserved once; every TP rank reports each step through
 `decode_step`, a token is published once all ranks agree, and one memoized
-continue decision per step keeps ranks in lockstep. A run yields at the next
+continue decision per step keeps ranks in lockstep (with
+`decode_leader_reports`, D rank 0 alone reports a continuing step and the other
+ranks read its decision from shared memory). A run yields at the next
 step boundary when a prefill waits for credits, cancellation/timeout arrives,
 or capacity recovery protects another request. Ranks keep one authenticated
 RPC connection, long-poll their commands, and the driver wakes on controller
@@ -130,6 +132,18 @@ TTFT boundary; the request is not shorter). `tools/run_perf_point.sh` takes
 `INLINE_START=1 SKIP_P=1 EARLY_TOKEN=1`, and `FROZEN_BUNDLE=... WARMUP_TOTAL=128`
 to bench original MuxServe's frozen 512/128 inputs with its 43/43/42 warmup,
 checking every output against the original's tokens.
+
+The remaining opt-in paths are grouped by where they act. Each is documented
+where it is defined in `muxserve_sglang/config.py`; `benchmark/paired_a100.json`
+turns them all on, and `tools/run_perf_point.sh` lists the matching switches.
+
+| Stage | Config keys |
+|---|---|
+| Before the first token | `inline_prepare`, `prepare_own_rank_table`, `register_in_ready`, `bootstrap_in_poll` |
+| Prefill to first decode step | `handoff_prepare_decode`, `handoff_inline_metadata`, `broker_status_in_poll`, `handoff_ack_in_poll`, `handoff_report_with_ready`, `handoff_prepare_after_ack`, `decode_prepare_light` |
+| Decode steps | `decode_leader_reports`, `final_step_in_gpu_done` |
+| Request end | `cleanup_skip_prefill_ranks`, `cleanup_with_quiesce`, `idle_cache_trim_mib`, `terminal_before_cleanup`, `slot_free_at_cleanup` |
+| Control transport | `event_pump_thread`, `start_in_report_reply`, `targeted_wake`, `rpc_inline_fast_methods` |
 
 ## Known limitations
 

@@ -36,8 +36,7 @@
 # BROKER_POLL=1 (broker status in long-poll replies: config broker_status_in_poll=true),
 # EARLY_TERMINAL=1 (TERMINAL when CLEANUP is queued: config terminal_before_cleanup=true),
 # SLOT_AT_CLEANUP=1 (D-only cleanup frees the slot: config slot_free_at_cleanup=true; needs CLEANUP_SKIP_P),
-# DELIVER_FIRST=1 (HANDOFF reaches D before the decode batch is reserved: config
-# handoff_deliver_first=true; needs HANDOFF_PREPARE), ACK_IN_POLL=1 (broker ACK rides on the
+# ACK_IN_POLL=1 (broker ACK rides on the
 # long poll: config handoff_ack_in_poll=true; needs BROKER_POLL), COMBINED_REPORT=1
 # (HANDOFF_READY and READY in one RPC: config handoff_report_with_ready=true; needs
 # HANDOFF_PREPARE), START_IN_REPLY=1 (START in the last READY's reply: config
@@ -45,7 +44,7 @@
 # RPC_INLINE=1 (short control RPCs on the connection thread: config rpc_inline_fast_methods=true),
 # DECODE_LEADER=1 (only D rank 0 reports continuing steps: config decode_leader_reports=true),
 # PREPARE_AFTER_ACK=1 (first decode batch reserved after all ranks saw the ACK: config
-# handoff_prepare_after_ack=true; needs HANDOFF_PREPARE, ACK_IN_POLL; replaces DELIVER_FIRST),
+# handoff_prepare_after_ack=true; needs HANDOFF_PREPARE, ACK_IN_POLL),
 # PREPARE_LIGHT=1 (READY of a decode batch skips GPU read-back: config decode_prepare_light=true),
 # FROZEN_BUNDLE=/abs/frozen-synthetic-512-128.json (original MuxServe's fixed-workload
 # input per model; every output must equal its expected tokens), WARMUP_TOTAL=128
@@ -90,7 +89,6 @@ REGISTER_READY="${REGISTER_READY:-}"
 BROKER_POLL="${BROKER_POLL:-}"
 EARLY_TERMINAL="${EARLY_TERMINAL:-}"
 SLOT_AT_CLEANUP="${SLOT_AT_CLEANUP:-}"
-DELIVER_FIRST="${DELIVER_FIRST:-}"
 ACK_IN_POLL="${ACK_IN_POLL:-}"
 COMBINED_REPORT="${COMBINED_REPORT:-}"
 START_IN_REPLY="${START_IN_REPLY:-}"
@@ -106,13 +104,13 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$DELIVER_FIRST" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
  handoff_prepare, inline_meta, final_step, event_pump, bootstrap_poll,
  inline_prepare, own_table, register_ready, broker_poll, early_terminal,
- slot_at_cleanup, deliver_first, ack_in_poll, combined_report, start_in_reply,
+ slot_at_cleanup, ack_in_poll, combined_report, start_in_reply,
  targeted_wake, rpc_inline, decode_leader, prepare_after_ack, prepare_light) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
@@ -140,7 +138,7 @@ for key, value in (("inline_start", inline), ("decode_skip_prefill_ranks", skip_
                    ("prepare_own_rank_table", own_table), ("register_in_ready", register_ready),
                    ("broker_status_in_poll", broker_poll), ("terminal_before_cleanup", early_terminal),
                    ("slot_free_at_cleanup", slot_at_cleanup),
-                   ("handoff_deliver_first", deliver_first), ("handoff_ack_in_poll", ack_in_poll),
+                   ("handoff_ack_in_poll", ack_in_poll),
                    ("handoff_report_with_ready", combined_report),
                    ("start_in_report_reply", start_in_reply), ("targeted_wake", targeted_wake),
                    ("rpc_inline_fast_methods", rpc_inline), ("decode_leader_reports", decode_leader),
@@ -181,7 +179,6 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "broker_poll=%s" % config.get("broker_status_in_poll", False),
       "early_terminal=%s" % config.get("terminal_before_cleanup", False),
       "slot_at_cleanup=%s" % config.get("slot_free_at_cleanup", False),
-      "deliver_first=%s" % config.get("handoff_deliver_first", False),
       "ack_in_poll=%s" % config.get("handoff_ack_in_poll", False),
       "combined_report=%s" % config.get("handoff_report_with_ready", False),
       "start_in_reply=%s" % config.get("start_in_report_reply", False),

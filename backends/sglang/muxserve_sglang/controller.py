@@ -283,7 +283,7 @@ class MuxController:
         # (ControllerDriver enables it and clears it on pause/failure). An
         # unexpected inline START failure is kept for the driver to raise.
         self._inline_start_allowed = False
-        self._deferred_prepares: list = []  # handoff_deliver_first / handoff_prepare_after_ack
+        self._deferred_prepares: list = []  # handoff_prepare_after_ack
         self._prepare_thread: Thread | None = None  # handoff_prepare_after_ack
         self._inline_starting = False
         self.inline_start_error: BaseException | None = None
@@ -644,7 +644,11 @@ class MuxController:
 
     def _prepare_after_ack(self) -> None:
         try:
-            self._drain_deferred_prepares()
+            with self.lock:
+                pending, self._deferred_prepares = self._deferred_prepares, []
+                for group, batch in pending:
+                    if batch.status == "HANDOFF":
+                        self._prepare_after_handoff(group, batch)
         except Exception as exc:  # surfaced by the driver, like an inline START failure
             with self.lock:
                 self.inline_start_error = exc
@@ -1378,13 +1382,6 @@ class MuxController:
             target.alive, target.exit_code = False, exit_code
             return self.close_ready(group_id)
 
-    def rank_report(self, group_id: str, stage: str, rank: int, pid: int,
-                    report_id: str, batch_id: str, kind: str, payload: dict) -> dict:
-        try:
-            return self._rank_report(group_id, stage, rank, pid, report_id, batch_id, kind, payload)
-        finally:
-            self._prepare_deferred()
-
     def rank_reports(self, group_id: str, stage: str, rank: int, pid: int, reports: tuple | list) -> dict:
         """handoff_report_with_ready: a D rank's HANDOFF_READY and the report
         that followed it, applied in order exactly as two rank_report calls
@@ -1395,28 +1392,11 @@ class MuxController:
                 or reports[0][2] != "HANDOFF_READY"):
             raise IntegrationError("INVALID_REPORT", "HANDOFF_READY and one following report required")
         with self.lock:
-            self._rank_report(group_id, stage, rank, pid, *reports[0])
-            return self._rank_report(group_id, stage, rank, pid, *reports[1])
+            self.rank_report(group_id, stage, rank, pid, *reports[0])
+            return self.rank_report(group_id, stage, rank, pid, *reports[1])
 
-    def _prepare_deferred(self) -> None:
-        """handoff_deliver_first: prepare the first decode batch after the
-        lock was released, so the woken D ranks read their HANDOFF first."""
-        if not self._deferred_prepares or self.config.handoff_prepare_after_ack:
-            return
-        # A plain release/re-acquire would barge past the waiters; PREPARE has
-        # time to spare, since each D rank runs it only after its handoff.
-        time.sleep(0.001)
-        self._drain_deferred_prepares()
-
-    def _drain_deferred_prepares(self) -> None:
-        with self.lock:
-            pending, self._deferred_prepares = self._deferred_prepares, []
-            for group, batch in pending:
-                if batch.status == "HANDOFF":
-                    self._prepare_after_handoff(group, batch)
-
-    def _rank_report(self, group_id: str, stage: str, rank: int, pid: int,
-                     report_id: str, batch_id: str, kind: str, payload: dict) -> dict:
+    def rank_report(self, group_id: str, stage: str, rank: int, pid: int,
+                    report_id: str, batch_id: str, kind: str, payload: dict) -> dict:
         trace.ev("rpt", batch_id, kind=kind, gid=group_id, s=stage, r=rank)
         with self.lock:
             group = self._group(group_id)
@@ -1857,8 +1837,6 @@ class MuxController:
                             "batch": batch, "seen": set(),
                             "rooms": tuple(room for room, entry in group.broker.items()
                                            if entry["batch_id"] == batch.plan.batch_id)}
-                    elif self.config.handoff_deliver_first:
-                        self._deferred_prepares.append((group, batch))
                     else:
                         self._prepare_after_handoff(group, batch)
         else:

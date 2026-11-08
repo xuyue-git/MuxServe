@@ -798,49 +798,6 @@ class HandoffRoundTrips(unittest.TestCase):
     def chained(self, **flags):
         return HandoffFastPaths.chained(self, **flags)
 
-    def flow(self, **flags):
-        sim = Sim(run_steps=4, inline_start=True, prefill_early_token=True, decode_skip_prefill_ranks=True,
-                  handoff_prepare_decode=True, handoff_deliver_first=True, **flags)
-        sim.controller.set_inline_start(True)
-        sim.submit("a", "r", max_new=5)
-        plan, out, reservation = sim.prefill_ready("a", "r")
-        sim.controller.start_batch(sim.group("a"), plan.batch_id)
-        return sim, plan, out, reservation
-
-    def test_handoff_is_readable_before_the_decode_batch_is_reserved(self):
-        sim, plan, out, reservation = self.flow()
-        group = sim.controller.groups["a"]
-        seen = {}
-
-        def during(_):
-            free = []
-
-            def try_lock():
-                free.append(sim.controller.lock.acquire(blocking=False))
-                if free[0]:
-                    sim.controller.lock.release()
-            worker = threading.Thread(target=try_lock)
-            worker.start()
-            worker.join()
-            seen.update(lock_free=free[0], last=sim.commands("a", "D", 0)[-1]["kind"],
-                        decode=[b for b in group.batches.values() if b.plan.stage == "D"])
-        with mock.patch("muxserve_sglang.controller.time.sleep", side_effect=during):
-            stage_and_gpu_done(sim, "a", "r", 11, plan, out, reservation)
-        self.assertEqual((seen["lock_free"], seen["last"], seen["decode"]), (True, "HANDOFF", []))
-        for rank in range(sim.tp):
-            self.assertEqual([c["kind"] for c in sim.commands("a", "D", rank)][-2:], ["HANDOFF", "PREPARE"])
-        self.assertEqual(sim.controller._deferred_prepares, [])
-
-    def test_deferred_prepare_is_dropped_once_the_prefill_left_handoff(self):
-        sim, plan, out, reservation = self.flow()
-        group = sim.controller.groups["a"]
-
-        def during(_):
-            group.batches[plan.batch_id].status = "QUIESCE"
-        with mock.patch("muxserve_sglang.controller.time.sleep", side_effect=during):
-            stage_and_gpu_done(sim, "a", "r", 11, plan, out, reservation)
-        self.assertEqual([b for b in group.batches.values() if b.plan.stage == "D"], [])
-
     def poll(self, sim, rank, wait_ms, epoch, acks=(), stage="D"):
         target = sim.controller.groups["a"].registered[(stage, rank)]
         started = time.monotonic()
@@ -987,7 +944,7 @@ class HandoffRoundTrips(unittest.TestCase):
         chain = dict(inline_start=True, prefill_early_token=True, decode_skip_prefill_ranks=True,
                      handoff_prepare_decode=True)
         config = load()
-        for name in ("handoff_deliver_first", "handoff_ack_in_poll", "handoff_report_with_ready",
+        for name in ("handoff_ack_in_poll", "handoff_report_with_ready",
                      "start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods",
                      "decode_leader_reports", "decode_prepare_light", "handoff_prepare_after_ack"):
             self.assertFalse(getattr(config, name))
@@ -995,7 +952,7 @@ class HandoffRoundTrips(unittest.TestCase):
         for name in ("start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods",
                      "decode_leader_reports", "decode_prepare_light"):
             self.assertTrue(getattr(load(**{name: True}), name))
-        for name in ("handoff_deliver_first", "handoff_report_with_ready"):
+        for name in ("handoff_report_with_ready",):
             expect("INVALID_CONFIG", lambda: load(**{name: True}))
             self.assertTrue(getattr(load(**chain, **{name: True}), name))
         expect("INVALID_CONFIG", lambda: load(handoff_ack_in_poll=True))
@@ -1003,7 +960,6 @@ class HandoffRoundTrips(unittest.TestCase):
         ack = dict(chain, handoff_ack_in_poll=True, broker_status_in_poll=True)
         expect("INVALID_CONFIG", lambda: load(handoff_prepare_after_ack=True))
         expect("INVALID_CONFIG", lambda: load(**chain, handoff_prepare_after_ack=True))
-        expect("INVALID_CONFIG", lambda: load(**ack, handoff_prepare_after_ack=True, handoff_deliver_first=True))
         self.assertTrue(load(**ack, handoff_prepare_after_ack=True).handoff_prepare_after_ack)
 
 
