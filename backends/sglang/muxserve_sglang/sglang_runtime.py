@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 import json
 import os
 import time
+import zlib
 
 import numpy as np
 import torch
@@ -85,6 +86,7 @@ class ControlledScheduler:
         self.deferred_report = None  # handoff_report_with_ready
         self.backlog = []  # commands fetched but not yet accepted
         self.reply_commands = ()  # start_in_report_reply
+        self.step_box = None  # decode_leader_reports
         self.drained = False
         require(self.pool.headwise_shared and not scheduler.enable_overlap
                 and scheduler.spec_algorithm.is_none() and self.runner.ps.pp_size == 1
@@ -519,11 +521,14 @@ class ControlledScheduler:
         views, targets, mode = self._validate_views(command, rows, logical_only)
         if not logical_only:
             batch = state.batch
-            self.sync()
+            light = (getattr(getattr(self.ctx, "config", None), "decode_prepare_light", False)
+                     and mode == "DECODE")
+            if not light:
+                self.sync()
             require(tuple(batch.req_pool_indices_cpu.tolist()) == tuple(rows)
-                    and tuple(batch.req_pool_indices.cpu().tolist()) == tuple(rows)
                     and tuple(batch.seq_lens_cpu.tolist()) == tuple(targets)
-                    and tuple(batch.seq_lens.cpu().tolist()) == tuple(targets),
+                    and (light or (tuple(batch.req_pool_indices.cpu().tolist()) == tuple(rows)
+                                   and tuple(batch.seq_lens.cpu().tolist()) == tuple(targets))),
                     "Native CPU/GPU row/length metadata differs before READY")
             if mode != "DECODE":
                 require(batch.extend_lens == targets and batch.prefix_lens == [0] * len(rows),
@@ -688,6 +693,13 @@ class ControlledScheduler:
         gpu_forward_ms = 0.0
         step = 1
         final_step = None
+        leader_only = self._flag("decode_leader_reports")
+        digest = 0
+        tag = zlib.crc32(command["batch_id"].encode())
+        if leader_only and self.step_box is None:
+            from .step_box import StepBox
+            self.step_box = StepBox(os.path.join(str(self.ctx.runtime_dir),
+                                                 "stepbox-%08x" % zlib.crc32(self.ctx.group_id.encode())))
         while True:
             previous_output_counts = [len(req.output_ids) for req in state.reqs]
             self.s.cur_batch_for_debug = state.batch
@@ -714,13 +726,22 @@ class ControlledScheduler:
                         "token_id": req.output_ids[-1], "valid_tokens": valid + step}
                        for req, item, valid in zip(state.reqs, state.command["requests"], start_valid)]
             finished = any(req.finished() for req in state.reqs)
+            if leader_only:
+                digest = zlib.crc32(",".join(str(item["token_id"]) for item in results).encode(), digest)
             if (finished or step >= steps) and getattr(getattr(self.ctx, "config", None), "final_step_in_gpu_done", False):
                 # The owner's decision for a locally final step is always to
                 # stop: report the step inside GPU_DONE (one RPC, not two).
                 final_step = {"step": step, "results": results, "finished": finished}
                 break
-            reply = self.rpc("decode_step", self.rank, self.pid, command["batch_id"], step,
-                             results, finished)
+            continuing = not (finished or step >= steps)
+            if (leader_only and continuing and self.rank != 0
+                    and self.step_box.wait(tag, step, self.ctx.config.prepare_timeout_ms / 1000)):
+                reply = {"continue": True}
+            else:
+                reply = self.rpc("decode_step", self.rank, self.pid, command["batch_id"], step,
+                                 results, finished)
+                if leader_only and continuing and self.rank == 0:
+                    self.step_box.publish(tag, step, reply.get("continue") is True)
             while reply.get("continue") == "PARK":
                 # Parked for a waiting prefill: the GPU is idle (synchronized
                 # above) and every native/KV state stays as it is.
@@ -733,6 +754,8 @@ class ControlledScheduler:
         payload = {"reservation_id": state.command["reservation_id"], "results": results,
                    "gpu_forward_ms": gpu_forward_ms, "duration_ms": (time.monotonic() - start) * 1000,
                    "steps": step}
+        if leader_only:
+            payload["token_digest"] = digest
         if final_step is not None:
             payload["final_step"] = final_step
         self._report(command["batch_id"], "GPU_DONE", payload)

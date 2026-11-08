@@ -212,7 +212,8 @@ def p_timeline(batch):
 def step_done(batch, ranks):
     out = {}
     for step, by_rank in batch.dstep.items():
-        if len(by_rank) >= ranks:
+        # decode_leader_reports: a continuing step is reported by rank 0 only.
+        if len(by_rank) >= ranks or list(by_rank) == [0]:
             out[step] = max(by_rank.values())
     return out
 

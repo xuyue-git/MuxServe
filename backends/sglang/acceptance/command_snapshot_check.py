@@ -132,6 +132,34 @@ class SnapshotChecks(unittest.TestCase):
             with self.assertRaisesRegex(IntegrationError, 'Nonlocal block rejected'):
                 ready(worker, state())
 
+    def test_light_decode_ready_checks_cpu_metadata_without_gpu_reads(self):
+        def require(ok, message, code=None):
+            if not ok:
+                raise IntegrationError(code or 'INVALID', message)
+        def forbidden(*args):
+            raise AssertionError('Light decode READY touched the GPU')
+        reported = []
+        namespace = dict(__package__='muxserve_sglang', require=require)
+        ready = runtime_method('_ready', namespace)
+        cpu = lambda values: SimpleNamespace(tolist=lambda: values)
+        gpu = SimpleNamespace(cpu=forbidden)
+        def worker(batch):
+            return SimpleNamespace(pool=SimpleNamespace(_bound=None), sync=forbidden,
+                ctx=SimpleNamespace(stage='D', config=SimpleNamespace(decode_prepare_light=True)),
+                _validate_views=lambda *args: (None, [17], 'DECODE'),
+                _report=lambda *args: reported.append(args))
+        def state(batch):
+            return SimpleNamespace(batch=batch, ready=False, reqs=[SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))],
+                                   command=dict(batch_id='b', batch_stage='D', reservation_id='r', requests=[{}]))
+        good = SimpleNamespace(req_pool_indices_cpu=cpu([0]), seq_lens_cpu=cpu([17]),
+                               req_pool_indices=gpu, seq_lens=gpu)
+        ready(worker(good), state(good))
+        self.assertEqual(len(reported), 1)
+        wrong = SimpleNamespace(req_pool_indices_cpu=cpu([0]), seq_lens_cpu=cpu([18]),
+                                req_pool_indices=gpu, seq_lens=gpu)
+        with self.assertRaisesRegex(IntegrationError, 'metadata differs'):
+            ready(worker(wrong), state(wrong))
+
     def test_prepare_publication_and_replay_are_detached_without_python_table_copy(self):
         fixture = Fixture()
         group = fixture.controller.groups['m']

@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +40,8 @@ def token_for(output_count: int) -> int:
 
 
 def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False,
-              register_ready=False, ack_in_poll=False, combined=False, start_reply=False):
+              register_ready=False, ack_in_poll=False, combined=False, start_reply=False,
+              leader_reports=False):
     """final_step: config final_step_in_gpu_done (a locally final run step is
     reported inside GPU_DONE). HANDOFF native_metadata and long-poll
     bootstrap_ready are used whenever the owner provides them."""
@@ -51,6 +53,10 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
     call("register_rank", stage, rank, pid, {"vocab_size": 32000, "eos_token_ids": (2,),
                                              "native_pd": True, "headwise_kv": True})
     report_seq = 0
+    box = None
+    if leader_reports:
+        from muxserve_sglang.step_box import StepBox
+        box = StepBox(os.path.join(os.path.dirname(address), "stepbox-" + model))
     deferred, pending_acks, reply_commands = None, [], ()
     def report(batch_id, kind, payload):
         nonlocal report_seq, deferred, reply_commands
@@ -140,6 +146,8 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                     steps = prep.get("run_steps", 1)
                     step = 1
                     final = None
+                    digest = 0
+                    tag = zlib.crc32(command["batch_id"].encode())
                     while True:
                         time.sleep(decode_s)
                         results = [{"request_id": i["request_id"], "attempt": i["attempt"],
@@ -149,10 +157,18 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                             break
                         finished = any(len(i["output_token_ids"]) + step >= i["max_new_tokens"]
                                        for i in prep["requests"])
+                        if box is not None:
+                            digest = zlib.crc32(",".join(str(item["token_id"]) for item in results).encode(), digest)
                         if final_step and (finished or step >= steps):
                             final = {"step": step, "results": results, "finished": finished}
                             break
-                        decision = call("decode_step", rank, pid, command["batch_id"], step, results, finished)
+                        continuing = not (finished or step >= steps)
+                        if box is not None and continuing and rank != 0 and box.wait(tag, step, 30):
+                            decision = {"continue": True}
+                        else:
+                            decision = call("decode_step", rank, pid, command["batch_id"], step, results, finished)
+                            if box is not None and continuing and rank == 0:
+                                box.publish(tag, step, decision["continue"] is True)
                         while decision["continue"] == "PARK":
                             decision = call("decode_resume", rank, pid, command["batch_id"], step, 100)
                         if finished or step >= steps or decision["continue"] is not True:
@@ -163,6 +179,8 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                                "gpu_forward_ms": decode_s * 1000 * step}
                     if steps > 1:
                         payload["steps"] = step
+                    if box is not None and steps > 1:
+                        payload["token_digest"] = digest
                     if final is not None:
                         payload["final_step"] = final
                 report(command["batch_id"], "GPU_DONE", payload)
@@ -273,6 +291,8 @@ def main():
     parser.add_argument("--start-in-reply", action="store_true", help="config start_in_report_reply=true")
     parser.add_argument("--targeted-wake", action="store_true", help="config targeted_wake=true")
     parser.add_argument("--rpc-inline", action="store_true", help="config rpc_inline_fast_methods=true")
+    parser.add_argument("--decode-leader", action="store_true", help="config decode_leader_reports=true")
+    parser.add_argument("--prepare-after-ack", action="store_true", help="config handoff_prepare_after_ack=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -309,7 +329,9 @@ def main():
                               handoff_report_with_ready=args.combined_report,
                               start_in_report_reply=args.start_in_reply,
                               targeted_wake=args.targeted_wake,
-                              rpc_inline_fast_methods=args.rpc_inline)
+                              rpc_inline_fast_methods=args.rpc_inline,
+                              decode_leader_reports=args.decode_leader,
+                              handoff_prepare_after_ack=args.prepare_after_ack)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -354,7 +376,8 @@ def main():
     processes = [context.Process(target=rank_main, args=(address, key, controller.group_id(m), m, stage, rank,
                                                          0, stop, timing[m], args.final_step,
                                                          args.register_ready, args.ack_in_poll,
-                                                         args.combined_report, args.start_in_reply), daemon=True)
+                                                         args.combined_report, args.start_in_reply,
+                                                         args.decode_leader), daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()

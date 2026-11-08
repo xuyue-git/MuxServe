@@ -988,16 +988,194 @@ class HandoffRoundTrips(unittest.TestCase):
                      handoff_prepare_decode=True)
         config = load()
         for name in ("handoff_deliver_first", "handoff_ack_in_poll", "handoff_report_with_ready",
-                     "start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods"):
+                     "start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods",
+                     "decode_leader_reports", "decode_prepare_light", "handoff_prepare_after_ack"):
             self.assertFalse(getattr(config, name))
             expect("INVALID_CONFIG", lambda: load(**{name: 1}))
-        for name in ("start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods"):
+        for name in ("start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods",
+                     "decode_leader_reports", "decode_prepare_light"):
             self.assertTrue(getattr(load(**{name: True}), name))
         for name in ("handoff_deliver_first", "handoff_report_with_ready"):
             expect("INVALID_CONFIG", lambda: load(**{name: True}))
             self.assertTrue(getattr(load(**chain, **{name: True}), name))
         expect("INVALID_CONFIG", lambda: load(handoff_ack_in_poll=True))
         self.assertTrue(load(handoff_ack_in_poll=True, broker_status_in_poll=True).handoff_ack_in_poll)
+        ack = dict(chain, handoff_ack_in_poll=True, broker_status_in_poll=True)
+        expect("INVALID_CONFIG", lambda: load(handoff_prepare_after_ack=True))
+        expect("INVALID_CONFIG", lambda: load(**chain, handoff_prepare_after_ack=True))
+        expect("INVALID_CONFIG", lambda: load(**ack, handoff_prepare_after_ack=True, handoff_deliver_first=True))
+        self.assertTrue(load(**ack, handoff_prepare_after_ack=True).handoff_prepare_after_ack)
+
+
+class PrepareAfterAck(unittest.TestCase):
+    def flow(self):
+        sim = Sim(run_steps=4, inline_start=True, prefill_early_token=True, decode_skip_prefill_ranks=True,
+                  handoff_prepare_decode=True, handoff_prepare_after_ack=True, handoff_ack_in_poll=True,
+                  broker_status_in_poll=True)
+        sim.controller.set_inline_start(True)
+        sim.submit("a", "r", max_new=5)
+        plan, out, reservation = sim.prefill_ready("a", "r")
+        sim.controller.start_batch(sim.group("a"), plan.batch_id)
+        stage_and_gpu_done(sim, "a", "r", 11, plan, out, reservation)
+        return sim, plan
+
+    def poll(self, sim, rank, acks=()):
+        return HandoffRoundTrips.poll(self, sim, rank, 0, None, acks)[0]
+
+    def decoding(self, sim):
+        return [b for b in sim.controller.groups["a"].batches.values() if b.plan.stage == "D"]
+
+    def test_decode_batch_is_reserved_only_after_every_rank_saw_the_ack(self):
+        sim, plan = self.flow()
+        self.assertEqual(self.decoding(sim), [])
+        room = HandoffRoundTrips.acks(self, sim, 0)[0][0]
+        self.assertEqual(dict(self.poll(sim, 0, HandoffRoundTrips.acks(self, sim, 0))["broker_status"]), {room: "PENDING"})
+        self.assertEqual(dict(self.poll(sim, 1, HandoffRoundTrips.acks(self, sim, 1))["broker_status"]), {room: "SUCCESS"})
+        self.assertIsNone(sim.controller._prepare_thread)  # rank 0 has not read SUCCESS yet
+        self.assertEqual(self.decoding(sim), [])
+        self.assertEqual(dict(self.poll(sim, 0)["broker_status"]), {room: "SUCCESS"})
+        sim.controller._prepare_thread.join(2)
+        (decode,) = self.decoding(sim)
+        self.assertEqual(decode.status, "PREPARING")
+        for rank in range(sim.tp):
+            self.assertEqual([c["kind"] for c in sim.commands("a", "D", rank)][-2:], ["HANDOFF", "PREPARE"])
+        self.assertEqual(sim.controller.groups["a"].ack_gates, {})
+
+    def test_gate_is_dropped_once_the_prefill_left_handoff(self):
+        sim, plan = self.flow()
+        group = sim.controller.groups["a"]
+        group.batches[plan.batch_id].status = "QUIESCE"
+        self.poll(sim, 0)
+        self.assertEqual(group.ack_gates, {})
+        self.assertIsNone(sim.controller._prepare_thread)
+        self.assertEqual(self.decoding(sim), [])
+
+
+class LeaderReports(unittest.TestCase):
+    def decode(self, *models, **flags):
+        sim = Sim(models or ("a",), run_steps=4, decode_leader_reports=True, **flags)
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 4)
+        return sim, plan, reservation
+
+    def done(self, sim, plan, reservation, digests, steps=4, token=15, **extra):
+        rid = plan.requests[0].request_id
+        start = sim.controller.groups["a"].batches[plan.batch_id].run_start_valid[rid]
+        for rank in range(sim.tp):
+            payload = {"reservation_id": reservation, "duration_ms": 2.0, "gpu_forward_ms": 1.0, "steps": steps,
+                       "results": [{"request_id": rid, "attempt": plan.requests[0].attempt,
+                                    "token_id": token, "valid_tokens": start + steps}]}
+            if digests is not None:
+                payload["token_digest"] = digests[rank]
+            sim.report("a", "D", rank, plan.batch_id, "GPU_DONE", payload)
+
+    def output(self, sim):
+        return sim.controller.requests[("a", "r")].output
+
+    def test_leader_publishes_each_continuing_step_alone(self):
+        sim, plan, reservation = self.decode()
+        for step, token in enumerate((12, 13, 14), start=1):
+            self.assertIs(sim.step("a", plan, 0, step, token)["continue"], True)
+            self.assertEqual(self.output(sim)[-1], token)
+        self.assertEqual(sim.controller.groups["a"].batches[plan.batch_id].run_reports[3].keys(), {0})
+        for rank in range(sim.tp):  # the locally final step is reported by every rank
+            self.assertIs(sim.step("a", plan, rank, 4, 15, finished=True)["continue"], False)
+        self.assertEqual(self.output(sim), [11, 12, 13, 14, 15])
+        self.done(sim, plan, reservation, [7, 7])
+        self.assertEqual(sim.controller.groups["a"].batches[plan.batch_id].status, "QUIESCE")
+
+    def test_non_leader_final_report_first_does_not_publish(self):
+        sim, plan, reservation = self.decode()
+        for step, token in enumerate((12, 13, 14), start=1):
+            sim.step("a", plan, 0, step, token)
+        sim.step("a", plan, 1, 4, 15, finished=True)
+        self.assertEqual(self.output(sim)[-1], 14)
+        sim.step("a", plan, 0, 4, 15, finished=True)
+        self.assertEqual(self.output(sim)[-1], 15)
+
+    def test_steps_must_be_granted_in_order(self):
+        sim, plan, reservation = self.decode()
+        expect("REPORT_GAP", lambda: sim.step("a", plan, 0, 2, 13))
+        sim.step("a", plan, 0, 1, 12)
+        expect("REPORT_GAP", lambda: sim.step("a", plan, 0, 3, 14))
+        expect("REPORT_GAP", lambda: sim.step("a", plan, 1, 3, 14))  # step 2 has no decision yet
+
+    def test_without_the_switch_every_rank_must_report(self):
+        sim = Sim(run_steps=4)
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 4)
+        sim.step("a", plan, 0, 1, 12)
+        self.assertEqual(self.output(sim), [11])
+        sim.step("a", plan, 1, 1, 12)
+        self.assertEqual(self.output(sim), [11, 12])
+
+    def test_a_park_is_still_reported_by_every_rank(self):
+        sim = Sim(("a", "b"), run_steps=8, park=True, decode_leader_reports=True)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        self.assertIs(sim.step("a", plan, 0, 1, 12)["continue"], True)
+        sim.submit("b", "x", max_new=4)
+        sim.prefill_ready("b", "x")
+        credits = sim.controller.credits
+        self.assertEqual(sim.step("a", plan, 0, 2, 13)["continue"], "PARK")
+        self.assertIn(plan.batch_id, credits.leases)  # rank 1 has not finished step 2 yet
+        self.assertEqual(sim.step("a", plan, 1, 2, 13)["continue"], "PARK")  # the rank asks: replayed
+        self.assertNotIn(plan.batch_id, credits.leases)
+        self.assertEqual(self.output(sim), [11, 12, 13])
+        self.assertEqual(sim.resume("a", plan, 1, 2), "PARK")
+
+    def test_token_digests_must_agree_and_are_required(self):
+        sim, plan, reservation = self.decode()
+        for step, token in enumerate((12, 13, 14), start=1):
+            sim.step("a", plan, 0, step, token)
+        for rank in range(sim.tp):
+            sim.step("a", plan, rank, 4, 15, finished=True)
+        expect("INVALID_REPORT", lambda: self.done(sim, plan, reservation, None))
+        expect("IDENTITY_CONFLICT", lambda: self.done(sim, plan, reservation, [7, 8]))
+        self.assertIsNotNone(sim.controller.groups["a"].fenced)
+
+    def test_digest_is_refused_without_the_switch(self):
+        sim = Sim(run_steps=4)
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 4)
+        for step, token in enumerate((12, 13, 14, 15), start=1):
+            for rank in range(sim.tp):
+                sim.step("a", plan, rank, step, token, finished=step == 4)
+        expect("INVALID_REPORT", lambda: self.done(sim, plan, reservation, [7, 7]))
+
+
+class StepBoxChecks(unittest.TestCase):
+    def box(self):
+        import tempfile
+        from muxserve_sglang.step_box import StepBox
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = directory.name + "/box"
+        return StepBox(path), StepBox(path)
+
+    def test_verdicts_reach_another_mapping_of_the_same_file(self):
+        leader, follower = self.box()
+        leader.publish(0xABCD1234, 7, True)
+        self.assertIs(follower.wait(0xABCD1234, 7, 1), True)
+        leader.publish(0xABCD1234, 8, False)
+        self.assertIs(follower.wait(0xABCD1234, 8, 1), False)
+
+    def test_another_batch_or_step_is_not_accepted(self):
+        leader, follower = self.box()
+        leader.publish(1, 7, True)
+        for tag, step in ((2, 7), (1, 8)):
+            expect("STEP_BOX_TIMEOUT", lambda: follower.wait(tag, step, 0.02))
+
+    def test_waiter_sees_a_later_publish(self):
+        leader, follower = self.box()
+        timer = threading.Timer(0.01, leader.publish, (5, 1, True))
+        timer.start()
+        self.assertIs(follower.wait(5, 1, 2), True)
+        timer.join()
 
 
 class RpcInlineMethods(unittest.TestCase):

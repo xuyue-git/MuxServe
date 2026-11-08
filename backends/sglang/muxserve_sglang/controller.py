@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import dataclass, field
-from threading import Condition, Event, RLock
+from threading import Condition, Event, RLock, Thread
 import math
 import time
 from typing import Any
@@ -31,6 +31,7 @@ _REPORT_WINDOW = 4096
 _INT64_MAX = (1 << 63) - 1
 # A parked decode run ends normally if it could not resume within this.
 _PARK_LIMIT_S = 2.0
+_LEADER_RANK = 0  # decode_leader_reports: the D rank that reports every step
 
 
 class _RetiredIds:
@@ -198,6 +199,9 @@ class _Group:
     uncertain_batches: set[str] = field(default_factory=set)
     # Bumped whenever broker state that a waiting rank may poll changes.
     epoch: int = 0
+    # handoff_prepare_after_ack: prefills waiting for every D rank to see the
+    # all-rank ACK before their first decode batch is reserved.
+    ack_gates: dict[str, dict] = field(default_factory=dict)
 
     @property
     def required(self) -> set[tuple[str, int]]:
@@ -279,7 +283,8 @@ class MuxController:
         # (ControllerDriver enables it and clears it on pause/failure). An
         # unexpected inline START failure is kept for the driver to raise.
         self._inline_start_allowed = False
-        self._deferred_prepares: list = []  # handoff_deliver_first
+        self._deferred_prepares: list = []  # handoff_deliver_first / handoff_prepare_after_ack
+        self._prepare_thread: Thread | None = None  # handoff_prepare_after_ack
         self._inline_starting = False
         self.inline_start_error: BaseException | None = None
         self.inline_start_count = 0
@@ -613,7 +618,38 @@ class MuxController:
                      "SUCCESS" if entry["state"] == "PUBLISHED" and entry["acked"] == set(group.ranks)
                      else "PENDING")
                     for room, entry in group.broker.items())
+                if group.ack_gates and stage == "D":
+                    self._note_ack_seen(group, rank)
             return reply
+
+    def _note_ack_seen(self, group: _Group, rank: int) -> None:
+        """Caller holds the lock; this D rank's reply reports the broker state.
+        Once every rank has seen the all-rank ACK they all work locally (pop,
+        prebuilt, sync), so reserving the decode batch now delays nobody."""
+        for batch_id, gate in tuple(group.ack_gates.items()):
+            if gate["batch"].status != "HANDOFF" or group.fenced:
+                del group.ack_gates[batch_id]
+                continue
+            entries = [group.broker.get(room) for room in gate["rooms"]]
+            if not all(entry is not None and entry["state"] == "PUBLISHED"
+                       and entry["acked"] == set(group.ranks) for entry in entries):
+                continue
+            gate["seen"].add(rank)
+            if len(gate["seen"]) == len(group.ranks):
+                del group.ack_gates[batch_id]
+                self._deferred_prepares.append((group, gate["batch"]))
+                # Its own thread: the polling rank's reply must not wait for it.
+                self._prepare_thread = Thread(target=self._prepare_after_ack, name="handoff-prepare", daemon=True)
+                self._prepare_thread.start()
+
+    def _prepare_after_ack(self) -> None:
+        try:
+            self._drain_deferred_prepares()
+        except Exception as exc:  # surfaced by the driver, like an inline START failure
+            with self.lock:
+                self.inline_start_error = exc
+                self._inline_start_allowed = False
+            self.wake.set()
 
     def submit_request(self, spec: RequestSpec, *, initialization_token: str | None = None) -> dict:
         trace.ev("submit", None, m=getattr(spec, "model_id", None), req=getattr(spec, "request_id", None))
@@ -1365,11 +1401,14 @@ class MuxController:
     def _prepare_deferred(self) -> None:
         """handoff_deliver_first: prepare the first decode batch after the
         lock was released, so the woken D ranks read their HANDOFF first."""
-        if not self._deferred_prepares:
+        if not self._deferred_prepares or self.config.handoff_prepare_after_ack:
             return
         # A plain release/re-acquire would barge past the waiters; PREPARE has
         # time to spare, since each D rank runs it only after its handoff.
         time.sleep(0.001)
+        self._drain_deferred_prepares()
+
+    def _drain_deferred_prepares(self) -> None:
         with self.lock:
             pending, self._deferred_prepares = self._deferred_prepares, []
             for group, batch in pending:
@@ -1680,6 +1719,8 @@ class MuxController:
         keys = {"reservation_id", "results", "duration_ms", "gpu_forward_ms"}
         if batch.plan.steps > 1:
             keys = keys | {"steps"}
+            if self.config.decode_leader_reports:
+                keys = keys | {"token_digest"}
         if set(payload) != keys or payload["reservation_id"] != batch.reservation.reservation_id:
             raise IntegrationError("INVALID_REPORT", "GPU_DONE schema/reservation mismatch")
         steps_done = 1
@@ -1735,7 +1776,9 @@ class MuxController:
                 self._fence(group, batch, "gpu_result_conflict")
                 raise IntegrationError("IDENTITY_CONFLICT", "Rank GPU result changed")
             return
-        if batch.gpu and next(iter(batch.gpu.values()))["results"] != payload["results"]:
+        first = next(iter(batch.gpu.values()), None)
+        if first is not None and (first["results"] != payload["results"]
+                                  or first.get("token_digest") != payload.get("token_digest")):
             self._fence(group, batch, "cross_rank_token_conflict")
             raise IntegrationError("IDENTITY_CONFLICT", "Greedy ranks disagree")
         batch.gpu[rank] = deepcopy(payload)
@@ -1809,7 +1852,12 @@ class MuxController:
                 self._apply_tokens(group, batch, settle=False)
                 batch.tokens_published = True
                 if self.config.handoff_prepare_decode and batch.plan.purpose == "GENERATE":
-                    if self.config.handoff_deliver_first:
+                    if self.config.handoff_prepare_after_ack:
+                        group.ack_gates[batch.plan.batch_id] = {
+                            "batch": batch, "seen": set(),
+                            "rooms": tuple(room for room, entry in group.broker.items()
+                                           if entry["batch_id"] == batch.plan.batch_id)}
+                    elif self.config.handoff_deliver_first:
                         self._deferred_prepares.append((group, batch))
                     else:
                         self._prepare_after_handoff(group, batch)
@@ -1933,8 +1981,10 @@ class MuxController:
                 self._fence(group, batch, "decode_step_conflict")
                 raise IntegrationError("IDENTITY_CONFLICT", "Decode step replay changed")
             return batch.run_decisions.get(step, False)
-        if step > 1 and (rank not in batch.run_reports.get(step - 1, {})
-                         or batch.run_decisions.get(step - 1) is not True):
+        leader_only = self.config.decode_leader_reports
+        previous_reported = (rank in batch.run_reports.get(step - 1, {})
+                             or (leader_only and rank != _LEADER_RANK))
+        if step > 1 and (not previous_reported or batch.run_decisions.get(step - 1) is not True):
             raise IntegrationError("REPORT_GAP", "Decode step was not granted")
         for ref, result in zip(batch.plan.requests, entry[0]):
             if (not isinstance(result, dict)
@@ -1951,8 +2001,8 @@ class MuxController:
         batch.run_reports[step] = reported
         batch.progress_at = self.clock()
         applied = False
-        if (len(reported) == len(group.ranks) and batch.run_applied == step - 1
-                and batch.status == "RUNNING"):
+        complete = _LEADER_RANK in reported if leader_only else len(reported) == len(group.ranks)
+        if complete and batch.run_applied == step - 1 and batch.status == "RUNNING":
             self._apply_run_step(group, batch, step, entry[0])
             applied = True
         decision = batch.run_decisions.get(step)

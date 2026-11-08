@@ -232,6 +232,19 @@ class DeploymentConfig:
     # new thread per call, and its sockets read and write before polling. Their
     # waits are already bounded; every other RPC keeps its worker and deadline.
     rpc_inline_fast_methods: bool = False
+    # Only D rank 0 reports a continuing decode step; the other ranks read its
+    # decision from shared memory and report only when it is not "continue".
+    # Each rank's token digest is compared at GPU_DONE instead of every step.
+    decode_leader_reports: bool = False
+    # The first decode batch is reserved once every D rank has seen that all
+    # ranks ACKed the handoff, so the reservation no longer holds the owner
+    # lock while they read HANDOFF and ACK. Requires handoff_prepare_decode and
+    # handoff_ack_in_poll; replaces handoff_deliver_first.
+    handoff_prepare_after_ack: bool = False
+    # READY of a decode batch checks the CPU copies of its row/length metadata
+    # and skips the GPU read-back and synchronize; those tensors were just
+    # built from the same CPU values on this rank.
+    decode_prepare_light: bool = False
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -311,9 +324,15 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "register_in_ready", "broker_status_in_poll", "terminal_before_cleanup",
                  "slot_free_at_cleanup", "handoff_deliver_first", "handoff_ack_in_poll",
                  "handoff_report_with_ready", "start_in_report_reply", "targeted_wake",
-                 "rpc_inline_fast_methods"):
+                 "rpc_inline_fast_methods", "decode_leader_reports", "handoff_prepare_after_ack",
+                 "decode_prepare_light"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
+    if config.handoff_prepare_after_ack and not (config.handoff_prepare_decode and config.handoff_ack_in_poll):
+        raise IntegrationError("INVALID_CONFIG", "handoff_prepare_after_ack requires handoff_prepare_decode "
+                                                 "and handoff_ack_in_poll")
+    if config.handoff_prepare_after_ack and config.handoff_deliver_first:
+        raise IntegrationError("INVALID_CONFIG", "handoff_prepare_after_ack replaces handoff_deliver_first")
     if config.handoff_deliver_first and not config.handoff_prepare_decode:
         raise IntegrationError("INVALID_CONFIG", "handoff_deliver_first requires handoff_prepare_decode")
     if config.handoff_report_with_ready and not config.handoff_prepare_decode:
