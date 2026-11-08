@@ -32,6 +32,10 @@
 # BOOTSTRAP_POLL=1 (P bootstrap readiness in long-poll replies: config bootstrap_in_poll=true),
 # INLINE_PREPARE=1 (prefill prepared at submit: config inline_prepare=true; needs INLINE_START),
 # OWN_TABLE=1 (PREPARE carries/validates the receiving rank's table: config prepare_own_rank_table=true),
+# REGISTER_READY=1 (D destinations ride in READY: config register_in_ready=true),
+# BROKER_POLL=1 (broker status in long-poll replies: config broker_status_in_poll=true),
+# EARLY_TERMINAL=1 (TERMINAL when CLEANUP is queued: config terminal_before_cleanup=true),
+# SLOT_AT_CLEANUP=1 (D-only cleanup frees the slot: config slot_free_at_cleanup=true; needs CLEANUP_SKIP_P),
 # FROZEN_BUNDLE=/abs/frozen-synthetic-512-128.json (original MuxServe's fixed-workload
 # input per model; every output must equal its expected tokens), WARMUP_TOTAL=128
 # (warmup split 43/43/42 over the models as the original; overrides WARMUP),
@@ -71,6 +75,10 @@ EVENT_PUMP="${EVENT_PUMP:-}"
 BOOTSTRAP_POLL="${BOOTSTRAP_POLL:-}"
 INLINE_PREPARE="${INLINE_PREPARE:-}"
 OWN_TABLE="${OWN_TABLE:-}"
+REGISTER_READY="${REGISTER_READY:-}"
+BROKER_POLL="${BROKER_POLL:-}"
+EARLY_TERMINAL="${EARLY_TERMINAL:-}"
+SLOT_AT_CLEANUP="${SLOT_AT_CLEANUP:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -78,12 +86,13 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
  handoff_prepare, inline_meta, final_step, event_pump, bootstrap_poll,
- inline_prepare, own_table) = sys.argv[1:]
+ inline_prepare, own_table, register_ready, broker_poll, early_terminal,
+ slot_at_cleanup) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -107,7 +116,9 @@ for key, value in (("inline_start", inline), ("decode_skip_prefill_ranks", skip_
                    ("handoff_prepare_decode", handoff_prepare), ("handoff_inline_metadata", inline_meta),
                    ("final_step_in_gpu_done", final_step), ("event_pump_thread", event_pump),
                    ("bootstrap_in_poll", bootstrap_poll), ("inline_prepare", inline_prepare),
-                   ("prepare_own_rank_table", own_table)):
+                   ("prepare_own_rank_table", own_table), ("register_in_ready", register_ready),
+                   ("broker_status_in_poll", broker_poll), ("terminal_before_cleanup", early_terminal),
+                   ("slot_free_at_cleanup", slot_at_cleanup)):
     config.pop(key, None)
     if value:
         config[key] = True
@@ -139,7 +150,11 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "event_pump=%s" % config.get("event_pump_thread", False),
       "bootstrap_poll=%s" % config.get("bootstrap_in_poll", False),
       "inline_prepare=%s" % config.get("inline_prepare", False),
-      "own_table=%s" % config.get("prepare_own_rank_table", False))
+      "own_table=%s" % config.get("prepare_own_rank_table", False),
+      "register_ready=%s" % config.get("register_in_ready", False),
+      "broker_poll=%s" % config.get("broker_status_in_poll", False),
+      "early_terminal=%s" % config.get("terminal_before_cleanup", False),
+      "slot_at_cleanup=%s" % config.get("slot_free_at_cleanup", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

@@ -167,6 +167,8 @@ class ControlledScheduler:
                 epoch = reply["epoch"]
                 if "bootstrap_ready" in reply:
                     self.manager.bootstrap_ready = frozenset(tuple(room) for room in reply["bootstrap_ready"])
+                if "broker_status" in reply:
+                    self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
                 backlog.extend(reply["commands"])
                 accepted = 0
                 while backlog:
@@ -483,7 +485,18 @@ class ControlledScheduler:
         else:
             self.sync()  # logical preallocation writes must complete before READY
         state.ready = True
-        self._report(command["batch_id"], "READY", {"reservation_id": command["reservation_id"]})
+        payload = {"reservation_id": command["reservation_id"]}
+        if (getattr(getattr(self.ctx, "config", None), "register_in_ready", False)
+                and self.ctx.stage == "D" and command["batch_stage"] == "P"):
+            # register_in_ready: this batch's destinations, registered locally
+            # by _prepare just before, are registered by the owner with READY.
+            rooms = {item["bootstrap_room"] for item in command["requests"]}
+            pending = self.manager.pending_destinations
+            require({d["room"] for d in pending} == rooms and len(pending) == len(rooms),
+                    "READY destinations differ from the prefill selection")
+            payload["destinations"] = tuple(pending)
+            self.manager.pending_destinations = []
+        self._report(command["batch_id"], "READY", payload)
 
     def _progress(self):
         for state in tuple(self.prepared.values()):

@@ -40,6 +40,12 @@ class SharedHeadwiseKVManager(BaseKVManager):
         # bootstrap_in_poll: rooms the latest command long-poll reported READY
         # (None: not provided, ask the owner with broker_bootstrap).
         self.bootstrap_ready = None
+        # register_in_ready: destinations registered locally, not yet reported
+        # (the rank's READY for that prefill batch carries and clears them).
+        self.pending_destinations = []
+        # broker_status_in_poll: {room: broker_poll status} from the latest
+        # command long-poll (None: not provided, ask the owner).
+        self.broker_status = None
         self.metadata_buffers = None
         self.is_dummy_cp_rank = False
         self.try_ensure_parallel_info(f"127.0.0.1:{self.ctx.model.bootstrap_port}")
@@ -105,10 +111,16 @@ class _Room:
     def _status(self, stage):
         if self.aborted:
             return KVPoll.Failed
-        reply = self.kv_mgr.rpc("broker_poll", self.bootstrap_room,
-                                self.kv_mgr.rank, self.kv_mgr.pid, stage)
+        cached = (self.kv_mgr.broker_status or {}).get(self.bootstrap_room)
+        if cached is not None:
+            # The long poll returns on every broker change (epoch), so a
+            # PENDING room is re-read on the next poll; no RPC needed.
+            status = cached
+        else:
+            status = self.kv_mgr.rpc("broker_poll", self.bootstrap_room,
+                                     self.kv_mgr.rank, self.kv_mgr.pid, stage)["status"]
         return {"ABORTED": KVPoll.Failed, "PENDING": KVPoll.Transferring,
-                "SUCCESS": KVPoll.Success}[reply["status"]]
+                "SUCCESS": KVPoll.Success}[status]
 
 
 class SharedHeadwiseKVSender(_Room, BaseKVSender):
@@ -201,11 +213,23 @@ class SharedHeadwiseKVReceiver(_Room, BaseKVReceiver):
         require(not self.registered or (self.aux_index == aux_index and self.logical_indices == indices),
                 "Receiver destination replay changed")
         view = self.item["reservation_view"]
-        self.kv_mgr.rpc("broker_register_destination", self.bootstrap_room, self.kv_mgr.rank,
-                       self.kv_mgr.pid, self.kv_mgr.ctx.model.model_id,
-                       self.item["request_id"], self.item["attempt"], view["allocation_id"],
-                       view["version"], self.item["target_valid_tokens"],
-                       self.item["rank_block_table"], aux_index, len(indices))
+        if getattr(self.kv_mgr.ctx.config, "register_in_ready", False):
+            # Sent inside this prefill batch's READY (the rank reports it once
+            # every selected destination is registered locally).
+            if not self.registered:
+                self.kv_mgr.pending_destinations.append({
+                    "room": self.bootstrap_room, "request_id": self.item["request_id"],
+                    "attempt": self.item["attempt"], "allocation_id": view["allocation_id"],
+                    "reserved_version": view["version"],
+                    "target_valid_tokens": self.item["target_valid_tokens"],
+                    "rank_block_table": self.item["rank_block_table"],
+                    "metadata_slot": aux_index, "logical_token_count": len(indices)})
+        else:
+            self.kv_mgr.rpc("broker_register_destination", self.bootstrap_room, self.kv_mgr.rank,
+                           self.kv_mgr.pid, self.kv_mgr.ctx.model.model_id,
+                           self.item["request_id"], self.item["attempt"], view["allocation_id"],
+                           view["version"], self.item["target_valid_tokens"],
+                           self.item["rank_block_table"], aux_index, len(indices))
         self.aux_index, self.logical_indices, self.registered = aux_index, indices, True
 
     def accept_handoff(self, handoff, pool):

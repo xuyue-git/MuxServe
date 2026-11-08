@@ -38,7 +38,8 @@ def token_for(output_count: int) -> int:
     return 10 + (output_count * 7) % 50
 
 
-def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False):
+def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False,
+              register_ready=False):
     """final_step: config final_step_in_gpu_done (a locally final run step is
     reported inside GPU_DONE). HANDOFF native_metadata and long-poll
     bootstrap_ready are used whenever the owner provides them."""
@@ -58,6 +59,7 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
     cursor, epoch, wait_ms, backlog = 0, None, 0, []
     prepared, waiting_bootstrap, waiting_handoff = {}, {}, None
     bootstrap_ready = None
+    broker_status = None
     drained = False
     while not drained and not stop.is_set():
         after = backlog[-1]["command_seq"] if backlog else cursor
@@ -65,6 +67,8 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
         epoch = reply["epoch"]
         if "bootstrap_ready" in reply:
             bootstrap_ready = {tuple(room) for room in reply["bootstrap_ready"]}
+        if "broker_status" in reply:
+            broker_status = dict(reply["broker_status"])
         backlog.extend(reply["commands"])
         accepted = 0
         while backlog and waiting_handoff is None:
@@ -76,14 +80,26 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                 if command["batch_stage"] == "P" and stage == "P":
                     waiting_bootstrap[command["batch_id"]] = command
                 else:
+                    ready_payload = {"reservation_id": command["reservation_id"]}
                     if command["batch_stage"] == "P":  # D destination registration
+                        destinations = []
                         for slot, item in enumerate(command["requests"]):
                             view = item["reservation_view"]
-                            call("broker_register_destination", item["bootstrap_room"], rank, pid, model,
-                                 item["request_id"], item["attempt"], view["allocation_id"], view["version"],
-                                 item["target_valid_tokens"], item["rank_block_table"], slot,
-                                 item["target_valid_tokens"])
-                    report(command["batch_id"], "READY", {"reservation_id": command["reservation_id"]})
+                            if register_ready:
+                                destinations.append({"room": item["bootstrap_room"],
+                                    "request_id": item["request_id"], "attempt": item["attempt"],
+                                    "allocation_id": view["allocation_id"], "reserved_version": view["version"],
+                                    "target_valid_tokens": item["target_valid_tokens"],
+                                    "rank_block_table": item["rank_block_table"], "metadata_slot": slot,
+                                    "logical_token_count": item["target_valid_tokens"]})
+                            else:
+                                call("broker_register_destination", item["bootstrap_room"], rank, pid, model,
+                                     item["request_id"], item["attempt"], view["allocation_id"], view["version"],
+                                     item["target_valid_tokens"], item["rank_block_table"], slot,
+                                     item["target_valid_tokens"])
+                        if register_ready:
+                            ready_payload["destinations"] = tuple(destinations)
+                    report(command["batch_id"], "READY", ready_payload)
             elif kind == "START":
                 prep = prepared[command["batch_id"]]
                 start = time.monotonic()
@@ -167,7 +183,9 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                 del waiting_bootstrap[batch_id]
                 report(batch_id, "READY", {"reservation_id": command["reservation_id"]})
         if waiting_handoff is not None:
-            if all(call("broker_poll", i["bootstrap_room"], rank, pid, "D")["status"] == "SUCCESS"
+            if all((broker_status or {}).get(i["bootstrap_room"]) == "SUCCESS"
+                   if broker_status is not None and i["bootstrap_room"] in broker_status else
+                   call("broker_poll", i["bootstrap_room"], rank, pid, "D")["status"] == "SUCCESS"
                    for i in waiting_handoff["requests"]):
                 report(waiting_handoff["batch_id"], "HANDOFF_READY",
                        {"requests": waiting_handoff["requests"]})
@@ -214,6 +232,10 @@ def main():
     parser.add_argument("--bootstrap-poll", action="store_true", help="config bootstrap_in_poll=true")
     parser.add_argument("--inline-prepare", action="store_true", help="config inline_prepare=true")
     parser.add_argument("--own-rank-table", action="store_true", help="config prepare_own_rank_table=true")
+    parser.add_argument("--register-ready", action="store_true", help="config register_in_ready=true")
+    parser.add_argument("--broker-poll", action="store_true", help="config broker_status_in_poll=true")
+    parser.add_argument("--early-terminal", action="store_true", help="config terminal_before_cleanup=true")
+    parser.add_argument("--slot-at-cleanup", action="store_true", help="config slot_free_at_cleanup=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -240,7 +262,11 @@ def main():
                               final_step_in_gpu_done=args.final_step,
                               event_pump_thread=args.event_pump, bootstrap_in_poll=args.bootstrap_poll,
                               inline_prepare=args.inline_prepare,
-                              prepare_own_rank_table=args.own_rank_table)
+                              prepare_own_rank_table=args.own_rank_table,
+                              register_in_ready=args.register_ready,
+                              broker_status_in_poll=args.broker_poll,
+                              terminal_before_cleanup=args.early_terminal,
+                              slot_free_at_cleanup=args.slot_at_cleanup)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -282,7 +308,8 @@ def main():
                                        else [default] * len(MODELS))
     timing = dict(zip(MODELS, zip(per_model(args.prefill_ms, PREFILL_S), per_model(args.decode_ms, DECODE_S))))
     processes = [context.Process(target=rank_main, args=(address, key, controller.group_id(m), m, stage, rank,
-                                                         0, stop, timing[m], args.final_step), daemon=True)
+                                                         0, stop, timing[m], args.final_step,
+                                                         args.register_ready), daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()
@@ -360,7 +387,9 @@ def main():
         args.cleanup_skip_p, args.cleanup_with_quiesce,
         "".join("1" if flag else "0" for flag in (args.handoff_prepare, args.inline_metadata, args.final_step,
                                                    args.event_pump, args.bootstrap_poll,
-                                                   args.inline_prepare, args.own_rank_table)),
+                                                   args.inline_prepare, args.own_rank_table,
+                                                   args.register_ready, args.broker_poll,
+                                                   args.early_terminal, args.slot_at_cleanup)),
         result["summary"]["overall"]["output_tokens_per_second"], tpot,
         {m: round(t[1] * 1000, 1) for m, t in timing.items()},
         {m: round(s["mean_ttft_s"] * 1000, 1) for m, s in result["summary"]["models"].items()},

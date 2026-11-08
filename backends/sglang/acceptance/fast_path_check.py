@@ -624,5 +624,193 @@ class HandoffFastPaths(unittest.TestCase):
         self.assertFalse(driver.pump_thread.is_alive())
 
 
+def destinations(sim, model, plan, rank):
+    """What a register_in_ready D rank puts in its prefill READY."""
+    cmd = next(c for c in sim.commands(model, "D", rank, "PREPARE") if c["batch_id"] == plan.batch_id)
+    item = cmd["requests"][0]
+    view = item["reservation_view"]
+    return ({"room": item["bootstrap_room"], "request_id": item["request_id"], "attempt": item["attempt"],
+             "allocation_id": view["allocation_id"], "reserved_version": view["version"],
+             "target_valid_tokens": item["target_valid_tokens"], "rank_block_table": item["rank_block_table"],
+             "metadata_slot": 0, "logical_token_count": item["target_valid_tokens"]},)
+
+
+class ProtocolFastPaths(unittest.TestCase):
+    def prepared_prefill(self, sim, rid="r"):
+        out = sim.controller.request_output("a", rid)
+        plan = BatchPlan(sim.group("a"), "p-" + rid, "a", "P", (RequestRef(rid, out["attempt"], 0),))
+        return plan, out, sim.controller.prepare_batch(plan)["reservation_id"]
+
+    def test_d_destinations_ride_in_the_prefill_ready(self):
+        sim = Sim(run_steps=4, register_in_ready=True, bootstrap_in_poll=True)
+        sim.submit("a", "r", max_new=5)
+        plan, out, reservation = self.prepared_prefill(sim)
+        room = destinations(sim, "a", plan, 0)[0]["room"]
+        entry = sim.controller.groups["a"].broker[room]
+        # A READY without them, or with another room, registers nothing.
+        expect("INVALID_REPORT", lambda: sim.report("a", "D", 0, plan.batch_id, "READY",
+                                                    {"reservation_id": reservation}))
+        wrong = ({**destinations(sim, "a", plan, 0)[0], "room": room + 99},)
+        expect("INVALID_REPORT", lambda: sim.report("a", "D", 0, plan.batch_id, "READY",
+                                                    {"reservation_id": reservation, "destinations": wrong}))
+        self.assertEqual(entry["destinations"], {})
+        for rank in range(sim.tp):
+            sim.report("a", "D", rank, plan.batch_id, "READY",
+                       {"reservation_id": reservation, "destinations": destinations(sim, "a", plan, rank)})
+        self.assertEqual(set(entry["destinations"]), set(range(sim.tp)))
+        reply = sim.controller.poll_commands_wait(sim.group("a"), "P", 0, sim.pid("a", "P", 0),
+                                                  sim.acked[("a", "P", 0)], None, 0, None)
+        self.assertEqual([x[0] for x in reply["bootstrap_ready"]], [room])
+        ready(sim, "a", plan.batch_id, reservation, stages=("P",))
+        sim.controller.start_batch(sim.group("a"), plan.batch_id)
+        sim.prefill_finish("a", "r", 11, plan, out, reservation)  # stage, handoff: unchanged
+        self.assertEqual(sim.controller.requests[("a", "r")].state, "DECODING")
+
+    def test_default_ready_carries_no_destinations(self):
+        sim = Sim(run_steps=4)
+        sim.submit("a", "r", max_new=5)
+        plan, out, reservation = self.prepared_prefill(sim)
+        expect("STALE_REPORT", lambda: sim.report("a", "D", 0, plan.batch_id, "READY", {
+            "reservation_id": reservation, "destinations": destinations(sim, "a", plan, 0)}))
+
+    def test_long_poll_reports_broker_status_to_every_rank(self):
+        for flag in (False, True):
+            with self.subTest(broker_status_in_poll=flag):
+                sim = Sim(run_steps=4, broker_status_in_poll=flag)
+                sim.submit("a", "r", max_new=5)
+                plan, out, reservation = sim.prefill_ready("a", "r")
+                sim.controller.start_batch(sim.group("a"), plan.batch_id)
+                stage_and_gpu_done(sim, "a", "r", 11, plan, out, reservation)
+                poll = lambda stage, rank: sim.controller.poll_commands_wait(
+                    sim.group("a"), stage, rank, sim.pid("a", stage, rank), sim.acked[("a", stage, rank)],
+                    None, 0, None).get("broker_status")
+                if not flag:
+                    self.assertIsNone(poll("D", 0))
+                    continue
+                room = sim.commands("a", "D", 0, "HANDOFF")[-1]["requests"][0]["bootstrap_room"]
+                self.assertEqual(dict(poll("D", 0)), {room: "PENDING"})
+                for rank in range(sim.tp):
+                    item = sim.commands("a", "D", rank, "HANDOFF")[-1]["requests"][0]
+                    sim.controller.broker_ack(sim.group("a"), room, rank, sim.pid("a", "D", rank),
+                                              item["allocation_id"], item["version"], item["valid_tokens"],
+                                              item["rank_block_table"])
+                for stage in ("P", "D"):
+                    self.assertEqual(dict(poll(stage, 1)), {room: "SUCCESS"})
+                    self.assertEqual(sim.controller.broker_poll(sim.group("a"), room, 1,
+                                                                sim.pid("a", stage, 1), stage)["status"], "SUCCESS")
+
+    def ended(self, **flags):
+        sim = Sim(run_steps=4, decode_skip_prefill_ranks=True, cleanup_skip_prefill_ranks=True,
+                  cleanup_with_quiesce=True, **flags)
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        plan, reservation, stages = decode_to_end(sim, "a", "r", 4, 12)
+        return sim, plan, reservation
+
+    def finish_cleanup(self, sim, plan, reservation):
+        (cleanup_id,) = cleanup_ids(sim, "a", "D", 0)
+        attempt = sim.controller.requests[("a", "r")].attempt
+        for rank in range(sim.tp):
+            sim.report("a", "D", rank, plan.batch_id, "QUIESCED",
+                       {"reservation_id": reservation, "request_ids": ("r",)})
+            sim.report("a", "D", rank, cleanup_id, "QUIESCED",
+                       {"cleanup_id": cleanup_id, "request_id": "r", "attempt": attempt})
+
+    def terminals(self, sim):
+        return [e for e in sim.controller.poll_events(sim.group("a")) if e.kind == "TERMINAL"]
+
+    def test_finished_request_is_terminal_when_its_cleanup_is_queued(self):
+        sim, plan, reservation = self.ended(terminal_before_cleanup=True)
+        (event,) = self.terminals(sim)
+        self.assertEqual((event.payload["output_token_ids"], event.payload["finish_reason"]),
+                         ((11, 12, 13, 14, 15), "length"))
+        tokens = [e for e in sim.controller.poll_events(sim.group("a")) if e.kind == "TOKEN"]
+        self.assertLess(max(e.event_seq for e in tokens), event.event_seq)
+        self.assertEqual(sim.controller.requests[("a", "r")].state, "CLEANUP_PENDING")
+        expect("NOT_READY", lambda: sim.controller.forget_request("a", "r", event.attempt))
+        free = sim.store.rank_usage()[0]["free_blocks"]
+        (cleanup_id,) = cleanup_ids(sim, "a", "D", 0)
+        self.finish_cleanup(sim, plan, reservation)
+        self.assertEqual(len(self.terminals(sim)), 1)  # the cleanup emits nothing more
+        self.assertEqual(sim.controller.request_output("a", "r")["state"], "FINISHED")
+        self.assertGreater(sim.store.rank_usage()[0]["free_blocks"], free)
+        self.assertNotIn(cleanup_id, sim.controller.groups["a"].outbox.reserved)
+
+    def test_default_and_cancelled_requests_are_terminal_after_cleanup(self):
+        sim, plan, reservation = self.ended()
+        self.assertEqual(self.terminals(sim), [])
+        self.finish_cleanup(sim, plan, reservation)
+        self.assertEqual(len(self.terminals(sim)), 1)
+        sim = Sim(run_steps=4, terminal_before_cleanup=True)
+        sim.submit("a", "q", max_new=5)
+        sim.controller.cancel_request("a", "q")
+        self.assertEqual(self.terminals(sim), [])  # not a normal finish: after the release
+
+    def test_d_only_cleanup_frees_the_slot_behind_its_commands(self):
+        sim, plan, reservation = self.ended(slot_free_at_cleanup=True)
+        sim.submit("a", "s", max_new=5)
+        nxt, out, reservation_s = self.prepared_prefill(sim, "s")  # while "r" still cleans
+        for rank in range(sim.tp):
+            kinds_d = [c["kind"] for c in sim.commands("a", "D", rank)]
+            self.assertEqual(kinds_d[-3:], ["QUIESCE", "CLEANUP", "PREPARE"])
+            self.assertEqual(sim.commands("a", "D", rank)[-1]["batch_id"], nxt.batch_id)
+        self.finish_cleanup(sim, plan, reservation)
+        self.assertEqual(sim.controller.request_output("a", "r")["state"], "FINISHED")
+        self.assertEqual(sim.controller.groups["a"].batches[nxt.batch_id].status, "PREPARING")
+
+    def test_slot_stays_taken_without_the_switch_or_with_p_cleanup(self):
+        sim, plan, reservation = self.ended()
+        sim.submit("a", "s", max_new=5)
+        expect("OUT_OF_CAPACITY", lambda: self.prepared_prefill(sim, "s"))
+        sim = Sim(run_steps=4, cleanup_skip_prefill_ranks=True, slot_free_at_cleanup=True)
+        sim.submit("a", "q", max_new=5)
+        sim.controller.cancel_request("a", "q")  # never prefilled: P ranks clean too
+        sim.submit("a", "s", max_new=5)
+        expect("OUT_OF_CAPACITY", lambda: self.prepared_prefill(sim, "s"))
+
+    def test_new_switches_are_boolean_and_slot_needs_d_only_cleanup(self):
+        import json, tempfile
+        from muxserve_sglang.config import load_config
+        root = Path(__file__).resolve().parents[1]
+
+        def load(**extra):
+            raw = json.loads((root / "configs/sglang_a100.json").read_text())
+            raw.update(extra)
+            directory = tempfile.mkdtemp()
+            raw["asset_lock_dir"] = raw["runtime_dir"] = directory
+            path = Path(directory) / "c.json"
+            path.write_text(json.dumps(raw))
+            return load_config(path, require_assets=False)
+        names = ("register_in_ready", "broker_status_in_poll", "terminal_before_cleanup")
+        config = load()
+        self.assertFalse(any(getattr(config, n) for n in names + ("slot_free_at_cleanup",)))
+        for name in names:
+            self.assertTrue(getattr(load(**{name: True}), name))
+            expect("INVALID_CONFIG", lambda: load(**{name: 1}))
+        expect("INVALID_CONFIG", lambda: load(slot_free_at_cleanup=True))
+        self.assertTrue(load(slot_free_at_cleanup=True, cleanup_skip_prefill_ranks=True).slot_free_at_cleanup)
+
+
+class EventPumpLock(unittest.TestCase):
+    def test_pump_delivers_while_the_owner_lock_is_held(self):
+        import threading
+        sim = Sim(run_steps=4, event_pump_thread=True)
+        seen, arrived = [], threading.Event()
+
+        def apply(event):
+            seen.append(event.kind)
+            arrived.set()
+        driver = ControllerDriver(sim.controller, apply, schedule=False)
+        driver.start()
+        try:
+            sim.submit("a", "r", max_new=5)
+            with sim.controller.lock:  # e.g. a GPU_DONE handler still running
+                sim.prefill("a", "r", 11)
+                self.assertTrue(arrived.wait(5))  # TOKEN delivered before the lock is released
+            self.assertIn("TOKEN", seen)
+        finally:
+            driver.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

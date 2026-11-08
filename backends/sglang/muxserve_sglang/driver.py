@@ -37,6 +37,7 @@ class ControllerDriver:
                             if getattr(self.config, "event_pump_thread", False) and events_wake is not None
                             else None)
         self._pumping = False
+        self._acked = {}
         # A scheduling driver owns START grants; the controller may then issue
         # them inline (config inline_start) until pause() or a failure.
         self._inline(schedule)
@@ -52,20 +53,28 @@ class ControllerDriver:
             self.pump_thread.start()
         self.thread.start()
 
-    def _pump_events(self):
+    def _pump_events(self, unlocked=False):
+        # unlocked (the pump thread): read the outbox under its own lock only,
+        # so delivery never waits for the owner lock (held while e.g. a GPU_DONE
+        # handler prepares the next batch). ACKs, which retire owner state,
+        # still take the owner lock, after every new event was delivered, and
+        # only when there is something new to acknowledge.
+        poll = getattr(self.controller, "poll_events_unlocked", None) if unlocked else None
+        poll = poll or self.controller.poll_events
         for model_id, receiver in self.receivers.items():
-            group_id = receiver.group_id
-            for event in self.controller.poll_events(group_id, receiver.last_seq):
+            for event in poll(receiver.group_id, receiver.last_seq):
                 receiver.receive(event)
-            if receiver.last_seq:
-                self.controller.ack_events(group_id, receiver.last_seq)
+        for model_id, receiver in self.receivers.items():
+            if receiver.last_seq and (not unlocked or receiver.last_seq != self._acked.get(model_id)):
+                self.controller.ack_events(receiver.group_id, receiver.last_seq)
+                self._acked[model_id] = receiver.last_seq
 
     def _pump_loop(self):
         wake = self.controller.events_wake
         try:
             while not self.stop_event.is_set():
                 wake.clear()  # before pumping: an event emitted meanwhile keeps it set
-                self._pump_events()
+                self._pump_events(unlocked=True)
                 wake.wait(0.02)
         except Exception as exc:
             self.failure = exc

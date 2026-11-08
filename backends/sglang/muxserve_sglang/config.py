@@ -190,6 +190,24 @@ class DeploymentConfig:
     # rank validates only it. Every table is still validated, by the one rank
     # that uses it; ranks no longer re-check the other ranks' tables.
     prepare_own_rank_table: bool = False
+    # A D rank sends its native destination registrations for a prefill batch
+    # inside that batch's READY report, instead of one broker_register_destination
+    # RPC before it. The owner registers them exactly as that RPC would.
+    register_in_ready: bool = False
+    # Command long-poll replies carry every room's broker status (what
+    # broker_poll would return), so ranks waiting for the all-rank handoff ACK
+    # need no broker_poll RPC; an absent room still asks the owner.
+    broker_status_in_poll: bool = False
+    # A request that finished normally (eos/length) is reported TERMINAL when
+    # its CLEANUP is queued, not when every rank has reported it. Its output is
+    # final by then; only the release is still in flight.
+    terminal_before_cleanup: bool = False
+    # A request whose queued CLEANUP involves only D ranks no longer counts
+    # against its model's in-flight slot: every D rank executes that CLEANUP
+    # before any later PREPARE, and P ranks already released it. The store
+    # still holds its KV until the cleanup completes. Requires
+    # cleanup_skip_prefill_ranks.
+    slot_free_at_cleanup: bool = False
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -265,9 +283,13 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
     for name in ("inline_start", "decode_skip_prefill_ranks", "prefill_early_token",
                  "cleanup_skip_prefill_ranks", "cleanup_with_quiesce", "handoff_prepare_decode",
                  "handoff_inline_metadata", "final_step_in_gpu_done", "event_pump_thread",
-                 "bootstrap_in_poll", "inline_prepare", "prepare_own_rank_table"):
+                 "bootstrap_in_poll", "inline_prepare", "prepare_own_rank_table",
+                 "register_in_ready", "broker_status_in_poll", "terminal_before_cleanup",
+                 "slot_free_at_cleanup"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
+    if config.slot_free_at_cleanup and not config.cleanup_skip_prefill_ranks:
+        raise IntegrationError("INVALID_CONFIG", "slot_free_at_cleanup requires cleanup_skip_prefill_ranks")
     if config.handoff_prepare_decode and not (config.inline_start and config.prefill_early_token
                                               and config.decode_skip_prefill_ranks):
         raise IntegrationError("INVALID_CONFIG", "handoff_prepare_decode requires inline_start, "

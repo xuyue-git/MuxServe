@@ -173,6 +173,8 @@ class _Cleanup:
     deadline: float
     quiesced: set[tuple[str, int]] = field(default_factory=set)
     participants: frozenset = frozenset()
+    # terminal_before_cleanup: TERMINAL was emitted when the CLEANUP was queued.
+    terminal_sent: bool = False
 
 
 @dataclass
@@ -569,6 +571,13 @@ class MuxController:
                     (room, entry["allocation_id"], entry["reserved_version"], entry["target_valid_tokens"])
                     for room, entry in group.broker.items()
                     if entry["state"] != "ABORTED" and set(entry["destinations"]) == set(group.ranks))
+            if self.config.broker_status_in_poll:
+                # Exactly broker_poll's answer for every room of this group.
+                reply["broker_status"] = tuple(
+                    (room, "ABORTED" if group.fenced or entry["state"] == "ABORTED" else
+                     "SUCCESS" if entry["state"] == "PUBLISHED" and entry["acked"] == set(group.ranks)
+                     else "PENDING")
+                    for room, entry in group.broker.items())
             return reply
 
     def submit_request(self, spec: RequestSpec, *, initialization_token: str | None = None) -> dict:
@@ -659,6 +668,12 @@ class MuxController:
         with self.lock:
             return self._group(group_id).outbox.replay(after_seq)
 
+    def poll_events_unlocked(self, group_id: str, after_seq: int = 0) -> tuple:
+        """The event pump's read: the outbox has its own lock (every emit and
+        ACK mutates it under that lock too), so this never waits for the owner
+        lock. Groups are fixed at construction."""
+        return self._group(group_id).outbox.replay(after_seq)
+
     def ack_events(self, group_id: str, through_seq: int) -> None:
         with self.lock:
             group = self._group(group_id)
@@ -677,6 +692,20 @@ class MuxController:
     def _occupies_slot(self, request: _Request) -> bool:
         """Count retained physical or native ownership, not waiting work."""
         group = self._model(request.spec.model_id)
+        active = self._active(request) if self.config.slot_free_at_cleanup else None
+        if (self.config.slot_free_at_cleanup and request.state == "CLEANUP_PENDING"
+                and (active is None or (active.status == "QUIESCE" and all(
+                    stage == "D" for stage, _ in active.quiesce_required)))
+                and any(cleanup.identity == request.identity
+                        and all(stage == "D" for stage, _ in cleanup.participants)
+                        for cleanup in group.cleanups.values())):
+            # Its CLEANUP (and the QUIESCE of a last decode batch still
+            # quiescing, cleanup_with_quiesce) is queued on every D rank ahead
+            # of any later PREPARE (ranks execute commands in order) and P
+            # ranks already released it, so the next request's native state
+            # never overlaps it. The store keeps its KV allocated until the
+            # cleanup completes.
+            return False
         return (request.allocation_id is not None or self._active(request) is not None
                 or any(cleanup.identity == request.identity for cleanup in group.cleanups.values()))
 
@@ -1308,6 +1337,13 @@ class MuxController:
                 self._notify()
                 return {"accepted": True, "duplicate": False, "cleanup_id": batch_id}
             batch = self._batch(group, batch_id)
+            registrations = None
+            if (kind == "READY" and self.config.register_in_ready and stage == "D"
+                    and batch.plan.stage == "P" and "destinations" in payload):
+                # register_in_ready: this D rank's native destinations for the
+                # prefill ride in its READY; validated and registered below.
+                payload = dict(payload)
+                registrations = payload.pop("destinations")
             revoked_ready = (kind == "READY" and batch.status == "REVOKING"
                              and key not in batch.quiesced
                              and payload == {"reservation_id": batch.reservation.reservation_id})
@@ -1322,6 +1358,9 @@ class MuxController:
                 if not revoked_ready and (batch.status != "PREPARING"
                         or payload != {"reservation_id": batch.reservation.reservation_id}):
                     raise IntegrationError("STALE_REPORT", "READY not for current preparation")
+                if (not revoked_ready and self.config.register_in_ready
+                        and stage == "D" and batch.plan.stage == "P"):
+                    self._register_ready_destinations(group, batch, rank, pid, registrations)
                 # PREPARE can finish before the rank receives its queued REVOKE.
                 # Consume that report's sequence; only all-rank QUIESCED may
                 # release storage. Obsolete readiness never votes for START.
@@ -1368,40 +1407,71 @@ class MuxController:
         """
         trace.ev("brk", None, op="register_destination", gid=group_id, room=room, r=rank)
         with self.lock:
-            group = self._group(group_id)
-            target = group.registered.get(("D", rank))
-            entry = group.broker.get(room)
-            if (type(room) is not int or target is None or target.pid != pid
-                    or not target.alive or entry is None or group.fenced):
-                raise IntegrationError("INVALID_BROKER", "Unknown D rank/PID/bootstrap room")
-            batch = self._batch(group, entry["batch_id"])
-            view = next(v for v in batch.reservation.views if v.identity == entry["identity"])
-            if (entry["identity"] !=
-                    RequestIdentity(model_id, request_id, attempt)
-                    or entry["allocation_id"] != allocation_id
-                    or entry["reserved_version"] != reserved_version
-                    or entry["target_valid_tokens"] != target_valid_tokens
-                    or rank not in view.block_tables
-                    or not _same_table(_packed_view(batch, view.identity.request_id)[rank], rank_block_table)
-                    or type(metadata_slot) is not int or not 0 <= metadata_slot < 2 * self.config.max_model_inflight
-                    or type(logical_token_count) is not int or logical_token_count != target_valid_tokens):
-                raise IntegrationError("INVALID_BROKER", "Native destination reservation mismatch")
-            destination = {"metadata_slot": metadata_slot, "logical_token_count": logical_token_count}
-            previous = entry["destinations"].get(rank)
-            if previous is not None and previous != destination:
-                self._fence(group, batch, "bootstrap_destination_conflict")
-                raise IntegrationError("IDENTITY_CONFLICT", "Native destination changed")
-            if previous is not None:
-                return {"room": room, "registered": True}
-            if batch.status != "PREPARING":
-                raise IntegrationError("INVALID_BROKER", "New native destination requires PREPARING")
-            if any(other is not entry and other["state"] != "ABORTED"
-                   and other["destinations"].get(rank, {}).get("metadata_slot") == metadata_slot
-                   for other in group.broker.values()):
-                raise IntegrationError("INVALID_BROKER", "Native metadata slot already belongs to another room")
-            entry["destinations"][rank] = destination
-            self._notify(group)
+            return self._register_destination(
+                self._group(group_id), room, rank, pid, model_id, request_id, attempt, allocation_id,
+                reserved_version, target_valid_tokens, rank_block_table, metadata_slot, logical_token_count)
+
+    def _register_destination(self, group: _Group, room: int, rank: int, pid: int,
+                              model_id: str, request_id: str, attempt: int,
+                              allocation_id: str, reserved_version: int,
+                              target_valid_tokens: int, rank_block_table: list,
+                              metadata_slot: int, logical_token_count: int) -> dict:
+        """Caller holds the lock: broker_register_destination's checks and effect."""
+        target = group.registered.get(("D", rank))
+        entry = group.broker.get(room)
+        if (type(room) is not int or target is None or target.pid != pid
+                or not target.alive or entry is None or group.fenced):
+            raise IntegrationError("INVALID_BROKER", "Unknown D rank/PID/bootstrap room")
+        batch = self._batch(group, entry["batch_id"])
+        view = next(v for v in batch.reservation.views if v.identity == entry["identity"])
+        if (entry["identity"] !=
+                RequestIdentity(model_id, request_id, attempt)
+                or entry["allocation_id"] != allocation_id
+                or entry["reserved_version"] != reserved_version
+                or entry["target_valid_tokens"] != target_valid_tokens
+                or rank not in view.block_tables
+                or not _same_table(_packed_view(batch, view.identity.request_id)[rank], rank_block_table)
+                or type(metadata_slot) is not int or not 0 <= metadata_slot < 2 * self.config.max_model_inflight
+                or type(logical_token_count) is not int or logical_token_count != target_valid_tokens):
+            raise IntegrationError("INVALID_BROKER", "Native destination reservation mismatch")
+        destination = {"metadata_slot": metadata_slot, "logical_token_count": logical_token_count}
+        previous = entry["destinations"].get(rank)
+        if previous is not None and previous != destination:
+            self._fence(group, batch, "bootstrap_destination_conflict")
+            raise IntegrationError("IDENTITY_CONFLICT", "Native destination changed")
+        if previous is not None:
             return {"room": room, "registered": True}
+        if batch.status != "PREPARING":
+            raise IntegrationError("INVALID_BROKER", "New native destination requires PREPARING")
+        if any(other is not entry and other["state"] != "ABORTED"
+               and other["destinations"].get(rank, {}).get("metadata_slot") == metadata_slot
+               for other in group.broker.values()):
+            raise IntegrationError("INVALID_BROKER", "Native metadata slot already belongs to another room")
+        entry["destinations"][rank] = destination
+        self._notify(group)
+        return {"room": room, "registered": True}
+
+    _READY_DESTINATION_KEYS = frozenset(("room", "request_id", "attempt", "allocation_id",
+                                         "reserved_version", "target_valid_tokens",
+                                         "rank_block_table", "metadata_slot", "logical_token_count"))
+
+    def _register_ready_destinations(self, group: _Group, batch: _Batch, rank: int, pid: int,
+                                     registrations) -> None:
+        """register_in_ready: one D rank's READY for a prefill must register a
+        destination for exactly each of the batch's rooms, with the same checks
+        as broker_register_destination (the batch is still PREPARING)."""
+        rooms = {room for room, entry in group.broker.items() if entry["batch_id"] == batch.plan.batch_id}
+        if (not isinstance(registrations, (list, tuple)) or len(registrations) != len(rooms)
+                or any(not isinstance(item, dict) or set(item) != self._READY_DESTINATION_KEYS
+                       for item in registrations)
+                or {item["room"] for item in registrations} != rooms):
+            raise IntegrationError("INVALID_REPORT", "READY must register every prefill destination")
+        for item in registrations:
+            self._register_destination(group, item["room"], rank, pid, group.model_id,
+                                       item["request_id"], item["attempt"], item["allocation_id"],
+                                       item["reserved_version"], item["target_valid_tokens"],
+                                       item["rank_block_table"], item["metadata_slot"],
+                                       item["logical_token_count"])
 
     def broker_bootstrap(self, group_id: str, room: int, rank: int, pid: int,
                          allocation_id: str, reserved_version: int,
@@ -2285,6 +2355,17 @@ class MuxController:
                 "request_id": request.spec.request_id, "attempt": request.attempt,
                 "allocation_id": request.allocation_id,
                 "release_native": True, "reason": reason})
+        if (self.config.terminal_before_cleanup and request.pending_reason is None
+                and request.finish_reason in ("eos", "length") and reason == request.finish_reason):
+            # Its output is final (every TOKEN precedes this in the outbox);
+            # only the physical release is still in flight. The reserved
+            # completion slot is used now, and the cleanup emits nothing more.
+            request.finished_at = self.clock()
+            group.outbox.emit("TERMINAL", request_id=request.spec.request_id,
+                attempt=request.attempt, payload={"output_token_ids": tuple(request.output),
+                    "output_count": len(request.output), "finish_reason": request.finish_reason,
+                    "resume_record_id": None}, owner=cleanup_id)
+            cleanup.terminal_sent = True
 
     def _cleanup_quiesced(self, group: _Group, cleanup: _Cleanup,
                           key: tuple[str, int], payload: dict) -> None:
@@ -2345,12 +2426,16 @@ class MuxController:
             request.state, request.finish_reason = "FAILED", reason
             event_kind = "TERMINAL"
         request.pending_reason = None
-        request.finished_at = now
-        group.outbox.emit(event_kind, request_id=request.spec.request_id,
-            attempt=request.attempt, payload={"output_token_ids": tuple(request.output),
-                "output_count": len(request.output), "finish_reason": request.finish_reason,
-                "resume_record_id": request.resume_record_id if event_kind == "SUSPENDED"
-                    else None}, owner=cleanup.cleanup_id)
+        if cleanup.terminal_sent:
+            if (request.state, event_kind) != ("FINISHED", "TERMINAL"):
+                raise IntegrationError("INVALID_STATE", "Early TERMINAL request did not finish normally")
+        else:
+            request.finished_at = now
+            group.outbox.emit(event_kind, request_id=request.spec.request_id,
+                attempt=request.attempt, payload={"output_token_ids": tuple(request.output),
+                    "output_count": len(request.output), "finish_reason": request.finish_reason,
+                    "resume_record_id": request.resume_record_id if event_kind == "SUSPENDED"
+                        else None}, owner=cleanup.cleanup_id)
         group.outbox.release(cleanup.cleanup_id)
         del group.cleanups[cleanup.cleanup_id]
         for batch in group.batches.values():
