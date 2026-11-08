@@ -191,6 +191,39 @@ class PackedBlockChecks(unittest.TestCase):
         self.assertLess(calls, 100)
         self.assertEqual(pool.bound_forward.tables[0].shape, (60, 13, 40))
 
+    def own_rank(self, views, rank=0):
+        return [replace(view, block_tables={rank: pack_tables(view.block_tables)[rank]}) for view in views]
+
+    def test_own_rank_table_binds_the_same_forward(self):
+        pool, views = case(layers=4, heads=3, pages=2, requests=2)
+        bind(pool, views)
+        full = pool.bound_forward.tables
+        pool._bound = None
+        pool.bind_forward(self.own_rank(views), (0, 1), [v.valid_tokens + 1 for v in views], 'DECODE',
+                          own_rank_only=True)
+        for a, b in zip(full, pool.bound_forward.tables):
+            self.assertTrue(np.array_equal(a, b))
+
+    def test_own_rank_mode_still_rejects_bad_own_tables_and_foreign_rank_sets(self):
+        pool, views = case(layers=2, heads=2, pages=2)
+        own = self.own_rank(views)
+        targets = [v.valid_tokens + 1 for v in views]
+        with self.assertRaises(IntegrationError):  # all ranks sent, own-rank mode expects only rank 0
+            pool.bind_forward(views, (0,), targets, 'DECODE', own_rank_only=True)
+        with self.assertRaises(IntegrationError):  # only rank 0 sent, full mode expects all ranks
+            pool.bind_forward(own, (0,), targets, 'DECODE')
+        tables = deepcopy(views[0].block_tables)
+        tables[0][1][1][1] = tables[0][0][0][0]  # alias inside rank 0's own table
+        aliased = [replace(views[0], block_tables={0: tables[0]})]
+        with self.assertRaises(IntegrationError):
+            pool.bind_forward(aliased, (0,), targets, 'DECODE', own_rank_only=True)
+        outside = deepcopy(views[0].block_tables)
+        outside[0][0][0][0] = pool.physical_block_count
+        with self.assertRaises(IntegrationError):
+            pool.bind_forward([replace(views[0], block_tables={0: outside[0]})], (0,), targets, 'DECODE',
+                              own_rank_only=True)
+        self.assertIsNone(pool._bound)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

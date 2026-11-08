@@ -126,6 +126,9 @@ class GatewayState:
             self.rids.add(key)
             self.aliases[key] = identity
             self.http_counters["generate_admitted"] += 1
+        prepare = getattr(self.controller, "prepare_submitted", None)
+        if prepare is not None:
+            prepare(model_id, identity)  # inline_prepare; outside the gateway lock
         return record
 
     def apply_event(self, event):

@@ -172,7 +172,9 @@ class HeadwiseTokenToKVPool(KVCache):
         return self._bound
 
     def bind_forward(self, views: Sequence[KVView], req_pool_indices: Sequence[int],
-                     target_lengths: Sequence[int], mode: str) -> None:
+                     target_lengths: Sequence[int], mode: str, own_rank_only: bool = False) -> None:
+        """``own_rank_only`` (prepare_own_rank_table): views carry and are
+        validated for this rank's table only; otherwise every rank's."""
         _require(self._bound is None, "Previous forward has not been cleared", "FORWARD_BUSY")
         _require(mode in ("PREFILL", "DECODE", "REBUILD"), "Unsupported bound mode")
         rows = _cpu_ints(req_pool_indices, "bound request rows")
@@ -186,7 +188,7 @@ class HeadwiseTokenToKVPool(KVCache):
                  and len({v.allocation_id for v in views}) == len(views),
                  "Duplicate request identity or allocation")
         tables, starts, writes = [], [], []
-        used_blocks: dict[int, list] = {r: [] for r in self.layout.ranks}
+        used_blocks: dict[int, list] = {r: [] for r in ((self.rank,) if own_rank_only else self.layout.ranks)}
         for view, target in zip(views, targets):
             _require(view.identity.model_id == self.layout.model_id and bool(view.allocation_id),
                      "Wrong model or absent allocation identity")
@@ -194,7 +196,8 @@ class HeadwiseTokenToKVPool(KVCache):
                      and 0 <= view.valid_tokens <= view.capacity_tokens
                      and 0 < target <= min(view.capacity_tokens, 2048)
                      and view.block_size == 16, "Invalid view capacity, length or block size")
-            _require(set(view.block_tables) == set(self.layout.ranks), "Incomplete rank mapping")
+            _require(set(view.block_tables) == ({self.rank} if own_rank_only else set(self.layout.ranks)),
+                     "Incomplete rank mapping")
             if mode == "DECODE":
                 _require(target == view.valid_tokens + 1, "Decode must append exactly one token")
                 starts.append(view.valid_tokens)

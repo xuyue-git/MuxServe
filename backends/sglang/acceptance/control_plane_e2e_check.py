@@ -212,6 +212,8 @@ def main():
     parser.add_argument("--final-step", action="store_true", help="config final_step_in_gpu_done=true")
     parser.add_argument("--event-pump", action="store_true", help="config event_pump_thread=true")
     parser.add_argument("--bootstrap-poll", action="store_true", help="config bootstrap_in_poll=true")
+    parser.add_argument("--inline-prepare", action="store_true", help="config inline_prepare=true")
+    parser.add_argument("--own-rank-table", action="store_true", help="config prepare_own_rank_table=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -236,7 +238,9 @@ def main():
                               handoff_prepare_decode=args.handoff_prepare,
                               handoff_inline_metadata=args.inline_metadata,
                               final_step_in_gpu_done=args.final_step,
-                              event_pump_thread=args.event_pump, bootstrap_in_poll=args.bootstrap_poll)
+                              event_pump_thread=args.event_pump, bootstrap_in_poll=args.bootstrap_poll,
+                              inline_prepare=args.inline_prepare,
+                              prepare_own_rank_table=args.own_rank_table)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -355,7 +359,8 @@ def main():
         args.run_steps, args.park, args.inline_start, args.skip_p, args.early_token,
         args.cleanup_skip_p, args.cleanup_with_quiesce,
         "".join("1" if flag else "0" for flag in (args.handoff_prepare, args.inline_metadata, args.final_step,
-                                                   args.event_pump, args.bootstrap_poll)),
+                                                   args.event_pump, args.bootstrap_poll,
+                                                   args.inline_prepare, args.own_rank_table)),
         result["summary"]["overall"]["output_tokens_per_second"], tpot,
         {m: round(t[1] * 1000, 1) for m, t in timing.items()},
         {m: round(s["mean_ttft_s"] * 1000, 1) for m, s in result["summary"]["models"].items()},

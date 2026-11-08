@@ -613,6 +613,34 @@ class MuxController:
             self._notify()
             return self._output(request)
 
+    def prepare_submitted(self, model_id: str, request_id: str) -> None:
+        """inline_prepare: the gateway calls this right after submit_request,
+        outside its own lock. Prepare the prefill exactly as the driver would
+        for this proposal; any refusal leaves it to the driver."""
+        if not self.config.inline_prepare:
+            return
+        with self.lock:
+            request = self.requests.get((model_id, request_id))
+            group = self.groups.get(model_id)
+            if (request is None or group is None or request.state != "QUEUED" or request.pending_reason
+                    or not self._inline_start_allowed or self.initializing
+                    or self.protected_failure is not None or group.fenced
+                    or any(other is not request and other.spec.model_id == model_id
+                           and other.state in ("QUEUED", "REBUILD") for other in self.requests.values())):
+                return
+            plan = BatchPlan(group.group_id, uuid4().hex, model_id, "P",
+                             (RequestRef(request_id, request.attempt, len(request.output)),),
+                             purpose="GENERATE", prepare_timeout_ms=self.config.prepare_timeout_ms)
+            try:
+                self.prepare_batch(plan)
+            except IntegrationError as exc:
+                trace.ev("prep_fail", None, m=model_id, s="P", code=exc.code, inline=True)
+                if exc.code not in ("OUT_OF_CAPACITY", "OUT_OF_CREDITS", "STAGE_BUSY", "NOT_READY",
+                                    "STALE_ATTEMPT", "EVENT_BACKPRESSURE", "COMMAND_BACKPRESSURE"):
+                    self.inline_start_error = exc  # the driver re-raises it, as its own
+                    self._inline_start_allowed = False
+                    self.wake.set()
+
     @staticmethod
     def _output(request: _Request) -> dict:
         return {"model_id": request.spec.model_id, "request_id": request.spec.request_id,
@@ -1039,7 +1067,9 @@ class MuxController:
                               "identity": {"model_id": view.identity.model_id,
                                   "request_id": view.identity.request_id, "attempt": view.identity.attempt},
                               "capacity_tokens": view.capacity_tokens, "valid_tokens": view.valid_tokens,
-                              "block_size": view.block_size, "block_tables": packed,
+                              "block_size": view.block_size,
+                              "block_tables": ({key[1]: packed[key[1]]} if self.config.prepare_own_rank_table
+                                               else packed),
                               "version": view.version},
                           "rank_block_table": packed[key[1]]})
         payload = {"batch_id": batch.plan.batch_id, "reservation_id": batch.reservation.reservation_id,

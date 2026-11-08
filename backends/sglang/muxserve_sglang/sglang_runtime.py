@@ -375,7 +375,10 @@ class ControlledScheduler:
         for view, item in zip(views, command["requests"]):
             require(view.identity == RequestIdentity(self.ctx.model.model_id, item["request_id"], item["attempt"])
                     and view.block_tables[self.rank] == item["rank_block_table"], "Reservation identity/map mismatch")
-        validator.bind_forward(views, rows, targets, mode)
+        if getattr(getattr(self.ctx, "config", None), "prepare_own_rank_table", False):
+            validator.bind_forward(views, rows, targets, mode, own_rank_only=True)
+        else:
+            validator.bind_forward(views, rows, targets, mode)
         return views, targets, mode
 
     def _prepare(self, command):
@@ -645,7 +648,7 @@ class ControlledScheduler:
                         "token_id": req.output_ids[-1], "valid_tokens": valid + step}
                        for req, item, valid in zip(state.reqs, state.command["requests"], start_valid)]
             finished = any(req.finished() for req in state.reqs)
-            if (finished or step >= steps) and getattr(self.ctx.config, "final_step_in_gpu_done", False):
+            if (finished or step >= steps) and getattr(getattr(self.ctx, "config", None), "final_step_in_gpu_done", False):
                 # The owner's decision for a locally final step is always to
                 # stop: report the step inside GPU_DONE (one RPC, not two).
                 final_step = {"step": step, "results": results, "finished": finished}

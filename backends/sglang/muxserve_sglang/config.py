@@ -181,6 +181,15 @@ class DeploymentConfig:
     # Command long-poll replies tell P ranks which bootstrap rooms have every
     # D destination registered, replacing their broker_bootstrap RPCs.
     bootstrap_in_poll: bool = False
+    # Prepare a submitted request's prefill right away (the gateway asks once
+    # its own lock is released) instead of on the driver's next pass. Only
+    # when it is the model's sole queued request, so FIFO order is unchanged.
+    # Requires inline_start (the driver no longer tracks such batches).
+    inline_prepare: bool = False
+    # Each PREPARE carries only the receiving rank's block table, and that
+    # rank validates only it. Every table is still validated, by the one rank
+    # that uses it; ranks no longer re-check the other ranks' tables.
+    prepare_own_rank_table: bool = False
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -256,13 +265,15 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
     for name in ("inline_start", "decode_skip_prefill_ranks", "prefill_early_token",
                  "cleanup_skip_prefill_ranks", "cleanup_with_quiesce", "handoff_prepare_decode",
                  "handoff_inline_metadata", "final_step_in_gpu_done", "event_pump_thread",
-                 "bootstrap_in_poll"):
+                 "bootstrap_in_poll", "inline_prepare", "prepare_own_rank_table"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.handoff_prepare_decode and not (config.inline_start and config.prefill_early_token
                                               and config.decode_skip_prefill_ranks):
         raise IntegrationError("INVALID_CONFIG", "handoff_prepare_decode requires inline_start, "
                                "prefill_early_token and decode_skip_prefill_ranks")
+    if config.inline_prepare and not config.inline_start:
+        raise IntegrationError("INVALID_CONFIG", "inline_prepare requires inline_start")
     if type(config.idle_cache_trim_mib) is not int or not 0 <= config.idle_cache_trim_mib <= 65536:
         raise IntegrationError("INVALID_CONFIG", "idle_cache_trim_mib must be an integer 0..65536")
     if config.decode_run_steps > config.max_new_tokens:

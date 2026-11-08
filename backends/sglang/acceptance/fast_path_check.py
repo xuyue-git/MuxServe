@@ -557,6 +557,52 @@ class HandoffFastPaths(unittest.TestCase):
                          [(item["bootstrap_room"], view["allocation_id"], view["version"],
                            item["target_valid_tokens"])])
 
+    def test_prepare_carries_only_the_receiving_ranks_table(self):
+        for flag in (False, True):
+            with self.subTest(prepare_own_rank_table=flag):
+                sim = Sim(run_steps=4, prepare_own_rank_table=flag)
+                sim.submit("a", "r", max_new=5)
+                sim.prefill("a", "r", 11)  # the whole prefill still works
+                plan, reservation = prepare_decode(sim, "a", "r", 4)
+                for stage in ("P", "D"):
+                    for rank in range(sim.tp):
+                        item = next(c for c in sim.commands("a", stage, rank, "PREPARE")
+                                    if c["batch_id"] == plan.batch_id)["requests"][0]
+                        tables = item["reservation_view"]["block_tables"]
+                        self.assertEqual(set(tables), {rank} if flag else set(range(sim.tp)))
+                        self.assertEqual(tables[rank], item["rank_block_table"])
+
+    def inline(self, **flags):
+        sim = Sim(run_steps=4, inline_start=True, inline_prepare=True, **flags)
+        sim.controller.set_inline_start(True)
+        return sim
+
+    def test_submitted_prefill_is_prepared_inline(self):
+        sim = self.inline()
+        sim.submit("a", "r", max_new=5)
+        sim.controller.prepare_submitted("a", "r")
+        (batch,) = sim.controller.groups["a"].batches.values()
+        self.assertEqual((batch.plan.stage, batch.status), ("P", "PREPARING"))
+        self.assertEqual(sim.controller.requests[("a", "r")].state, "PREPARING")
+        sim.controller.prepare_submitted("a", "r")  # a replay prepares nothing more
+        self.assertEqual(len(sim.controller.groups["a"].batches), 1)
+
+    def test_inline_prepare_keeps_fifo_and_needs_permission(self):
+        sim = self.inline()
+        sim.submit("a", "old", max_new=5)  # left for the driver
+        sim.submit("a", "new", max_new=5)
+        sim.controller.prepare_submitted("a", "new")
+        self.assertEqual(sim.controller.groups["a"].batches, {})
+        sim = Sim(run_steps=4, inline_start=True, inline_prepare=True)  # no scheduling driver
+        sim.submit("a", "r", max_new=5)
+        sim.controller.prepare_submitted("a", "r")
+        self.assertEqual(sim.controller.groups["a"].batches, {})
+        sim = Sim(run_steps=4, inline_start=True)  # switch off
+        sim.controller.set_inline_start(True)
+        sim.submit("a", "r", max_new=5)
+        sim.controller.prepare_submitted("a", "r")
+        self.assertEqual(sim.controller.groups["a"].batches, {})
+
     def test_event_pump_thread_delivers_events(self):
         import threading
         sim = Sim(run_steps=4, event_pump_thread=True)
