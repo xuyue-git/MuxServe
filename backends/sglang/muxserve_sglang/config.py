@@ -161,8 +161,26 @@ class DeploymentConfig:
     # QUIESCED precedes its CLEANUP QUIESCED.
     cleanup_with_quiesce: bool = False
     # Idle allocator trimming: 0 calls empty_cache at every idle cleanup (as
-    # before); N > 0 only when the rank caches at least N MiB it does not use.
+    # before); N > 0 only when at least N MiB sit in wholly free cached
+    # segments (what empty_cache can return; split segments cannot be freed).
     idle_cache_trim_mib: int = 0
+    # Prepare a prefill's first decode batch as soon as every P rank's result
+    # is committed, queued behind the HANDOFF on each D rank (which executes
+    # it once its handoff completed), instead of after every HANDOFF_READY.
+    # Requires inline_start, prefill_early_token and decode_skip_prefill_ranks.
+    handoff_prepare_decode: bool = False
+    # HANDOFF carries each rank's staged P metadata, so a D rank needs no
+    # broker_lookup RPC; it still ACKs the committed mapping.
+    handoff_inline_metadata: bool = False
+    # A D rank whose run ends locally (finished, or the last granted step)
+    # reports that step inside its GPU_DONE instead of a separate decode_step.
+    final_step_in_gpu_done: bool = False
+    # Runtime events reach the gateway from their own driver thread rather
+    # than between the driver's scheduling passes.
+    event_pump_thread: bool = False
+    # Command long-poll replies tell P ranks which bootstrap rooms have every
+    # D destination registered, replacing their broker_bootstrap RPCs.
+    bootstrap_in_poll: bool = False
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -236,9 +254,15 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
     if type(config.prefill_cuda_graph) is not bool:
         raise IntegrationError("INVALID_CONFIG", "prefill_cuda_graph must be a boolean")
     for name in ("inline_start", "decode_skip_prefill_ranks", "prefill_early_token",
-                 "cleanup_skip_prefill_ranks", "cleanup_with_quiesce"):
+                 "cleanup_skip_prefill_ranks", "cleanup_with_quiesce", "handoff_prepare_decode",
+                 "handoff_inline_metadata", "final_step_in_gpu_done", "event_pump_thread",
+                 "bootstrap_in_poll"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
+    if config.handoff_prepare_decode and not (config.inline_start and config.prefill_early_token
+                                              and config.decode_skip_prefill_ranks):
+        raise IntegrationError("INVALID_CONFIG", "handoff_prepare_decode requires inline_start, "
+                               "prefill_early_token and decode_skip_prefill_ranks")
     if type(config.idle_cache_trim_mib) is not int or not 0 <= config.idle_cache_trim_mib <= 65536:
         raise IntegrationError("INVALID_CONFIG", "idle_cache_trim_mib must be an integer 0..65536")
     if config.decode_run_steps > config.max_new_tokens:

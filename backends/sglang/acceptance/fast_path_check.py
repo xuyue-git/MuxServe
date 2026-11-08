@@ -401,5 +401,182 @@ class CleanupFastPaths(unittest.TestCase):
         self.assertEqual(cleanup_ids(sim, "a", "D", 0), [])
 
 
+def stage_and_gpu_done(sim, model, rid, token, plan, out, reservation):
+    """The first half of Sim.prefill_finish: P staging and all P GPU_DONE."""
+    for rank in range(sim.tp):
+        cmd = next(c for c in sim.commands(model, "P", rank, "PREPARE") if c["batch_id"] == plan.batch_id)
+        item = cmd["requests"][0]
+        view = item["reservation_view"]
+        sim.controller.broker_stage(sim.group(model), item["bootstrap_room"], rank, sim.pid(model, "P", rank), {
+            "bootstrap_room": item["bootstrap_room"], "allocation_id": view["allocation_id"],
+            "reserved_version": view["version"], "target_valid_tokens": item["target_valid_tokens"],
+            "rank": rank, "native_payload": {"x": rank}})
+    valid = len(sim.controller.requests[(model, rid)].spec.input_ids)
+    for rank in range(sim.tp):
+        sim.report(model, "P", rank, plan.batch_id, "GPU_DONE", {
+            "reservation_id": reservation, "duration_ms": 1.0, "gpu_forward_ms": 1.0,
+            "results": [{"request_id": rid, "attempt": out["attempt"], "token_id": token,
+                         "valid_tokens": valid}]})
+
+
+def handoff_ready(sim, model, plan):
+    for rank in range(sim.tp):
+        item = sim.commands(model, "D", rank, "HANDOFF")[-1]["requests"][0]
+        sim.controller.broker_ack(sim.group(model), item["bootstrap_room"], rank, sim.pid(model, "D", rank),
+                                  item["allocation_id"], item["version"], item["valid_tokens"],
+                                  item["rank_block_table"])
+    for rank in range(sim.tp):
+        item = sim.commands(model, "D", rank, "HANDOFF")[-1]["requests"][0]
+        sim.report(model, "D", rank, plan.batch_id, "HANDOFF_READY", {"requests": [item]})
+
+
+class HandoffFastPaths(unittest.TestCase):
+    def chained(self, **flags):
+        sim = Sim(run_steps=4, inline_start=True, prefill_early_token=True,
+                  decode_skip_prefill_ranks=True, handoff_prepare_decode=True, **flags)
+        sim.controller.set_inline_start(True)  # a scheduling driver would allow it
+        sim.submit("a", "r", max_new=5)
+        plan, out, reservation = sim.prefill_ready("a", "r")
+        sim.controller.start_batch(sim.group("a"), plan.batch_id)
+        stage_and_gpu_done(sim, "a", "r", 11, plan, out, reservation)
+        decode = next(b for b in sim.controller.groups["a"].batches.values() if b.plan.stage == "D")
+        return sim, plan, reservation, decode
+
+    def test_first_decode_batch_is_prepared_behind_the_handoff(self):
+        sim, plan, reservation, decode = self.chained()
+        self.assertEqual((decode.status, decode.plan.steps), ("PREPARING", 4))
+        for rank in range(sim.tp):
+            kinds_d = [c["kind"] for c in sim.commands("a", "D", rank)]
+            self.assertEqual(kinds_d[-2:], ["HANDOFF", "PREPARE"])
+            self.assertEqual(kinds(sim, "a", "P", rank, decode.plan.batch_id), [])
+        request = sim.controller.requests[("a", "r")]
+        self.assertEqual((request.state, request.output), ("PREPARING", [11]))
+        handoff_ready(sim, "a", plan)
+        self.assertEqual(request.state, "PREPARING")  # the decode batch owns the state
+        ready(sim, "a", decode.plan.batch_id, decode.reservation.reservation_id, stages=("D",))
+        self.assertEqual(decode.status, "RUNNING")  # last READY STARTs it inline
+        quiesce(sim, "a", plan, reservation, stages=("P",))
+        self.assertEqual(sim.controller.groups["a"].batches[plan.batch_id].status, "DONE")
+        self.assertEqual(request.state, "RUNNING")  # the prefill's end does not reset it
+        for step, token in enumerate((12, 13, 14, 15), start=1):
+            for rank in range(sim.tp):
+                sim.step("a", decode.plan, rank, step, token, finished=step == 4)
+        sim.finish_run("a", decode.plan, decode.reservation.reservation_id, 4, 15)
+        quiesce(sim, "a", decode.plan, decode.reservation.reservation_id, stages=("D",))
+        sim.cleanup("a", "r")
+        output = sim.controller.request_output("a", "r")
+        self.assertEqual((output["state"], output["output_token_ids"]), ("FINISHED", (11, 12, 13, 14, 15)))
+
+    def test_driver_proposal_for_the_chained_request_is_stale(self):
+        sim, plan, reservation, decode = self.chained()
+        handoff_ready(sim, "a", plan)
+        out = sim.controller.request_output("a", "r")
+        again = BatchPlan(sim.group("a"), "d-again", "a", "D",
+                          (RequestRef("r", out["attempt"], out["output_count"]),), steps=4)
+        expect("STAGE_BUSY", lambda: sim.controller.prepare_batch(again))  # benign for the driver
+
+    def test_cancel_during_handoff_revokes_the_chained_batch(self):
+        sim, plan, reservation, decode = self.chained()
+        sim.controller.cancel_request("a", "r")
+        self.assertEqual(decode.status, "REVOKING")
+        for rank in range(sim.tp):
+            self.assertEqual(sim.commands("a", "D", rank)[-1]["kind"], "REVOKE")
+
+    def test_no_chain_without_inline_permission_or_switch(self):
+        sim = Sim(run_steps=4, inline_start=True, prefill_early_token=True,
+                  decode_skip_prefill_ranks=True, handoff_prepare_decode=True)
+        sim.submit("a", "r", max_new=5)  # inline start never allowed (no driver)
+        sim.prefill("a", "r", 11)
+        self.assertFalse(any(b.plan.stage == "D" for b in sim.controller.groups["a"].batches.values()))
+        self.assertEqual(sim.controller.requests[("a", "r")].state, "DECODING")
+
+    def test_handoff_carries_staged_metadata_only_when_enabled(self):
+        for flag in (False, True):
+            with self.subTest(handoff_inline_metadata=flag):
+                sim = Sim(run_steps=4, handoff_inline_metadata=flag)
+                sim.submit("a", "r", max_new=5)
+                plan, out, reservation = sim.prefill_ready("a", "r")
+                sim.controller.start_batch(sim.group("a"), plan.batch_id)
+                stage_and_gpu_done(sim, "a", "r", 11, plan, out, reservation)
+                for rank in range(sim.tp):
+                    item = sim.commands("a", "D", rank, "HANDOFF")[-1]["requests"][0]
+                    self.assertEqual(item.get("native_metadata"), {"x": rank} if flag else None)
+                handoff_ready(sim, "a", plan)  # the echoed items still match
+                self.assertEqual(sim.controller.requests[("a", "r")].state, "DECODING")
+
+    def run_to_last_step(self, **flags):
+        sim = Sim(run_steps=4, **flags)
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 4)
+        for step, token in enumerate((12, 13, 14), start=1):
+            for rank in range(sim.tp):
+                self.assertIs(sim.step("a", plan, rank, step, token)["continue"], True)
+        start = sim.controller.groups["a"].batches[plan.batch_id].run_start_valid["r"]
+        results = [{"request_id": "r", "attempt": plan.requests[0].attempt, "token_id": 15,
+                    "valid_tokens": start + 4}]
+        payload = {"reservation_id": reservation, "duration_ms": 2.0, "gpu_forward_ms": 1.0,
+                   "steps": 4, "results": results,
+                   "final_step": {"step": 4, "results": results, "finished": True}}
+        return sim, plan, reservation, payload
+
+    def test_gpu_done_carries_the_final_step(self):
+        sim, plan, reservation, payload = self.run_to_last_step(final_step_in_gpu_done=True)
+        for rank in range(sim.tp):
+            sim.report("a", "D", rank, plan.batch_id, "GPU_DONE", payload)
+        batch = sim.controller.groups["a"].batches[plan.batch_id]
+        self.assertEqual(batch.status, "QUIESCE")
+        self.assertEqual(sim.controller.requests[("a", "r")].output, [11, 12, 13, 14, 15])
+
+    def test_final_step_needs_the_switch_and_matching_results(self):
+        sim, plan, reservation, payload = self.run_to_last_step()
+        expect("INVALID_REPORT", lambda: sim.report("a", "D", 0, plan.batch_id, "GPU_DONE", payload))
+        sim, plan, reservation, payload = self.run_to_last_step(final_step_in_gpu_done=True)
+        payload["final_step"] = {**payload["final_step"], "step": 3}
+        expect("INVALID_REPORT", lambda: sim.report("a", "D", 0, plan.batch_id, "GPU_DONE", payload))
+
+    def test_long_poll_reports_bootstrap_ready_rooms_to_p_ranks(self):
+        sim = Sim(run_steps=4, bootstrap_in_poll=True)
+        sim.submit("a", "r", max_new=5)
+        out = sim.controller.request_output("a", "r")
+        plan = BatchPlan(sim.group("a"), "p-r", "a", "P", (RequestRef("r", out["attempt"], 0),))
+        sim.controller.prepare_batch(plan)
+        poll = lambda stage: sim.controller.poll_commands_wait(
+            sim.group("a"), stage, 0, sim.pid("a", stage, 0), sim.acked[("a", stage, 0)], None, 0, None)
+        self.assertEqual(tuple(poll("P")["bootstrap_ready"]), ())
+        self.assertNotIn("bootstrap_ready", poll("D"))
+        sim.controller.abort_batch(sim.group("a"), "p-r", "test")
+        sim2 = Sim(run_steps=4, bootstrap_in_poll=True)
+        sim2.submit("a", "r", max_new=5)
+        plan, out, reservation = sim2.prefill_ready("a", "r")  # every D destination registered
+        item = next(c for c in sim2.commands("a", "P", 0, "PREPARE") if c["batch_id"] == plan.batch_id)["requests"][0]
+        view = item["reservation_view"]
+        reply = sim2.controller.poll_commands_wait(sim2.group("a"), "P", 0, sim2.pid("a", "P", 0),
+                                                   sim2.acked[("a", "P", 0)], None, 0, None)
+        self.assertEqual([tuple(x) for x in reply["bootstrap_ready"]],
+                         [(item["bootstrap_room"], view["allocation_id"], view["version"],
+                           item["target_valid_tokens"])])
+
+    def test_event_pump_thread_delivers_events(self):
+        import threading
+        sim = Sim(run_steps=4, event_pump_thread=True)
+        seen, arrived = [], threading.Event()
+
+        def apply(event):
+            seen.append(event.kind)
+            arrived.set()
+        driver = ControllerDriver(sim.controller, apply, schedule=False)
+        driver.start()
+        try:
+            self.assertTrue(driver._pumping)
+            sim.submit("a", "r", max_new=5)
+            sim.prefill("a", "r", 11)  # publishes the first TOKEN
+            self.assertTrue(arrived.wait(5))
+            self.assertIn("TOKEN", seen)
+        finally:
+            driver.stop()
+        self.assertFalse(driver.pump_thread.is_alive())
+
+
 if __name__ == "__main__":
     unittest.main()

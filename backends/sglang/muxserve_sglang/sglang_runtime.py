@@ -165,6 +165,8 @@ class ControlledScheduler:
                 reply = self.rpc("poll_commands_wait", self.ctx.stage, self.rank, self.pid,
                                  after, self.cursor or None, wait_ms, epoch)
                 epoch = reply["epoch"]
+                if "bootstrap_ready" in reply:
+                    self.manager.bootstrap_ready = frozenset(tuple(room) for room in reply["bootstrap_ready"])
                 backlog.extend(reply["commands"])
                 accepted = 0
                 while backlog:
@@ -286,14 +288,24 @@ class ControlledScheduler:
         before_allocated = torch.cuda.memory_allocated(device)
         before_reserved = torch.cuda.memory_reserved(device)
         threshold_mib = getattr(getattr(self.ctx, "config", None), "idle_cache_trim_mib", 0)
-        if threshold_mib and before_reserved - before_allocated < threshold_mib * 1024**2:
+        trimmable = None
+        if threshold_mib:
+            # empty_cache returns only wholly free segments: reserved minus
+            # active blocks minus free blocks inside partly used (split)
+            # segments. reserved - allocated overstates it by those splits.
+            stats = torch.cuda.memory_stats(device)
+            trimmable = max(0, stats.get("reserved_bytes.all.current", 0)
+                            - stats.get("active_bytes.all.current", 0)
+                            - stats.get("inactive_split_bytes.all.current", 0))
+        if threshold_mib and trimmable < threshold_mib * 1024**2:
             # Below the threshold the cache is kept: the next forward reuses it
             # (a per-request release is reallocated by the next prefill).
             print("IDLE_CUDA_CACHE " + json.dumps({"model_id": self.ctx.model.model_id,
                 "stage": self.ctx.stage, "rank": self.rank, "pid": self.pid, "cleanup_id": cleanup_id,
                 "allocated_before_bytes": before_allocated, "allocated_after_bytes": before_allocated,
                 "reserved_before_bytes": before_reserved, "reserved_after_bytes": before_reserved,
-                "released_reserved_bytes": 0, "trimmed": False, "threshold_mib": threshold_mib}), flush=True)
+                "released_reserved_bytes": 0, "trimmable_bytes": trimmable, "trimmed": False,
+                "threshold_mib": threshold_mib}), flush=True)
             return
         with torch.cuda.device(device):
             torch.cuda.empty_cache()
@@ -308,7 +320,7 @@ class ControlledScheduler:
             "allocated_before_bytes": before_allocated, "allocated_after_bytes": after_allocated,
             "reserved_before_bytes": before_reserved, "reserved_after_bytes": after_reserved,
             "released_reserved_bytes": max(0, before_reserved - after_reserved),
-            "shared_aliases_verified": True, "trimmed": True}), flush=True)
+            "shared_aliases_verified": True, "trimmable_bytes": trimmable, "trimmed": True}), flush=True)
 
     def _native_request(self, item):
         identity = (item["request_id"], item["attempt"])
@@ -606,6 +618,7 @@ class ControlledScheduler:
         start_valid = [item["target_valid_tokens"] - 1 for item in state.command["requests"]]
         gpu_forward_ms = 0.0
         step = 1
+        final_step = None
         while True:
             previous_output_counts = [len(req.output_ids) for req in state.reqs]
             self.s.cur_batch_for_debug = state.batch
@@ -632,6 +645,11 @@ class ControlledScheduler:
                         "token_id": req.output_ids[-1], "valid_tokens": valid + step}
                        for req, item, valid in zip(state.reqs, state.command["requests"], start_valid)]
             finished = any(req.finished() for req in state.reqs)
+            if (finished or step >= steps) and getattr(self.ctx.config, "final_step_in_gpu_done", False):
+                # The owner's decision for a locally final step is always to
+                # stop: report the step inside GPU_DONE (one RPC, not two).
+                final_step = {"step": step, "results": results, "finished": finished}
+                break
             reply = self.rpc("decode_step", self.rank, self.pid, command["batch_id"], step,
                              results, finished)
             while reply.get("continue") == "PARK":
@@ -643,10 +661,12 @@ class ControlledScheduler:
             step += 1
             self._advance_run(state, start_valid, step, command["grant_id"])
         self.s.cur_batch_for_debug = None
-        self._report(command["batch_id"], "GPU_DONE", {
-            "reservation_id": state.command["reservation_id"], "results": results,
-            "gpu_forward_ms": gpu_forward_ms, "duration_ms": (time.monotonic() - start) * 1000,
-            "steps": step})
+        payload = {"reservation_id": state.command["reservation_id"], "results": results,
+                   "gpu_forward_ms": gpu_forward_ms, "duration_ms": (time.monotonic() - start) * 1000,
+                   "steps": step}
+        if final_step is not None:
+            payload["final_step"] = final_step
+        self._report(command["batch_id"], "GPU_DONE", payload)
 
     def _advance_run(self, state, start_valid, step, grant_id):
         """Prepare decode step ``step`` locally, exactly as a fresh per-token

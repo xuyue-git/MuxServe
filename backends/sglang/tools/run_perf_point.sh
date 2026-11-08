@@ -23,7 +23,13 @@
 # CLEANUP_SKIP_P=1 (request CLEANUP only on D ranks once P released it: config
 # cleanup_skip_prefill_ranks=true), CLEANUP_WITH_QUIESCE=1 (queue a finished request's
 # CLEANUP behind its last D QUIESCE: config cleanup_with_quiesce=true), TRIM_MIB=N
-# (empty_cache only with >= N MiB unused cache: config idle_cache_trim_mib=N),
+# (empty_cache only with >= N MiB in wholly free cached segments: config idle_cache_trim_mib=N),
+# HANDOFF_PREPARE=1 (first decode batch prepared behind the HANDOFF: config
+# handoff_prepare_decode=true; needs INLINE_START, EARLY_TOKEN, SKIP_P),
+# INLINE_META=1 (HANDOFF carries staged P metadata: config handoff_inline_metadata=true),
+# FINAL_STEP=1 (final run step inside GPU_DONE: config final_step_in_gpu_done=true),
+# EVENT_PUMP=1 (events to the gateway on their own thread: config event_pump_thread=true),
+# BOOTSTRAP_POLL=1 (P bootstrap readiness in long-poll replies: config bootstrap_in_poll=true),
 # FROZEN_BUNDLE=/abs/frozen-synthetic-512-128.json (original MuxServe's fixed-workload
 # input per model; every output must equal its expected tokens), WARMUP_TOTAL=128
 # (warmup split 43/43/42 over the models as the original; overrides WARMUP),
@@ -56,6 +62,11 @@ EARLY_TOKEN="${EARLY_TOKEN:-}"
 CLEANUP_SKIP_P="${CLEANUP_SKIP_P:-}"
 CLEANUP_WITH_QUIESCE="${CLEANUP_WITH_QUIESCE:-}"
 TRIM_MIB="${TRIM_MIB:-}"
+HANDOFF_PREPARE="${HANDOFF_PREPARE:-}"
+INLINE_META="${INLINE_META:-}"
+FINAL_STEP="${FINAL_STEP:-}"
+EVENT_PUMP="${EVENT_PUMP:-}"
+BOOTSTRAP_POLL="${BOOTSTRAP_POLL:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -63,10 +74,11 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
- inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib) = sys.argv[1:]
+ inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
+ handoff_prepare, inline_meta, final_step, event_pump, bootstrap_poll) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -86,7 +98,10 @@ if pgraph:
     config["prefill_cuda_graph"] = True
 for key, value in (("inline_start", inline), ("decode_skip_prefill_ranks", skip_p),
                    ("prefill_early_token", early), ("cleanup_skip_prefill_ranks", cleanup_skip_p),
-                   ("cleanup_with_quiesce", cleanup_with_quiesce)):
+                   ("cleanup_with_quiesce", cleanup_with_quiesce),
+                   ("handoff_prepare_decode", handoff_prepare), ("handoff_inline_metadata", inline_meta),
+                   ("final_step_in_gpu_done", final_step), ("event_pump_thread", event_pump),
+                   ("bootstrap_in_poll", bootstrap_poll)):
     config.pop(key, None)
     if value:
         config[key] = True
@@ -111,7 +126,12 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "early_token=%s" % config.get("prefill_early_token", False),
       "cleanup_skip_p=%s" % config.get("cleanup_skip_prefill_ranks", False),
       "cleanup_with_quiesce=%s" % config.get("cleanup_with_quiesce", False),
-      "trim_mib=%s" % config.get("idle_cache_trim_mib", 0))
+      "trim_mib=%s" % config.get("idle_cache_trim_mib", 0),
+      "handoff_prepare=%s" % config.get("handoff_prepare_decode", False),
+      "inline_meta=%s" % config.get("handoff_inline_metadata", False),
+      "final_step=%s" % config.get("final_step_in_gpu_done", False),
+      "event_pump=%s" % config.get("event_pump_thread", False),
+      "bootstrap_poll=%s" % config.get("bootstrap_in_poll", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

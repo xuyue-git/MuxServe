@@ -38,7 +38,10 @@ def token_for(output_count: int) -> int:
     return 10 + (output_count * 7) % 50
 
 
-def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None):
+def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False):
+    """final_step: config final_step_in_gpu_done (a locally final run step is
+    reported inside GPU_DONE). HANDOFF native_metadata and long-poll
+    bootstrap_ready are used whenever the owner provides them."""
     prefill_s, decode_s = timing or (PREFILL_S, DECODE_S)
     from muxserve_sglang.ipc import StorageRPCClient
     rpc = StorageRPCClient(address, key, 30)
@@ -54,11 +57,14 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
         report_seq += 1
     cursor, epoch, wait_ms, backlog = 0, None, 0, []
     prepared, waiting_bootstrap, waiting_handoff = {}, {}, None
+    bootstrap_ready = None
     drained = False
     while not drained and not stop.is_set():
         after = backlog[-1]["command_seq"] if backlog else cursor
         reply = call("poll_commands_wait", stage, rank, pid, after, cursor or None, wait_ms, epoch)
         epoch = reply["epoch"]
+        if "bootstrap_ready" in reply:
+            bootstrap_ready = {tuple(room) for room in reply["bootstrap_ready"]}
         backlog.extend(reply["commands"])
         accepted = 0
         while backlog and waiting_handoff is None:
@@ -97,6 +103,7 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                 else:
                     steps = prep.get("run_steps", 1)
                     step = 1
+                    final = None
                     while True:
                         time.sleep(decode_s)
                         results = [{"request_id": i["request_id"], "attempt": i["attempt"],
@@ -106,6 +113,9 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                             break
                         finished = any(len(i["output_token_ids"]) + step >= i["max_new_tokens"]
                                        for i in prep["requests"])
+                        if final_step and (finished or step >= steps):
+                            final = {"step": step, "results": results, "finished": finished}
+                            break
                         decision = call("decode_step", rank, pid, command["batch_id"], step, results, finished)
                         while decision["continue"] == "PARK":
                             decision = call("decode_resume", rank, pid, command["batch_id"], step, 100)
@@ -117,11 +127,14 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                                "gpu_forward_ms": decode_s * 1000 * step}
                     if steps > 1:
                         payload["steps"] = step
+                    if final is not None:
+                        payload["final_step"] = final
                 report(command["batch_id"], "GPU_DONE", payload)
             elif kind == "HANDOFF":
                 for item in command["requests"]:
-                    call("broker_lookup", item["bootstrap_room"], rank, pid, model, item["request_id"],
-                         item["attempt"], item["allocation_id"], item["version"], item["valid_tokens"])
+                    if "native_metadata" not in item:
+                        call("broker_lookup", item["bootstrap_room"], rank, pid, model, item["request_id"],
+                             item["attempt"], item["allocation_id"], item["version"], item["valid_tokens"])
                     call("broker_ack", item["bootstrap_room"], rank, pid, item["allocation_id"],
                          item["version"], item["valid_tokens"], item["rank_block_table"])
                 waiting_handoff = command
@@ -143,8 +156,12 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
             ready = True
             for item in command["requests"]:
                 view = item["reservation_view"]
-                status = call("broker_bootstrap", item["bootstrap_room"], rank, pid, view["allocation_id"],
-                              view["version"], item["target_valid_tokens"])["status"]
+                if bootstrap_ready is not None:
+                    status = "READY" if (item["bootstrap_room"], view["allocation_id"], view["version"],
+                                         item["target_valid_tokens"]) in bootstrap_ready else "PENDING"
+                else:
+                    status = call("broker_bootstrap", item["bootstrap_room"], rank, pid, view["allocation_id"],
+                                  view["version"], item["target_valid_tokens"])["status"]
                 ready = ready and status == "READY"
             if ready:
                 del waiting_bootstrap[batch_id]
@@ -190,6 +207,11 @@ def main():
     parser.add_argument("--early-token", action="store_true", help="config prefill_early_token=true")
     parser.add_argument("--cleanup-skip-p", action="store_true", help="config cleanup_skip_prefill_ranks=true")
     parser.add_argument("--cleanup-with-quiesce", action="store_true", help="config cleanup_with_quiesce=true")
+    parser.add_argument("--handoff-prepare", action="store_true", help="config handoff_prepare_decode=true")
+    parser.add_argument("--inline-metadata", action="store_true", help="config handoff_inline_metadata=true")
+    parser.add_argument("--final-step", action="store_true", help="config final_step_in_gpu_done=true")
+    parser.add_argument("--event-pump", action="store_true", help="config event_pump_thread=true")
+    parser.add_argument("--bootstrap-poll", action="store_true", help="config bootstrap_in_poll=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -210,7 +232,11 @@ def main():
                               decode_skip_prefill_ranks=args.skip_p,
                               prefill_early_token=args.early_token,
                               cleanup_skip_prefill_ranks=args.cleanup_skip_p,
-                              cleanup_with_quiesce=args.cleanup_with_quiesce)
+                              cleanup_with_quiesce=args.cleanup_with_quiesce,
+                              handoff_prepare_decode=args.handoff_prepare,
+                              handoff_inline_metadata=args.inline_metadata,
+                              final_step_in_gpu_done=args.final_step,
+                              event_pump_thread=args.event_pump, bootstrap_in_poll=args.bootstrap_poll)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -252,7 +278,7 @@ def main():
                                        else [default] * len(MODELS))
     timing = dict(zip(MODELS, zip(per_model(args.prefill_ms, PREFILL_S), per_model(args.decode_ms, DECODE_S))))
     processes = [context.Process(target=rank_main, args=(address, key, controller.group_id(m), m, stage, rank,
-                                                         0, stop, timing[m]), daemon=True)
+                                                         0, stop, timing[m], args.final_step), daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()
@@ -324,10 +350,12 @@ def main():
         print("OWNER_HANDLER_MS", busy)
     tpot = {m: round(s["mean_tpot_s"] * 1000, 2) for m, s in result["summary"]["models"].items()}
     print("E2E_PASS run_steps=%d park=%s inline_start=%s skip_p=%s early_token=%s "
-          "cleanup_skip_p=%s cleanup_with_quiesce=%s tok_s=%.2f "
+          "cleanup_skip_p=%s cleanup_with_quiesce=%s six=%s tok_s=%.2f "
           "mean_tpot_ms=%s (simulated decode ms %s) ttft_ms=%s tail_ms=%s cycle_ms=%s inline_starts=%d" % (
         args.run_steps, args.park, args.inline_start, args.skip_p, args.early_token,
         args.cleanup_skip_p, args.cleanup_with_quiesce,
+        "".join("1" if flag else "0" for flag in (args.handoff_prepare, args.inline_metadata, args.final_step,
+                                                   args.event_pump, args.bootstrap_poll)),
         result["summary"]["overall"]["output_tokens_per_second"], tpot,
         {m: round(t[1] * 1000, 1) for m, t in timing.items()},
         {m: round(s["mean_ttft_s"] * 1000, 1) for m, s in result["summary"]["models"].items()},

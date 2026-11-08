@@ -37,6 +37,9 @@ class SharedHeadwiseKVManager(BaseKVManager):
         self.prefill_info_table = {}
         self.transfer_infos = {}
         self.descriptors = {}
+        # bootstrap_in_poll: rooms the latest command long-poll reported READY
+        # (None: not provided, ask the owner with broker_bootstrap).
+        self.bootstrap_ready = None
         self.metadata_buffers = None
         self.is_dummy_cp_rank = False
         self.try_ensure_parallel_info(f"127.0.0.1:{self.ctx.model.bootstrap_port}")
@@ -124,6 +127,13 @@ class SharedHeadwiseKVSender(_Room, BaseKVSender):
         if self.sent:
             return self._status("P")
         view = self.item["reservation_view"]
+        ready = self.kv_mgr.bootstrap_ready
+        if ready is not None:
+            # The long poll returns whenever a destination registers (broker
+            # epoch), so an absent room is simply not ready yet.
+            identity = (self.bootstrap_room, view["allocation_id"], view["version"],
+                        self.item["target_valid_tokens"])
+            return KVPoll.WaitingForInput if identity in ready else KVPoll.Bootstrapping
         reply = self.kv_mgr.rpc("broker_bootstrap", self.bootstrap_room,
                                 self.kv_mgr.rank, self.kv_mgr.pid,
                                 view["allocation_id"], view["version"],
@@ -209,12 +219,17 @@ class SharedHeadwiseKVReceiver(_Room, BaseKVReceiver):
                 and handoff["valid_tokens"] == self.item["target_valid_tokens"]
                 and handoff["rank_block_table"] == self.item["rank_block_table"]
                 and pool.rank == self.kv_mgr.rank, "Committed handoff differs from imported reservation")
-        reply = self.kv_mgr.rpc("broker_lookup", self.bootstrap_room, self.kv_mgr.rank,
-                               self.kv_mgr.pid, self.kv_mgr.ctx.model.model_id,
-                               handoff["request_id"], handoff["attempt"], handoff["allocation_id"],
-                               handoff["version"], handoff["valid_tokens"])
-        require(reply["rank_block_table"] == handoff["rank_block_table"], "Broker mapping mismatch")
-        payload = reply["metadata"]["native_payload"]
+        if "native_metadata" in handoff:
+            # handoff_inline_metadata: the owner put this rank's staged P
+            # metadata into the HANDOFF it built from the PUBLISHED room.
+            payload = handoff["native_metadata"]
+        else:
+            reply = self.kv_mgr.rpc("broker_lookup", self.bootstrap_room, self.kv_mgr.rank,
+                                   self.kv_mgr.pid, self.kv_mgr.ctx.model.model_id,
+                                   handoff["request_id"], handoff["attempt"], handoff["allocation_id"],
+                                   handoff["version"], handoff["valid_tokens"])
+            require(reply["rank_block_table"] == handoff["rank_block_table"], "Broker mapping mismatch")
+            payload = reply["metadata"]["native_payload"]
         require(set(payload) == {"output_id", "cached_tokens", "bootstrap_room"}
                 and payload["bootstrap_room"] == self.bootstrap_room
                 and payload["output_id"] == handoff["boundary_token_id"]

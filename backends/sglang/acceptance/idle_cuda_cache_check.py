@@ -48,6 +48,7 @@ class IdleCacheChecks(unittest.TestCase):
         self.trace = []
         self.reserved = 256 * 1024**2
         self.allocated = 8 * 1024**2
+        self.split = 0  # free bytes inside partly used segments
 
         def empty():
             self.trace.append('empty_cache')
@@ -55,7 +56,10 @@ class IdleCacheChecks(unittest.TestCase):
 
         cuda = SimpleNamespace(device=lambda device: nullcontext(),
             memory_allocated=lambda device: self.allocated,
-            memory_reserved=lambda device: self.reserved, empty_cache=empty)
+            memory_reserved=lambda device: self.reserved, empty_cache=empty,
+            memory_stats=lambda device: {'reserved_bytes.all.current': self.reserved,
+                                         'active_bytes.all.current': self.allocated,
+                                         'inactive_split_bytes.all.current': self.split})
         runtime_type = checked_runtime(cuda)
         runtime = runtime_type.__new__(runtime_type)
         runtime.ctx = SimpleNamespace(group_id='group', model=SimpleNamespace(model_id='llama13b'), stage='D')
@@ -132,6 +136,17 @@ class IdleCacheChecks(unittest.TestCase):
         evidence = json.loads(output.getvalue().split(' ', 1)[1])
         self.assertIn('empty_cache', self.trace)
         self.assertEqual((evidence['trimmed'], evidence['released_reserved_bytes']), (True, 248 * 1024**2))
+
+    def test_threshold_ignores_free_bytes_inside_split_segments(self):
+        runtime, _, _ = self.fixture()
+        self.split = 200 * 1024**2  # 248 MiB unused, but only 48 MiB in whole free segments
+        runtime.ctx.config = SimpleNamespace(idle_cache_trim_mib=128)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            runtime._accept(self.command())
+        evidence = json.loads(output.getvalue().split(' ', 1)[1])
+        self.assertNotIn('empty_cache', self.trace)
+        self.assertEqual((evidence['trimmed'], evidence['trimmable_bytes']), (False, 48 * 1024**2))
 
     def test_live_request_preparation_mapping_or_room_prevents_trimming(self):
         for field, value in (('requests', {'live': object()}), ('prepared', {'batch': object()}),

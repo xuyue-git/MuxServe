@@ -22,6 +22,8 @@ class RuntimeOutbox:
         self.pending: OrderedDict[int, RuntimeEvent] = OrderedDict()
         self.lock = RLock()
         self.reserved: dict[str, int] = {}
+        # Called after every emitted event (e.g. to wake an event pump).
+        self.on_emit: Callable[[], None] | None = None
 
     def reserve(self, owner: str, count: int) -> None:
         with self.lock:
@@ -65,6 +67,8 @@ class RuntimeOutbox:
             self.next_seq += 1
             if owner is not None:
                 self.reserved[owner] -= 1
+            if self.on_emit is not None:
+                self.on_emit()
             return deepcopy(event)
 
     def ack(self, sequence: int) -> None:

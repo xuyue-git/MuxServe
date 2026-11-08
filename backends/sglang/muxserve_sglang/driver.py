@@ -28,6 +28,15 @@ class ControllerDriver:
             receiver.last_seq = groups[model_id]["acked_event_seq"]
         self.stop_event = Event()
         self.thread = Thread(target=self.run, name="external-adbs-driver", daemon=False)
+        # event_pump_thread: once started, a second thread alone delivers
+        # runtime events (TOKEN/TERMINAL) to the gateway, so they never wait
+        # for a scheduling pass (tick, START, prepare). Synchronous step()
+        # calls (initialization) keep pumping inline.
+        events_wake = getattr(controller, "events_wake", None)
+        self.pump_thread = (Thread(target=self._pump_loop, name="event-pump", daemon=False)
+                            if getattr(self.config, "event_pump_thread", False) and events_wake is not None
+                            else None)
+        self._pumping = False
         # A scheduling driver owns START grants; the controller may then issue
         # them inline (config inline_start) until pause() or a failure.
         self._inline(schedule)
@@ -38,7 +47,31 @@ class ControllerDriver:
             setter(allowed)
 
     def start(self):
+        if self.pump_thread is not None:
+            self._pumping = True
+            self.pump_thread.start()
         self.thread.start()
+
+    def _pump_events(self):
+        for model_id, receiver in self.receivers.items():
+            group_id = receiver.group_id
+            for event in self.controller.poll_events(group_id, receiver.last_seq):
+                receiver.receive(event)
+            if receiver.last_seq:
+                self.controller.ack_events(group_id, receiver.last_seq)
+
+    def _pump_loop(self):
+        wake = self.controller.events_wake
+        try:
+            while not self.stop_event.is_set():
+                wake.clear()  # before pumping: an event emitted meanwhile keeps it set
+                self._pump_events()
+                wake.wait(0.02)
+        except Exception as exc:
+            self.failure = exc
+            self.schedule = False
+            self._inline(False)
+            logger.exception("Event pump stopped; supervisor must retain producers")
 
     def run(self):
         # Wake on controller activity (reports, decode steps, submissions,
@@ -67,12 +100,8 @@ class ControllerDriver:
         if inline_error is not None:
             raise inline_error  # an inline START failed exactly where ours would have
         proposals = self.controller.tick(include_adjustments=False)
-        for model_id, receiver in self.receivers.items():
-            group_id = receiver.group_id
-            for event in self.controller.poll_events(group_id, receiver.last_seq):
-                receiver.receive(event)
-            if receiver.last_seq:
-                self.controller.ack_events(group_id, receiver.last_seq)
+        if not self._pumping:
+            self._pump_events()
         self.maintain()
         progress = self.controller.batch_progress()
         everyone = {(stage, rank) for stage in ("P", "D") for rank in range(self.config.tp_size)}
@@ -156,10 +185,13 @@ class ControllerDriver:
     def stop(self):
         self._inline(False)
         self.stop_event.set()
-        wake = getattr(self.controller, "wake", None)
-        if wake is not None:
-            wake.set()
+        for name in ("wake", "events_wake"):
+            event = getattr(self.controller, name, None)
+            if event is not None:
+                event.set()
         self.thread.join()
+        if self.pump_thread is not None and self.pump_thread.is_alive():
+            self.pump_thread.join()
 
     def pause(self):
         """Return after any current CPU grant call; issue no later grants."""

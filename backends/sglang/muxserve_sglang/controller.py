@@ -222,6 +222,8 @@ class MuxController:
         # Parked decode runs wait here for credits to come back.
         self._park_cv = Condition(self.lock)
         self.wake = Event()
+        # Set by every runtime event; the driver's event pump thread waits here.
+        self.events_wake = Event()
         if type(initializing) is not bool:
             raise IntegrationError("INVALID_ARGUMENT", "Initialization gate must be boolean")
         self.initializing = initializing
@@ -248,6 +250,7 @@ class MuxController:
                            RuntimeOutbox(group_id, model.model_id, event_window),
                            retired=_RetiredIds(config.batch_history_limit))
             group.outbox.reserve("group_error", 1)
+            group.outbox.on_emit = self.events_wake.set
             self.groups[model.model_id] = group
             self.by_group[group.group_id] = group
             blocks_per_group[model.model_id] = layout.blocks_per_token_group
@@ -557,7 +560,16 @@ class MuxController:
                 for cmd in commands:
                     trace.ev("dlv", cmd.get("batch_id") or cmd.get("cleanup_id"), kind=cmd.get("kind"),
                              m=group.model_id, s=stage, r=rank, seq=cmd.get("command_seq"))
-            return {"commands": commands, "epoch": group.epoch}
+            reply = {"commands": commands, "epoch": group.epoch}
+            if self.config.bootstrap_in_poll and stage == "P":
+                # Exactly the rooms broker_bootstrap would report READY (every
+                # D destination registered, not aborted, group not fenced),
+                # with the identity the P sender must match.
+                reply["bootstrap_ready"] = () if group.fenced else tuple(
+                    (room, entry["allocation_id"], entry["reserved_version"], entry["target_valid_tokens"])
+                    for room, entry in group.broker.items()
+                    if entry["state"] != "ABORTED" and set(entry["destinations"]) == set(group.ranks))
+            return reply
 
     def submit_request(self, spec: RequestSpec, *, initialization_token: str | None = None) -> dict:
         trace.ev("submit", None, m=getattr(spec, "model_id", None), req=getattr(spec, "request_id", None))
@@ -815,7 +827,10 @@ class MuxController:
                     "groups": {m: {"group_id": g.group_id, "ready": g.ready,
                                     "fenced": g.fenced} for m, g in self.groups.items()}}
 
-    def prepare_batch(self, plan: BatchPlan) -> dict:
+    def prepare_batch(self, plan: BatchPlan, *, _after_handoff: "_Batch | None" = None) -> dict:
+        """``_after_handoff`` (controller-internal, handoff_prepare_decode): the
+        prefill batch whose HANDOFF was just queued; its requests may then
+        prepare their first decode batch while that batch is in HANDOFF."""
         trace.ev("prep_call", getattr(plan, "batch_id", None), m=getattr(plan, "model_id", None),
                  s=getattr(plan, "stage", None))
         with self.lock:
@@ -860,11 +875,16 @@ class MuxController:
                 request = self._request(plan.model_id, ref.request_id)
                 # Request state can change after a policy snapshot. Validate it
                 # here as a stale selection, not as a malformed immutable plan.
+                if _after_handoff is not None:
+                    state_ok = (plan.stage == "D" and request.state == "RUNNING"
+                                and _after_handoff.status == "HANDOFF"
+                                and self._active(request) is _after_handoff)
+                else:
+                    state_ok = (request.state == ("REBUILD" if plan.purpose == "REBUILD" else
+                                                  "QUEUED" if plan.stage == "P" else "DECODING")
+                                and not self._active(request))
                 if (request.attempt != ref.attempt or len(request.output) != ref.expected_output_count
-                        or request.pending_reason or self.clock() >= request.deadline
-                        or request.state != ("REBUILD" if plan.purpose == "REBUILD" else
-                                             "QUEUED" if plan.stage == "P" else "DECODING")
-                        or self._active(request)):
+                        or request.pending_reason or self.clock() >= request.deadline or not state_ok):
                     raise IntegrationError("STALE_ATTEMPT", "Request state/output changed before prepare")
                 if plan.stage == "P":
                     target = len(request.spec.input_ids) + (len(request.output) - 1 if plan.purpose == "REBUILD" else 0)
@@ -1282,6 +1302,8 @@ class MuxController:
             elif kind == "GPU_DONE":
                 if batch.status not in ("RUNNING", "FENCED"):
                     raise IntegrationError("STALE_REPORT", "GPU_DONE requires started batch")
+                if "final_step" in payload:
+                    payload = self._record_final_step(group, batch, rank, payload)
                 self._gpu_done(group, batch, rank, payload)
             elif kind == "HANDOFF_READY":
                 if stage != "D" or batch.plan.stage != "P" or batch.status != "HANDOFF":
@@ -1607,6 +1629,8 @@ class MuxController:
                 # until every D rank has accepted the handoff.
                 self._apply_tokens(group, batch, settle=False)
                 batch.tokens_published = True
+                if self.config.handoff_prepare_decode and batch.plan.purpose == "GENERATE":
+                    self._prepare_after_handoff(group, batch)
         else:
             if batch.plan.steps > 1:
                 if batch.run_applied != batch.run_steps_done:
@@ -1629,6 +1653,56 @@ class MuxController:
                             and request.finish_reason in ("eos", "length")
                             and request.pending_reason is None):
                         self._begin_cleanup(request, quiescing=batch)
+
+    def _prepare_after_handoff(self, group: _Group, batch: _Batch) -> None:
+        """Caller holds the lock; ``batch`` is a prefill whose HANDOFF commands
+        were just queued. Prepare its requests' first decode batch now: its
+        PREPARE follows the HANDOFF on every D rank, which executes commands in
+        order (a HANDOFF holds back later commands until it completes), so
+        each rank prepares right after its handoff and the last READY STARTs it
+        inline. Any refusal leaves the ordinary driver path to prepare it."""
+        if not self._inline_start_allowed or self.protected_failure is not None or group.fenced:
+            return
+        refs, remaining = [], []
+        for ref in batch.plan.requests:
+            request = self._request(group.model_id, ref.request_id)
+            if (request.attempt != ref.attempt or request.finish_reason or request.pending_reason
+                    or len(request.output) != ref.expected_output_count + 1):
+                return
+            refs.append(RequestRef(ref.request_id, ref.attempt, len(request.output)))
+            remaining.append(request.spec.max_new_tokens - len(request.output))
+        steps = max(1, min([self.config.decode_run_steps] + remaining))
+        plan = BatchPlan(group.group_id, uuid4().hex, group.model_id, "D", tuple(refs),
+                         purpose="GENERATE", prepare_timeout_ms=self.config.prepare_timeout_ms,
+                         steps=steps)
+        try:
+            self.prepare_batch(plan, _after_handoff=batch)
+        except IntegrationError as exc:
+            trace.ev("prep_fail", None, m=group.model_id, s="D", code=exc.code, after_handoff=True)
+            if exc.code not in ("OUT_OF_CAPACITY", "OUT_OF_CREDITS", "STAGE_BUSY", "NOT_READY",
+                                "STALE_ATTEMPT", "EVENT_BACKPRESSURE", "COMMAND_BACKPRESSURE"):
+                # Surfaced by the driver, exactly as its own prepare_batch
+                # failure would have been (same contract as inline_start).
+                self.inline_start_error = exc
+                self._inline_start_allowed = False
+                self.wake.set()
+
+    def _record_final_step(self, group: _Group, batch: _Batch, rank: int, payload: dict) -> dict:
+        """final_step_in_gpu_done: the rank ended its run locally (finished or
+        last granted step), whose decision is always to stop; record that step
+        exactly as its decode_step would have, then handle the GPU_DONE."""
+        final = payload["final_step"]
+        rest = {key: value for key, value in payload.items() if key != "final_step"}
+        if (not self.config.final_step_in_gpu_done or batch.plan.stage != "D" or batch.plan.steps < 2
+                or not isinstance(final, dict) or set(final) != {"step", "results", "finished"}
+                or final["step"] != rest.get("steps") or final["results"] != rest.get("results")):
+            raise IntegrationError("INVALID_REPORT", "GPU_DONE final step mismatch")
+        trace.ev("dstep", batch.plan.batch_id, gid=group.group_id, r=rank, step=final["step"])
+        decision = self._record_step(group, batch, rank, final["step"], final["results"], final["finished"])
+        if decision is not False:
+            self._fence(group, batch, "final_step_continues")
+            raise IntegrationError("INVALID_REPORT", "A locally final decode step must stop the run")
+        return rest
 
     def _finish_run_tokens(self, group: _Group, batch: _Batch) -> None:
         """Tokens were published per agreed step; only settle request states."""
@@ -1653,68 +1727,75 @@ class MuxController:
             if target is None or target.pid != pid or not target.alive:
                 raise IntegrationError("UNKNOWN_RANK", "Registered D rank/PID required")
             batch = self._batch(group, batch_id)
-            if (batch.plan.stage != "D" or batch.plan.steps < 2
-                    or batch.status not in ("RUNNING", "FENCED")):
-                raise IntegrationError("STALE_REPORT", "No running decode run")
-            if (type(step) is not int or not 1 <= step <= batch.plan.steps
-                    or type(finished) is not bool or not isinstance(results, (list, tuple))
-                    or len(results) != len(batch.plan.requests)):
-                raise IntegrationError("INVALID_REPORT", "Invalid decode step report")
-            entry = (tuple(deepcopy(dict(item)) if isinstance(item, dict) else item for item in results),
-                     finished)
-            # A rejected report must not create a step entry (GPU_DONE treats
-            # any entry after the last step as a protocol error).
-            reported = batch.run_reports.get(step, {})
-            if rank in reported:
-                if reported[rank] != entry:
-                    self._fence(group, batch, "decode_step_conflict")
-                    raise IntegrationError("IDENTITY_CONFLICT", "Decode step replay changed")
-                return {"continue": batch.run_decisions.get(step, False)}
-            if step > 1 and (rank not in batch.run_reports.get(step - 1, {})
-                             or batch.run_decisions.get(step - 1) is not True):
-                raise IntegrationError("REPORT_GAP", "Decode step was not granted")
-            for ref, result in zip(batch.plan.requests, entry[0]):
-                if (not isinstance(result, dict)
-                        or set(result) != {"request_id", "attempt", "token_id", "valid_tokens"}
-                        or result["request_id"] != ref.request_id or result["attempt"] != ref.attempt
-                        or result["valid_tokens"] != batch.run_start_valid[ref.request_id] + step
-                        or type(result["token_id"]) is not int
-                        or not 0 <= result["token_id"] < group.capability["vocab_size"]):
-                    raise IntegrationError("INVALID_REPORT", "Decode step result mismatch")
-            if reported and next(iter(reported.values())) != entry:
-                self._fence(group, batch, "cross_rank_token_conflict")
-                raise IntegrationError("IDENTITY_CONFLICT", "Greedy ranks disagree")
-            reported[rank] = entry
-            batch.run_reports[step] = reported
-            batch.progress_at = self.clock()
-            applied = False
-            if (len(reported) == len(group.ranks) and batch.run_applied == step - 1
-                    and batch.status == "RUNNING"):
-                self._apply_run_step(group, batch, step, entry[0])
-                applied = True
-            decision = batch.run_decisions.get(step)
-            if decision is None:
-                decision = self._run_continues(group, batch, step, finished)
-                batch.run_decisions[step] = decision
-            if (decision == "PARK" and len(reported) == len(group.ranks)
-                    and batch.parked_at is None):
-                # Every rank finished (and synchronized) forward ``step``: the
-                # run uses no SMs until it resumes, so its credits go to the
-                # waiting prefill. KV reservation and native state stay.
-                batch.parked_at = self.clock()
-                trace.ev("park", batch_id, m=group.model_id, step=step)
-                self._release_credits(batch_id)
-                self.wake.set()
-                # The last run to park frees the credits the READY prefill
-                # waits for: START it now (inline_start), not a driver pass later.
-                self._start_ready_inline()
-            # A step report changes no command, liveness or broker epoch, so
-            # the ranks' long polls need no wake-up (notify_all here woke every
-            # waiting poll thread four times per token). Wake only the driver,
-            # once per published step or when the run stops.
-            if applied or decision is False:
-                self.wake.set()
-            return {"continue": decision}
+            return {"continue": self._record_step(group, batch, rank, step, results, finished)}
+
+    def _record_step(self, group: _Group, batch: _Batch, rank: int, step: int,
+                     results, finished: bool) -> bool | str:
+        """Caller holds the lock and verified the D rank. Returns the step's
+        (once decided, replayed) continue decision."""
+        batch_id = batch.plan.batch_id
+        if (batch.plan.stage != "D" or batch.plan.steps < 2
+                or batch.status not in ("RUNNING", "FENCED")):
+            raise IntegrationError("STALE_REPORT", "No running decode run")
+        if (type(step) is not int or not 1 <= step <= batch.plan.steps
+                or type(finished) is not bool or not isinstance(results, (list, tuple))
+                or len(results) != len(batch.plan.requests)):
+            raise IntegrationError("INVALID_REPORT", "Invalid decode step report")
+        entry = (tuple(deepcopy(dict(item)) if isinstance(item, dict) else item for item in results),
+                 finished)
+        # A rejected report must not create a step entry (GPU_DONE treats
+        # any entry after the last step as a protocol error).
+        reported = batch.run_reports.get(step, {})
+        if rank in reported:
+            if reported[rank] != entry:
+                self._fence(group, batch, "decode_step_conflict")
+                raise IntegrationError("IDENTITY_CONFLICT", "Decode step replay changed")
+            return batch.run_decisions.get(step, False)
+        if step > 1 and (rank not in batch.run_reports.get(step - 1, {})
+                         or batch.run_decisions.get(step - 1) is not True):
+            raise IntegrationError("REPORT_GAP", "Decode step was not granted")
+        for ref, result in zip(batch.plan.requests, entry[0]):
+            if (not isinstance(result, dict)
+                    or set(result) != {"request_id", "attempt", "token_id", "valid_tokens"}
+                    or result["request_id"] != ref.request_id or result["attempt"] != ref.attempt
+                    or result["valid_tokens"] != batch.run_start_valid[ref.request_id] + step
+                    or type(result["token_id"]) is not int
+                    or not 0 <= result["token_id"] < group.capability["vocab_size"]):
+                raise IntegrationError("INVALID_REPORT", "Decode step result mismatch")
+        if reported and next(iter(reported.values())) != entry:
+            self._fence(group, batch, "cross_rank_token_conflict")
+            raise IntegrationError("IDENTITY_CONFLICT", "Greedy ranks disagree")
+        reported[rank] = entry
+        batch.run_reports[step] = reported
+        batch.progress_at = self.clock()
+        applied = False
+        if (len(reported) == len(group.ranks) and batch.run_applied == step - 1
+                and batch.status == "RUNNING"):
+            self._apply_run_step(group, batch, step, entry[0])
+            applied = True
+        decision = batch.run_decisions.get(step)
+        if decision is None:
+            decision = self._run_continues(group, batch, step, finished)
+            batch.run_decisions[step] = decision
+        if (decision == "PARK" and len(reported) == len(group.ranks)
+                and batch.parked_at is None):
+            # Every rank finished (and synchronized) forward ``step``: the
+            # run uses no SMs until it resumes, so its credits go to the
+            # waiting prefill. KV reservation and native state stay.
+            batch.parked_at = self.clock()
+            trace.ev("park", batch_id, m=group.model_id, step=step)
+            self._release_credits(batch_id)
+            self.wake.set()
+            # The last run to park frees the credits the READY prefill
+            # waits for: START it now (inline_start), not a driver pass later.
+            self._start_ready_inline()
+        # A step report changes no command, liveness or broker epoch, so
+        # the ranks' long polls need no wake-up (notify_all here woke every
+        # waiting poll thread four times per token). Wake only the driver,
+        # once per published step or when the run stops.
+        if applied or decision is False:
+            self.wake.set()
+        return decision
 
     def decode_resume(self, group_id: str, rank: int, pid: int, batch_id: str, step: int,
                       wait_ms: int | float = 100) -> dict:
@@ -1873,7 +1954,12 @@ class MuxController:
             room = next(number for number, entry in group.broker.items()
                         if entry["batch_id"] == batch.plan.batch_id and
                         entry["identity"] == request.identity)
-            items.append({"request_id": ref.request_id, "attempt": ref.attempt,
+            extra = {}
+            if self.config.handoff_inline_metadata:
+                # What broker_lookup would return: this rank's staged P
+                # metadata of the PUBLISHED room (checked at all-rank GPU_DONE).
+                extra["native_metadata"] = deepcopy(group.broker[room]["metadata"][rank]["native_payload"])
+            items.append({**extra, "request_id": ref.request_id, "attempt": ref.attempt,
                           "bootstrap_room": room, "allocation_id": request.allocation_id,
                           "version": request.version, "valid_tokens": request.valid_tokens,
                           "rank_block_table": _packed_view(batch, ref.request_id, committed=True)[rank],
@@ -2001,6 +2087,13 @@ class MuxController:
             raise
         for ref in batch.plan.requests:
             request = self._request(group.model_id, ref.request_id)
+            if any(other is not batch and other.status not in ("DONE", "ABORTED")
+                   and any(r.request_id == ref.request_id and r.attempt == request.attempt
+                           for r in other.plan.requests)
+                   for other in group.batches.values()):
+                # handoff_prepare_decode: the request's first decode batch is
+                # already prepared or running; that batch owns its state now.
+                continue
             if request.pending_reason or request.finish_reason:
                 request.state = "CLEANUP_PENDING"
             elif batch.plan.purpose == "REBUILD":
@@ -2079,6 +2172,14 @@ class MuxController:
             raise IntegrationError("IDENTITY_CONFLICT", "Conflicting pending stop reason")
         request.pending_reason = reason
         active = self._active(request)
+        group = self._model(request.spec.model_id)
+        for other in tuple(group.batches.values()):
+            # handoff_prepare_decode: a decode batch prepared behind the
+            # request's still-active prefill is revoked as well.
+            if (other is not active and other.status == "PREPARING" and any(
+                    ref.request_id == request.spec.request_id and ref.attempt == request.attempt
+                    for ref in other.plan.requests)):
+                self._abort_prepared(group, other, reason)
         if active is not None:
             if active.status == "PREPARING":
                 self._abort_prepared(self._model(request.spec.model_id), active, reason)
