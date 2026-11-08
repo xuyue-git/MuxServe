@@ -988,16 +988,29 @@ class HandoffRoundTrips(unittest.TestCase):
                      handoff_prepare_decode=True)
         config = load()
         for name in ("handoff_deliver_first", "handoff_ack_in_poll", "handoff_report_with_ready",
-                     "start_in_report_reply", "targeted_wake"):
+                     "start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods"):
             self.assertFalse(getattr(config, name))
             expect("INVALID_CONFIG", lambda: load(**{name: 1}))
-        for name in ("start_in_report_reply", "targeted_wake"):
+        for name in ("start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods"):
             self.assertTrue(getattr(load(**{name: True}), name))
         for name in ("handoff_deliver_first", "handoff_report_with_ready"):
             expect("INVALID_CONFIG", lambda: load(**{name: True}))
             self.assertTrue(getattr(load(**chain, **{name: True}), name))
         expect("INVALID_CONFIG", lambda: load(handoff_ack_in_poll=True))
         self.assertTrue(load(handoff_ack_in_poll=True, broker_status_in_poll=True).handoff_ack_in_poll)
+
+
+class RpcInlineMethods(unittest.TestCase):
+    def test_only_bounded_owner_lock_methods_are_listed(self):
+        self.assertEqual(Sim(run_steps=4).controller.rpc_inline_methods(), ())
+        controller = Sim(run_steps=4, rpc_inline_fast_methods=True).controller
+        listed = set(controller.rpc_inline_methods())
+        self.assertLessEqual(listed, set(controller.rpc_methods()))
+        for name in ("poll_commands_wait", "rank_report", "rank_reports", "decode_step", "decode_resume"):
+            self.assertIn("controller_" + name, listed)
+        for name in ("register_rank", "prepare_batch", "start_batch", "snapshot", "begin_drain",
+                     "close_ready", "metrics", "request_capacity"):
+            self.assertNotIn("controller_" + name, listed)
 
 
 class EventPumpLock(unittest.TestCase):

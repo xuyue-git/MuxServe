@@ -342,6 +342,16 @@ class MuxController:
                  "poll_commands_wait", "decode_step", "decode_resume")
         return {"controller_" + name: getattr(self, name) for name in names}
 
+    def rpc_inline_methods(self) -> tuple[str, ...]:
+        """rpc_inline_fast_methods: methods that only take the owner lock and
+        wait at most 1 s (the long polls validate that bound themselves)."""
+        if not self.config.rpc_inline_fast_methods:
+            return ()
+        return tuple("controller_" + name for name in (
+            "poll_commands", "poll_commands_wait", "rank_report", "rank_reports",
+            "decode_step", "decode_resume", "broker_stage", "broker_lookup", "broker_ack",
+            "broker_poll", "broker_register_destination", "broker_bootstrap"))
+
     def _release_credits(self, batch_id: str) -> None:
         """Caller holds the lock. Parked decode runs re-check on every release."""
         self.credits.release(batch_id)

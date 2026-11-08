@@ -272,6 +272,7 @@ def main():
     parser.add_argument("--combined-report", action="store_true", help="config handoff_report_with_ready=true")
     parser.add_argument("--start-in-reply", action="store_true", help="config start_in_report_reply=true")
     parser.add_argument("--targeted-wake", action="store_true", help="config targeted_wake=true")
+    parser.add_argument("--rpc-inline", action="store_true", help="config rpc_inline_fast_methods=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -307,7 +308,8 @@ def main():
                               handoff_ack_in_poll=args.ack_in_poll,
                               handoff_report_with_ready=args.combined_report,
                               start_in_report_reply=args.start_in_reply,
-                              targeted_wake=args.targeted_wake)
+                              targeted_wake=args.targeted_wake,
+                              rpc_inline_fast_methods=args.rpc_inline)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -336,7 +338,8 @@ def main():
         return call
     methods = {name: traced(name, method) for name, method in controller.rpc_methods().items()}
     server = StorageRPCServer(store, owner, address, key, extra_methods=methods,
-                              owner_close=owner.close)
+                              owner_close=owner.close, inline_methods=controller.rpc_inline_methods(),
+                              eager_io=config.rpc_inline_fast_methods)
     if args.profile:
         import cProfile  # Python 3.12+: one interpreter-wide profiler covers every thread
         profiles.append(cProfile.Profile())

@@ -42,6 +42,7 @@
 # (HANDOFF_READY and READY in one RPC: config handoff_report_with_ready=true; needs
 # HANDOFF_PREPARE), START_IN_REPLY=1 (START in the last READY's reply: config
 # start_in_report_reply=true), TARGETED_WAKE=1 (long polls woken per rank: config targeted_wake=true),
+# RPC_INLINE=1 (short control RPCs on the connection thread: config rpc_inline_fast_methods=true),
 # FROZEN_BUNDLE=/abs/frozen-synthetic-512-128.json (original MuxServe's fixed-workload
 # input per model; every output must equal its expected tokens), WARMUP_TOTAL=128
 # (warmup split 43/43/42 over the models as the original; overrides WARMUP),
@@ -90,6 +91,7 @@ ACK_IN_POLL="${ACK_IN_POLL:-}"
 COMBINED_REPORT="${COMBINED_REPORT:-}"
 START_IN_REPLY="${START_IN_REPLY:-}"
 TARGETED_WAKE="${TARGETED_WAKE:-}"
+RPC_INLINE="${RPC_INLINE:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -97,14 +99,14 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$DELIVER_FIRST" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$DELIVER_FIRST" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
  handoff_prepare, inline_meta, final_step, event_pump, bootstrap_poll,
  inline_prepare, own_table, register_ready, broker_poll, early_terminal,
  slot_at_cleanup, deliver_first, ack_in_poll, combined_report, start_in_reply,
- targeted_wake) = sys.argv[1:]
+ targeted_wake, rpc_inline) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -133,7 +135,8 @@ for key, value in (("inline_start", inline), ("decode_skip_prefill_ranks", skip_
                    ("slot_free_at_cleanup", slot_at_cleanup),
                    ("handoff_deliver_first", deliver_first), ("handoff_ack_in_poll", ack_in_poll),
                    ("handoff_report_with_ready", combined_report),
-                   ("start_in_report_reply", start_in_reply), ("targeted_wake", targeted_wake)):
+                   ("start_in_report_reply", start_in_reply), ("targeted_wake", targeted_wake),
+                   ("rpc_inline_fast_methods", rpc_inline)):
     config.pop(key, None)
     if value:
         config[key] = True
@@ -174,7 +177,8 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "ack_in_poll=%s" % config.get("handoff_ack_in_poll", False),
       "combined_report=%s" % config.get("handoff_report_with_ready", False),
       "start_in_reply=%s" % config.get("start_in_report_reply", False),
-      "targeted_wake=%s" % config.get("targeted_wake", False))
+      "targeted_wake=%s" % config.get("targeted_wake", False),
+      "rpc_inline=%s" % config.get("rpc_inline_fast_methods", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

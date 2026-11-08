@@ -227,6 +227,11 @@ class DeploymentConfig:
     # A long-polling rank is woken only by its own command or its group's
     # broker change, not by every owner state change.
     targeted_wake: bool = False
+    # The owner's short control RPCs (rank reports, step reports, command
+    # polls, broker calls) run on the connection's handler thread instead of a
+    # new thread per call, and its sockets read and write before polling. Their
+    # waits are already bounded; every other RPC keeps its worker and deadline.
+    rpc_inline_fast_methods: bool = False
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -305,7 +310,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "bootstrap_in_poll", "inline_prepare", "prepare_own_rank_table",
                  "register_in_ready", "broker_status_in_poll", "terminal_before_cleanup",
                  "slot_free_at_cleanup", "handoff_deliver_first", "handoff_ack_in_poll",
-                 "handoff_report_with_ready", "start_in_report_reply", "targeted_wake"):
+                 "handoff_report_with_ready", "start_in_report_reply", "targeted_wake",
+                 "rpc_inline_fast_methods"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.handoff_deliver_first and not config.handoff_prepare_decode:

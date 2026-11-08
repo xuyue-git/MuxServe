@@ -73,10 +73,13 @@ class _DeadlineConnection:
     every partial frame read/write without creating a helper thread.
     """
     def __init__(self, connection: Connection, deadline: float,
-                 pending: list[Thread] | None = None):
+                 pending: list[Thread] | None = None, eager: bool = False):
         self.connection = connection
         self.deadline = deadline
         self.pending = pending
+        # eager: try the non-blocking read/write first and poll only when it
+        # would block. Each avoided poll is one less GIL release and re-acquire.
+        self.eager = eager
         self._poller = select.poll()
         duplicate = os.dup(connection.fileno())
         try:
@@ -114,10 +117,15 @@ class _DeadlineConnection:
         view = memoryview(data)
         offset = 0
         while offset < length:
-            self._wait(select.POLLIN)
+            if self.eager:
+                self.remaining()
+            else:
+                self._wait(select.POLLIN)
             try:
                 count = self._socket.recv_into(view[offset:], length-offset, socket.MSG_DONTWAIT)
             except (BlockingIOError, InterruptedError):
+                if self.eager:
+                    self._wait(select.POLLIN)
                 continue
             if not count:
                 raise EOFError("Local RPC frame ended before completion")
@@ -128,10 +136,15 @@ class _DeadlineConnection:
         view = memoryview(value)
         offset = 0
         while offset < len(view):
-            self._wait(select.POLLOUT)
+            if self.eager:
+                self.remaining()
+            else:
+                self._wait(select.POLLOUT)
             try:
                 count = self._socket.send(view[offset:], socket.MSG_DONTWAIT)
             except (BlockingIOError, InterruptedError):
+                if self.eager:
+                    self._wait(select.POLLOUT)
                 continue
             if not count:
                 raise EOFError("Local RPC frame could not be sent")
@@ -196,6 +209,18 @@ def _bounded(operation: Callable[[], Any], timeout: float,
     if not ok:
         raise value
     return value
+
+
+def _run_inline(operation: Callable[[], Any], timeout: float) -> Any:
+    """_bounded's admission on the calling thread, for owner-lock-only control
+    methods. No worker thread: the connection's handler thread runs it, so the
+    handler (and the close barrier behind it) stays pinned until it returns."""
+    if not _operation_slots.acquire(timeout=max(0, timeout)):
+        raise IntegrationError("RPC_TIMEOUT", "Local RPC worker capacity deadline expired")
+    try:
+        return operation()
+    finally:
+        _operation_slots.release()
 
 
 def _encode(value: Any) -> bytes:
@@ -428,7 +453,9 @@ class StorageRPCServer:
                  extra_methods: dict[str, Callable[..., Any]] | None = None,
                  allow_owner_shutdown: bool = False,
                  owner_close: Callable[[], None] | None = None,
-                 failure_event: Any = None):
+                 failure_event: Any = None,
+                 inline_methods: tuple[str, ...] = (),
+                 eager_io: bool = False):
         # If the keeper cannot start, this constructor thread itself must be
         # capable of holding the owner until the close barrier proves safety.
         if current_thread().daemon:
@@ -453,7 +480,7 @@ class StorageRPCServer:
                                           name="storage-owner-lifetime-keeper")
             self._failure_thread.start()
             self._initialize(store, address, authkey, timeout_s,
-                             extra_methods, allow_owner_shutdown)
+                             extra_methods, allow_owner_shutdown, inline_methods, eager_io)
         except BaseException:
             self._mark_failure("RPC_INIT_FAILED")
             self._retain_until_safe()
@@ -461,7 +488,8 @@ class StorageRPCServer:
 
     def _initialize(self, store: HeadwiseStore, address: str, authkey: bytes,
                     timeout_s: float, extra_methods: dict[str, Callable[..., Any]] | None,
-                    allow_owner_shutdown: bool) -> None:
+                    allow_owner_shutdown: bool, inline_methods: tuple[str, ...] = (),
+                    eager_io: bool = False) -> None:
         _validate_options(authkey, timeout_s)
         self.address = _validate_endpoint(address, create=True)
         self.store = store
@@ -484,6 +512,12 @@ class StorageRPCServer:
             if not isinstance(name, str) or name.startswith("_") or name in self._methods or not callable(method):
                 raise IntegrationError("INVALID_ARGUMENT", "Invalid explicit owner RPC extension")
             self._methods[name] = method
+        # Only explicit extensions, whose owner states they never block on
+        # native work beyond their own bounded waits, may skip the worker.
+        self._inline = frozenset(inline_methods)
+        if not self._inline <= set(extra_methods or {}):
+            raise IntegrationError("INVALID_ARGUMENT", "Inline RPC methods must be explicit owner extensions")
+        self._eager_io = bool(eager_io)
         self._stop = Event()
         self._closing_handlers = False
         # Each authenticated rank keeps one persistent connection (24 ranks for
@@ -586,7 +620,7 @@ class StorageRPCServer:
         timed = None
         try:
             timed = _DeadlineConnection(conn, deadline if deadline is not None else
-                                        time.monotonic() + self.timeout_s, pending)
+                                        time.monotonic() + self.timeout_s, pending, eager=self._eager_io)
             deliver_challenge(timed, self._authkey)
             answer_challenge(timed, self._authkey)
             first = True
@@ -614,8 +648,12 @@ class StorageRPCServer:
                     # An operation that outlives a deadline may still mutate storage;
                     # reservation/consumer references therefore remain pinned.
                     try:
-                        result = _bounded(lambda: method(*request["args"], **request["kwargs"]),
-                                          timed.remaining(), pending=pending)
+                        if request["method"] in self._inline:
+                            result = _run_inline(lambda: method(*request["args"], **request["kwargs"]),
+                                                 timed.remaining())
+                        else:
+                            result = _bounded(lambda: method(*request["args"], **request["kwargs"]),
+                                              timed.remaining(), pending=pending)
                     except IntegrationError as exc:
                         uncertain = exc.code == "RPC_TIMEOUT"
                         raise

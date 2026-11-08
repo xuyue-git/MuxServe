@@ -23,11 +23,11 @@ from muxserve_sglang.storage import HeadwiseStore
 
 
 @contextmanager
-def pair(timeout=1):
+def pair(timeout=1, eager=False):
     left, right = socket.socketpair()
     left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
     connection, peer = Connection(left.detach()), Connection(right.detach())
-    timed = ipc._DeadlineConnection(connection, time.monotonic()+timeout)
+    timed = ipc._DeadlineConnection(connection, time.monotonic()+timeout, eager=eager)
     try:
         yield timed, peer, connection
     finally:
@@ -109,6 +109,43 @@ class FramingChecks(unittest.TestCase):
                 stopped.set()
                 producer.join(1)
                 self.assertFalse(producer.is_alive())
+
+    def test_eager_io_handles_partial_frames_and_stays_bounded(self):
+        with pair(eager=True) as (timed, peer, connection):
+            def later():
+                time.sleep(0.03)
+                os.write(peer.fileno(), struct.pack('!i', 5)+b'ab')
+                time.sleep(0.03)
+                os.write(peer.fileno(), b'cde')
+            worker = Thread(target=later)
+            worker.start()
+            self.assertEqual(timed.recv_bytes(), b'abcde')  # nothing was readable at first
+            worker.join(1)
+            timed.send_bytes(b'response')
+            self.assertEqual(peer.recv_bytes(), b'response')
+        with pair(eager=True) as (timed, peer, connection):
+            os.write(peer.fileno(), struct.pack('!i', 5)+b'ab')
+            peer.close()
+            with self.assertRaises((EOFError, OSError, IntegrationError)):
+                timed.recv_bytes()
+        with pair(timeout=0.08, eager=True) as (timed, peer, connection):  # silent peer
+            beginning = time.monotonic()
+            with self.assertRaises(IntegrationError) as error:
+                timed.recv_bytes()
+            self.assertEqual(error.exception.code, 'RPC_TIMEOUT')
+            self.assertLess(time.monotonic()-beginning, 0.25)
+        with pair(timeout=0.08, eager=True) as (timed, peer, connection):  # blocked write
+            beginning = time.monotonic()
+            with self.assertRaises(IntegrationError) as error:
+                timed.send_bytes(b'x'*(2*1024**2))
+            self.assertEqual(error.exception.code, 'RPC_TIMEOUT')
+            self.assertLess(time.monotonic()-beginning, 0.25)
+        with pair(timeout=0.01, eager=True) as (timed, peer, connection):  # readable, but expired
+            peer.send_bytes(b'late')
+            time.sleep(0.03)
+            with self.assertRaises(IntegrationError) as error:
+                timed.recv_bytes()
+            self.assertEqual(error.exception.code, 'RPC_TIMEOUT')
 
     def test_partial_eof_and_blocked_write_are_bounded(self):
         with pair() as (timed, peer, connection):

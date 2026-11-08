@@ -328,7 +328,9 @@ class Supervisor:
         self.controller = MuxController(self.config, store, initializing=True)
         self.gpu = GPUStorage(store, {rank: rank for rank in range(self.config.tp_size)})
         self.rpc = StorageRPCServer(store, self.gpu, str(self.directory / "store.sock"), self.authkey,
-            extra_methods=self.controller.rpc_methods(), owner_close=self._close_barrier)
+            extra_methods=self.controller.rpc_methods(), owner_close=self._close_barrier,
+            inline_methods=self.controller.rpc_inline_methods(),
+            eager_io=self.config.rpc_inline_fast_methods)
         self.rpc_thread = Thread(target=self.rpc.serve_forever, name="owner-rpc", daemon=False)
         self.rpc_thread.start()
         environment = dict(os.environ)
