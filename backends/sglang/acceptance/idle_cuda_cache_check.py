@@ -111,6 +111,28 @@ class IdleCacheChecks(unittest.TestCase):
             runtime._accept(self.command())
         self.assertEqual(calls, [True], 'One weight audit, after the cache release')
 
+    def test_threshold_keeps_a_small_cache_and_still_reports(self):
+        runtime, _, _ = self.fixture()  # 248 MiB reserved but unused
+        runtime.ctx.config = SimpleNamespace(idle_cache_trim_mib=512)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            runtime._accept(self.command())
+        evidence = json.loads(output.getvalue().split(' ', 1)[1])
+        self.assertNotIn('empty_cache', self.trace)
+        self.assertEqual((evidence['trimmed'], evidence['released_reserved_bytes']), (False, 0))
+        self.assertTrue(any(isinstance(item, tuple) and item[0] == 'report' for item in self.trace))
+        self.assertEqual(runtime.cursor, 1)
+
+    def test_threshold_trims_a_large_cache(self):
+        runtime, _, _ = self.fixture()
+        runtime.ctx.config = SimpleNamespace(idle_cache_trim_mib=128)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            runtime._accept(self.command())
+        evidence = json.loads(output.getvalue().split(' ', 1)[1])
+        self.assertIn('empty_cache', self.trace)
+        self.assertEqual((evidence['trimmed'], evidence['released_reserved_bytes']), (True, 248 * 1024**2))
+
     def test_live_request_preparation_mapping_or_room_prevents_trimming(self):
         for field, value in (('requests', {'live': object()}), ('prepared', {'batch': object()}),
                              ('binding', object()), ('descriptors', {'room': object()})):

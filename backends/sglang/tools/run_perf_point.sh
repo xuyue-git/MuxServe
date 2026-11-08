@@ -20,6 +20,10 @@
 # SKIP_P=1 (decode batches involve only D ranks: config decode_skip_prefill_ranks=true),
 # EARLY_TOKEN=1 (publish the prefill token at commit, not after the D handoff:
 # config prefill_early_token=true; moves the TTFT boundary, adds the handoff to TPOT),
+# CLEANUP_SKIP_P=1 (request CLEANUP only on D ranks once P released it: config
+# cleanup_skip_prefill_ranks=true), CLEANUP_WITH_QUIESCE=1 (queue a finished request's
+# CLEANUP behind its last D QUIESCE: config cleanup_with_quiesce=true), TRIM_MIB=N
+# (empty_cache only with >= N MiB unused cache: config idle_cache_trim_mib=N),
 # FROZEN_BUNDLE=/abs/frozen-synthetic-512-128.json (original MuxServe's fixed-workload
 # input per model; every output must equal its expected tokens), WARMUP_TOTAL=128
 # (warmup split 43/43/42 over the models as the original; overrides WARMUP),
@@ -49,6 +53,9 @@ PREFILL_GRAPH="${PREFILL_GRAPH:-}"
 INLINE_START="${INLINE_START:-}"
 SKIP_P="${SKIP_P:-}"
 EARLY_TOKEN="${EARLY_TOKEN:-}"
+CLEANUP_SKIP_P="${CLEANUP_SKIP_P:-}"
+CLEANUP_WITH_QUIESCE="${CLEANUP_WITH_QUIESCE:-}"
+TRIM_MIB="${TRIM_MIB:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -56,10 +63,10 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
- inline, skip_p, early) = sys.argv[1:]
+ inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -78,10 +85,14 @@ config.pop("prefill_cuda_graph", None)
 if pgraph:
     config["prefill_cuda_graph"] = True
 for key, value in (("inline_start", inline), ("decode_skip_prefill_ranks", skip_p),
-                   ("prefill_early_token", early)):
+                   ("prefill_early_token", early), ("cleanup_skip_prefill_ranks", cleanup_skip_p),
+                   ("cleanup_with_quiesce", cleanup_with_quiesce)):
     config.pop(key, None)
     if value:
         config[key] = True
+config.pop("idle_cache_trim_mib", None)
+if trim_mib:
+    config["idle_cache_trim_mib"] = int(trim_mib)
 if int(steps) > 0:
     config["decode_run_steps"] = int(steps)
 for model, size in zip(config["models"], ("7b", "13b", "30b")):
@@ -97,7 +108,10 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "prefill_graph=%s" % config.get("prefill_cuda_graph", False),
       "inline_start=%s" % config.get("inline_start", False),
       "skip_p=%s" % config.get("decode_skip_prefill_ranks", False),
-      "early_token=%s" % config.get("prefill_early_token", False))
+      "early_token=%s" % config.get("prefill_early_token", False),
+      "cleanup_skip_p=%s" % config.get("cleanup_skip_prefill_ranks", False),
+      "cleanup_with_quiesce=%s" % config.get("cleanup_with_quiesce", False),
+      "trim_mib=%s" % config.get("idle_cache_trim_mib", 0))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

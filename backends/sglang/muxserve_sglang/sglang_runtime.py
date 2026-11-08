@@ -285,6 +285,16 @@ class ControlledScheduler:
         device = self.runner.gpu_id
         before_allocated = torch.cuda.memory_allocated(device)
         before_reserved = torch.cuda.memory_reserved(device)
+        threshold_mib = getattr(getattr(self.ctx, "config", None), "idle_cache_trim_mib", 0)
+        if threshold_mib and before_reserved - before_allocated < threshold_mib * 1024**2:
+            # Below the threshold the cache is kept: the next forward reuses it
+            # (a per-request release is reallocated by the next prefill).
+            print("IDLE_CUDA_CACHE " + json.dumps({"model_id": self.ctx.model.model_id,
+                "stage": self.ctx.stage, "rank": self.rank, "pid": self.pid, "cleanup_id": cleanup_id,
+                "allocated_before_bytes": before_allocated, "allocated_after_bytes": before_allocated,
+                "reserved_before_bytes": before_reserved, "reserved_after_bytes": before_reserved,
+                "released_reserved_bytes": 0, "trimmed": False, "threshold_mib": threshold_mib}), flush=True)
+            return
         with torch.cuda.device(device):
             torch.cuda.empty_cache()
             self.sync()
@@ -298,7 +308,7 @@ class ControlledScheduler:
             "allocated_before_bytes": before_allocated, "allocated_after_bytes": after_allocated,
             "reserved_before_bytes": before_reserved, "reserved_after_bytes": after_reserved,
             "released_reserved_bytes": max(0, before_reserved - after_reserved),
-            "shared_aliases_verified": True}), flush=True)
+            "shared_aliases_verified": True, "trimmed": True}), flush=True)
 
     def _native_request(self, item):
         identity = (item["request_id"], item["attempt"])
@@ -699,6 +709,12 @@ class ControlledScheduler:
             self.pool.clear_forward()
             self.runner._muxserve_permit = None
         del self.prepared[command["batch_id"]]
+        if (command["kind"] == "QUIESCE" and self.ctx.stage == "P"
+                and state.command["batch_stage"] == "P"
+                and getattr(getattr(self.ctx, "config", None), "cleanup_skip_prefill_ranks", False)):
+            # This QUIESCE released every request on this P rank, and request
+            # CLEANUP skips P ranks: trim here (off the request's end path).
+            self._trim_idle_cuda_cache(command["batch_id"])
         self._report(command["batch_id"], "QUIESCED", {
             "reservation_id": command["reservation_id"],
             "request_ids": tuple(state.command["ordered_request_ids"])})

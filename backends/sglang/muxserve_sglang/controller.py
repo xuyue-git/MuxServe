@@ -91,6 +91,9 @@ class _Request:
     pending_reason: str | None = None
     resume_record_id: str | None = None
     resumed_attempt: int | None = None
+    # Every P rank released this attempt's native request: its last prefill
+    # batch quiesced normally on all P ranks, and none was prepared since.
+    p_released: bool = False
 
     @property
     def identity(self) -> RequestIdentity:
@@ -169,6 +172,7 @@ class _Cleanup:
     reason: str
     deadline: float
     quiesced: set[tuple[str, int]] = field(default_factory=set)
+    participants: frozenset = frozenset()
 
 
 @dataclass
@@ -946,6 +950,8 @@ class MuxController:
                 raise
             for request in requests:
                 request.state = "PREPARING"
+                if plan.stage == "P":
+                    request.p_released = False
             for key in sorted(participants):
                 self._command(group, key, "PREPARE", {
                     **self._command_payload(group, batch, key), "_command_owner": owner})
@@ -1128,6 +1134,7 @@ class MuxController:
             if batch.plan.stage == "P" and request.pending_reason is None:
                 # The retired fresh allocation kept the store's attempt watermark.
                 request.attempt += 1
+                request.p_released = False
         for room in tuple(group.broker):
             if group.broker[room]["batch_id"] == batch.plan.batch_id:
                 del group.broker[room]
@@ -1613,6 +1620,15 @@ class MuxController:
             # prefill (which needs all credits) start one round trip sooner.
             self._release_credits(batch.plan.batch_id)
             self._begin_quiesce(group, batch, batch.participants)
+            if self.config.cleanup_with_quiesce:
+                # The request ended in this batch: queue its CLEANUP right
+                # behind the QUIESCE rather than one more round trip later.
+                for ref in batch.plan.requests:
+                    request = self._request(group.model_id, ref.request_id)
+                    if (request.attempt == ref.attempt and request.state == "FINISH_PENDING"
+                            and request.finish_reason in ("eos", "length")
+                            and request.pending_reason is None):
+                        self._begin_cleanup(request, quiescing=batch)
 
     def _finish_run_tokens(self, group: _Group, batch: _Batch) -> None:
         """Tokens were published per agreed step; only settle request states."""
@@ -1992,6 +2008,13 @@ class MuxController:
             elif batch.plan.stage == "P":
                 request.state = "DECODING"
         batch.status = "DONE"
+        if batch.plan.stage == "P" and all(("P", rank) in batch.quiesce_required for rank in group.ranks):
+            # Every P rank executed this batch's QUIESCE, which releases each
+            # of its requests' native state on that rank.
+            for ref in batch.plan.requests:
+                request = self._request(group.model_id, ref.request_id)
+                if request.attempt == ref.attempt:
+                    request.p_released = True
         if batch.plan.stage == "P":
             for room in tuple(group.broker):
                 if group.broker[room]["batch_id"] == batch.plan.batch_id:
@@ -2088,17 +2111,29 @@ class MuxController:
             self._notify()
             return result
 
-    def _begin_cleanup(self, request: _Request) -> None:
+    def _cleanup_participants(self, group: _Group, request: _Request) -> frozenset:
+        if self.config.cleanup_skip_prefill_ranks and request.p_released:
+            return frozenset(("D", rank) for rank in group.ranks)
+        return frozenset(group.required)
+
+    def _begin_cleanup(self, request: _Request, quiescing: _Batch | None = None) -> None:
+        """``quiescing``: the request's last batch, whose QUIESCE was just
+        queued; its CLEANUP may then follow on the same ranks right away."""
         group = self._model(request.spec.model_id)
         if any(item.identity == request.identity for item in group.cleanups.values()):
             return
-        if (group.uncertain_batches or self._active(request) is not None or
+        participants = self._cleanup_participants(group, request)
+        active = self._active(request)
+        if quiescing is not None and (active is not quiescing or quiescing.status != "QUIESCE"
+                                      or not quiescing.quiesce_required <= participants):
+            return  # _finish_batch issues the ordinary cleanup later
+        if (group.uncertain_batches or (active is not None and quiescing is None) or
                 any(not group.registered.get(key) or
-                    not group.registered[key].alive for key in group.required)):
+                    not group.registered[key].alive for key in participants)):
             return
         if any(len(group.registered[key].commands) +
                sum(group.command_reserved.get(key, {}).values()) >= _COMMAND_WINDOW
-               for key in group.required):
+               for key in participants):
             return
         cleanup_id = "cleanup:" + uuid4().hex
         owner = cleanup_id
@@ -2110,10 +2145,11 @@ class MuxController:
             raise
         reason = request.pending_reason or request.finish_reason or "finished"
         cleanup = _Cleanup(cleanup_id, request.identity, reason,
-                           self.clock() + self.config.prepare_timeout_ms / 1000)
+                           self.clock() + self.config.prepare_timeout_ms / 1000,
+                           participants=participants)
         group.cleanups[cleanup_id] = cleanup
         request.state = "CLEANUP_PENDING"
-        for key in sorted(group.required):
+        for key in sorted(participants):
             self._command(group, key, "CLEANUP", {"cleanup_id": cleanup_id,
                 "request_id": request.spec.request_id, "attempt": request.attempt,
                 "allocation_id": request.allocation_id,
@@ -2121,17 +2157,22 @@ class MuxController:
 
     def _cleanup_quiesced(self, group: _Group, cleanup: _Cleanup,
                           key: tuple[str, int], payload: dict) -> None:
-        if key not in group.required or payload != {
+        if key not in cleanup.participants or payload != {
                 "cleanup_id": cleanup.cleanup_id,
                 "request_id": cleanup.identity.request_id,
                 "attempt": cleanup.identity.attempt}:
             raise IntegrationError("INVALID_REPORT", "Cleanup QUIESCED identity mismatch")
         cleanup.quiesced.add(key)
-        if cleanup.quiesced != group.required:
+        if cleanup.quiesced != cleanup.participants:
             return
         request = self._request(cleanup.identity.model_id, cleanup.identity.request_id)
         if request.identity != cleanup.identity:
             raise IntegrationError("STALE_ATTEMPT", "Cleanup belongs to old attempt")
+        if self._active(request) is not None:
+            # Ranks report in command order, so a batch QUIESCE queued before
+            # this CLEANUP has completed on every participant by now.
+            self._fence(group, self._active(request), "cleanup_before_quiesce")
+            raise IntegrationError("INVALID_REPORT", "Cleanup completed before its batch quiesced")
         if request.allocation_id:
             try:
                 self.store.release_kv(request.allocation_id, self._d_holder(request))
@@ -2209,6 +2250,7 @@ class MuxController:
                 raise IntegrationError("INVALID_STATE", "Immutable record cannot resume now")
             request.attempt += 1
             request.resumed_attempt = request.attempt
+            request.p_released = False
             self.records.pop(resume_record_id, None)
             request.output = list(record.output_token_ids)
             request.deadline = record.deadline

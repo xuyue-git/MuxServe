@@ -149,6 +149,20 @@ class DeploymentConfig:
     # (same token, all ranks agreed), instead of after the D handoff. The
     # request still becomes decodable only after the handoff.
     prefill_early_token: bool = False
+    # A request's CLEANUP involves only the D ranks once every P rank has
+    # released its native state (its prefill batch quiesced normally, which
+    # releases each request on every P rank). P ranks otherwise receive a
+    # CLEANUP that finds nothing to release and only trims their allocator
+    # cache; with this switch they trim after the prefill QUIESCE instead.
+    cleanup_skip_prefill_ranks: bool = False
+    # Queue a finished request's CLEANUP right behind its last decode batch's
+    # QUIESCE on every rank, instead of after all ranks reported QUIESCED.
+    # Ranks execute and report commands in order, so every rank's batch
+    # QUIESCED precedes its CLEANUP QUIESCED.
+    cleanup_with_quiesce: bool = False
+    # Idle allocator trimming: 0 calls empty_cache at every idle cleanup (as
+    # before); N > 0 only when the rank caches at least N MiB it does not use.
+    idle_cache_trim_mib: int = 0
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -221,9 +235,12 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "decode_run_park must be a boolean")
     if type(config.prefill_cuda_graph) is not bool:
         raise IntegrationError("INVALID_CONFIG", "prefill_cuda_graph must be a boolean")
-    for name in ("inline_start", "decode_skip_prefill_ranks", "prefill_early_token"):
+    for name in ("inline_start", "decode_skip_prefill_ranks", "prefill_early_token",
+                 "cleanup_skip_prefill_ranks", "cleanup_with_quiesce"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
+    if type(config.idle_cache_trim_mib) is not int or not 0 <= config.idle_cache_trim_mib <= 65536:
+        raise IntegrationError("INVALID_CONFIG", "idle_cache_trim_mib must be an integer 0..65536")
     if config.decode_run_steps > config.max_new_tokens:
         raise IntegrationError("INVALID_CONFIG", "Decode run length exceeds the output budget")
     if config.queue_limit > 100000:

@@ -188,6 +188,8 @@ def main():
     parser.add_argument("--inline-start", action="store_true", help="config inline_start=true")
     parser.add_argument("--skip-p", action="store_true", help="config decode_skip_prefill_ranks=true")
     parser.add_argument("--early-token", action="store_true", help="config prefill_early_token=true")
+    parser.add_argument("--cleanup-skip-p", action="store_true", help="config cleanup_skip_prefill_ranks=true")
+    parser.add_argument("--cleanup-with-quiesce", action="store_true", help="config cleanup_with_quiesce=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -206,7 +208,9 @@ def main():
                               controller_port=port, decode_run_steps=args.run_steps,
                               decode_run_park=args.park, inline_start=args.inline_start,
                               decode_skip_prefill_ranks=args.skip_p,
-                              prefill_early_token=args.early_token)
+                              prefill_early_token=args.early_token,
+                              cleanup_skip_prefill_ranks=args.cleanup_skip_p,
+                              cleanup_with_quiesce=args.cleanup_with_quiesce)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -319,9 +323,11 @@ def main():
                 if k != "poll_commands_wait"}
         print("OWNER_HANDLER_MS", busy)
     tpot = {m: round(s["mean_tpot_s"] * 1000, 2) for m, s in result["summary"]["models"].items()}
-    print("E2E_PASS run_steps=%d park=%s inline_start=%s skip_p=%s early_token=%s tok_s=%.2f "
+    print("E2E_PASS run_steps=%d park=%s inline_start=%s skip_p=%s early_token=%s "
+          "cleanup_skip_p=%s cleanup_with_quiesce=%s tok_s=%.2f "
           "mean_tpot_ms=%s (simulated decode ms %s) ttft_ms=%s tail_ms=%s cycle_ms=%s inline_starts=%d" % (
         args.run_steps, args.park, args.inline_start, args.skip_p, args.early_token,
+        args.cleanup_skip_p, args.cleanup_with_quiesce,
         result["summary"]["overall"]["output_tokens_per_second"], tpot,
         {m: round(t[1] * 1000, 1) for m, t in timing.items()},
         {m: round(s["mean_ttft_s"] * 1000, 1) for m, s in result["summary"]["models"].items()},

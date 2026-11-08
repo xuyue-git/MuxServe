@@ -268,5 +268,138 @@ class EarlyToken(unittest.TestCase):
         self.assertEqual(sim.controller.requests[("a", "r")].state, "DECODING")
 
 
+def cleanup_ids(sim, model, stage, rank):
+    return [c["cleanup_id"] for c in sim.commands(model, stage, rank, "CLEANUP")]
+
+
+def cleanup_quiesced(sim, model, rid, cleanup_id, stages):
+    attempt = sim.controller.requests[(model, rid)].attempt
+    for stage in stages:
+        for rank in range(sim.tp):
+            sim.report(model, stage, rank, cleanup_id, "QUIESCED",
+                       {"cleanup_id": cleanup_id, "request_id": rid, "attempt": attempt})
+
+
+def decode_to_end(sim, model, rid, steps, first_token):
+    """One decode run of ``steps``; returns (plan, reservation, quiescing stages)."""
+    request = sim.controller.requests[(model, rid)]
+    ends = len(request.output) + steps >= request.spec.max_new_tokens
+    plan, reservation = prepare_decode(sim, model, rid, steps)
+    stages = ("D",) if sim.config.decode_skip_prefill_ranks else ("P", "D")
+    ready(sim, model, plan.batch_id, reservation, stages=stages)
+    sim.controller.start_batch(sim.group(model), plan.batch_id)
+    for step in range(1, steps + 1):
+        for rank in range(sim.tp):
+            sim.step(model, plan, rank, step, first_token + step - 1, finished=ends and step == steps)
+    sim.finish_run(model, plan, reservation, steps, first_token + steps - 1)
+    return plan, reservation, stages
+
+
+class CleanupFastPaths(unittest.TestCase):
+    def test_released_prefill_ranks_get_no_request_cleanup(self):
+        sim = Sim(run_steps=4, decode_skip_prefill_ranks=True, cleanup_skip_prefill_ranks=True)
+        free = sim.store.rank_usage()[0]["free_blocks"]
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        self.assertTrue(sim.controller.requests[("a", "r")].p_released)
+        plan, reservation, stages = decode_to_end(sim, "a", "r", 4, 12)
+        quiesce(sim, "a", plan, reservation, stages=stages)
+        self.assertEqual(sim.controller.requests[("a", "r")].state, "CLEANUP_PENDING")
+        (cleanup_id,) = cleanup_ids(sim, "a", "D", 0)
+        for rank in range(sim.tp):
+            self.assertEqual(cleanup_ids(sim, "a", "P", rank), [])
+        # A P rank is no participant and cannot vote for the cleanup.
+        expect("INVALID_REPORT", lambda: cleanup_quiesced(sim, "a", "r", cleanup_id, ("P",)))
+        cleanup_quiesced(sim, "a", "r", cleanup_id, ("D",))
+        output = sim.controller.request_output("a", "r")
+        self.assertEqual((output["state"], output["output_token_ids"]), ("FINISHED", (11, 12, 13, 14, 15)))
+        self.assertEqual(sim.store.rank_usage()[0]["free_blocks"], free)
+
+    def test_request_without_a_released_prefill_cleans_every_rank(self):
+        sim = Sim(run_steps=4, cleanup_skip_prefill_ranks=True)
+        sim.submit("a", "q", max_new=5)
+        sim.controller.cancel_request("a", "q")  # never prefilled: no release proof
+        self.assertEqual(len(cleanup_ids(sim, "a", "P", 0)), 1)
+        (first,) = cleanup_ids(sim, "a", "D", 0)
+        cleanup_quiesced(sim, "a", "q", first, ("P", "D"))
+        self.assertEqual(sim.controller.request_output("a", "q")["state"], "CANCELLED")
+        sim.submit("a", "r", max_new=5)
+        plan, out, reservation = sim.prefill_ready("a", "r")
+        sim.controller.abort_batch(sim.group("a"), plan.batch_id, "test")  # revoked, not quiesced
+        request = sim.controller.requests[("a", "r")]
+        self.assertFalse(request.p_released)
+        sim.controller.cancel_request("a", "r")
+        quiesce(sim, "a", plan, reservation)
+        self.assertEqual(len(cleanup_ids(sim, "a", "P", 0)), 2)
+
+    def test_default_cleans_every_rank(self):
+        sim = Sim(run_steps=4, decode_skip_prefill_ranks=True)
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        plan, reservation, stages = decode_to_end(sim, "a", "r", 4, 12)
+        quiesce(sim, "a", plan, reservation, stages=stages)
+        self.assertEqual(len(cleanup_ids(sim, "a", "P", 0)), 1)
+
+    def with_quiesce(self, **flags):
+        sim = Sim(run_steps=4, decode_skip_prefill_ranks=True, cleanup_skip_prefill_ranks=True,
+                  cleanup_with_quiesce=True, **flags)
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        plan, reservation, stages = decode_to_end(sim, "a", "r", 4, 12)
+        return sim, plan, reservation, stages
+
+    def test_cleanup_follows_the_last_quiesce_in_command_order(self):
+        sim, plan, reservation, stages = self.with_quiesce()
+        free = sim.store.rank_usage()[0]["free_blocks"]
+        for rank in range(sim.tp):
+            commands = sim.commands("a", "D", rank)
+            self.assertEqual([c["kind"] for c in commands][-2:], ["QUIESCE", "CLEANUP"])
+            self.assertEqual(commands[-2]["batch_id"], plan.batch_id)
+            self.assertEqual(cleanup_ids(sim, "a", "P", rank), [])
+        (cleanup_id,) = cleanup_ids(sim, "a", "D", 0)
+        batch = sim.controller.groups["a"].batches[plan.batch_id]
+        # Each rank reports its batch QUIESCED, then its cleanup QUIESCED.
+        rid = plan.requests[0].request_id
+        for rank in range(sim.tp):
+            sim.report("a", "D", rank, plan.batch_id, "QUIESCED",
+                       {"reservation_id": reservation, "request_ids": (rid,)})
+            self.assertEqual(batch.status, "DONE" if rank == sim.tp - 1 else "QUIESCE")
+            attempt = sim.controller.requests[("a", rid)].attempt
+            sim.report("a", "D", rank, cleanup_id, "QUIESCED",
+                       {"cleanup_id": cleanup_id, "request_id": rid, "attempt": attempt})
+        output = sim.controller.request_output("a", "r")
+        self.assertEqual((output["state"], output["output_token_ids"]), ("FINISHED", (11, 12, 13, 14, 15)))
+        self.assertGreater(sim.store.rank_usage()[0]["free_blocks"], free)
+        self.assertEqual(sim.controller.groups["a"].cleanups, {})
+
+    def test_cleanup_reported_before_the_batch_quiesced_fences(self):
+        sim, plan, reservation, stages = self.with_quiesce()
+        (cleanup_id,) = cleanup_ids(sim, "a", "D", 0)
+        expect("INVALID_REPORT", lambda: cleanup_quiesced(sim, "a", "r", cleanup_id, ("D",)))
+        self.assertTrue(sim.controller.groups["a"].fenced)
+
+    def test_no_early_cleanup_when_p_ranks_quiesce_the_decode_batch(self):
+        sim = Sim(run_steps=4, cleanup_skip_prefill_ranks=True, cleanup_with_quiesce=True)
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        plan, reservation, stages = decode_to_end(sim, "a", "r", 4, 12)
+        self.assertEqual(stages, ("P", "D"))
+        self.assertEqual(cleanup_ids(sim, "a", "D", 0), [])  # P ranks would quiesce after it
+        quiesce(sim, "a", plan, reservation, stages=stages)
+        self.assertEqual(len(cleanup_ids(sim, "a", "D", 0)), 1)
+        self.assertEqual(cleanup_ids(sim, "a", "P", 0), [])
+
+    def test_unfinished_run_gets_no_early_cleanup(self):
+        sim = Sim(run_steps=2, decode_skip_prefill_ranks=True, cleanup_skip_prefill_ranks=True,
+                  cleanup_with_quiesce=True)
+        sim.submit("a", "r", max_new=5)
+        sim.prefill("a", "r", 11)
+        plan, reservation, stages = decode_to_end(sim, "a", "r", 2, 12)
+        self.assertEqual(cleanup_ids(sim, "a", "D", 0), [])
+        quiesce(sim, "a", plan, reservation, stages=stages)
+        self.assertEqual(sim.controller.requests[("a", "r")].state, "DECODING")
+        self.assertEqual(cleanup_ids(sim, "a", "D", 0), [])
+
+
 if __name__ == "__main__":
     unittest.main()
