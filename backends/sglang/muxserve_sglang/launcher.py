@@ -64,7 +64,9 @@ def _graph_fields(config, stage):
         return dict(disable_cuda_graph=False, disable_prefill_cuda_graph=False,
                     disable_decode_cuda_graph=True, cuda_graph_backend_prefill="breakable",
                     cuda_graph_backend_decode="disabled",
-                    cuda_graph_bs_prefill=list(PREFILL_GRAPH_TOKENS))
+                    cuda_graph_bs_prefill=list(PREFILL_GRAPH_TOKENS) + (
+                        [2 * tokens for tokens in PREFILL_GRAPH_TOKENS]
+                        if getattr(config, "prefill_pair_hold_ms", 0) else []))
     if stage != "D" or not getattr(config, "decode_cuda_graph", False):
         return {}
     return dict(disable_cuda_graph=False, disable_prefill_cuda_graph=True,

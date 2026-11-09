@@ -241,6 +241,16 @@ class DeploymentConfig:
     # and skips the GPU read-back and synchronize; those tensors were just
     # built from the same CPU values on this rank.
     decode_prepare_light: bool = False
+    # With two requests of a model in flight: D ranks take no commands inside a
+    # decode run, so a run ends at its next step boundary when a prefill of its
+    # model needs them or another request waits to decode, and no decode batch
+    # starts until that handoff is done. The next batch holds both requests.
+    decode_run_merge: bool = False
+    # With two requests of a model in flight: a request that finds its model
+    # idle waits this many ms, so a request arriving just after it joins the
+    # same prefill batch. The pair then decodes and finishes together, as under
+    # original MuxServe, whose scheduler takes everything waiting. 0 is off.
+    prefill_pair_hold_ms: int = 0
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -321,9 +331,15 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "slot_free_at_cleanup", "handoff_ack_in_poll",
                  "handoff_report_with_ready", "start_in_report_reply", "targeted_wake",
                  "rpc_inline_fast_methods", "decode_leader_reports", "handoff_prepare_after_ack",
-                 "decode_prepare_light"):
+                 "decode_prepare_light", "decode_run_merge"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
+    if type(config.prefill_pair_hold_ms) is not int or not 0 <= config.prefill_pair_hold_ms <= 50:
+        raise IntegrationError("INVALID_CONFIG", "prefill_pair_hold_ms must be an integer 0..50")
+    if config.prefill_pair_hold_ms and not (config.inline_prepare and config.decode_run_merge
+                                            and config.max_model_inflight > 1):
+        raise IntegrationError("INVALID_CONFIG",
+                               "prefill_pair_hold_ms requires inline_prepare, decode_run_merge and two in flight")
     if config.handoff_prepare_after_ack and not (config.handoff_prepare_decode and config.handoff_ack_in_poll):
         raise IntegrationError("INVALID_CONFIG", "handoff_prepare_after_ack requires handoff_prepare_decode "
                                                  "and handoff_ack_in_poll")

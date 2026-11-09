@@ -5,6 +5,13 @@
 #     tools/run_perf_point.sh OUT_DIR [REQUESTS=64] [WARMUP=4] [RUN_STEPS=128]
 #
 # RUN_STEPS=0 writes a config without decode_run_steps (for the original code).
+# XBENCH_DIR + XBENCH_PY send the frozen 128+192 workload with the xbench client
+# instead of bench_fixed.py (results in OUT_DIR/xbench).
+# INFLIGHT=2 (two requests per model in flight: config max_model_inflight=2 and the
+# same closed-loop load in the client), RUN_MERGE=1 (a waiting decode joins at the next
+# step boundary: config decode_run_merge=true), PAIR_HOLD_MS=N (a request of an idle
+# model waits N ms so the next one shares its prefill batch: config prefill_pair_hold_ms=N;
+# needs INFLIGHT=2, RUN_MERGE, INLINE_PREPARE).
 # Optional env: GPUS (default 1,2,3,4), MODELS_ROOT, REFERENCE (bench JSON to
 # compare output tokens against), KV_FRACTION (size the KV pool like original
 # MuxServe: gpu_memory_utilization x total GPU memory, instead of kv_bytes_per_rank),
@@ -69,6 +76,9 @@ TRACE="${TRACE:-}"
 SOLO="${SOLO:-}"
 SOLO_REQUESTS="${SOLO_REQUESTS:-8}"
 PROFILE="${PROFILE:-}"
+XBENCH_DIR="${XBENCH_DIR:-}"
+XBENCH_PY="${XBENCH_PY:-}"
+XBENCH_EXTRA_SITE="${XBENCH_EXTRA_SITE:-}"
 DECODE_GRAPH="${DECODE_GRAPH:-}"
 PARK="${PARK:-}"
 PREFILL_GRAPH="${PREFILL_GRAPH:-}"
@@ -97,6 +107,9 @@ RPC_INLINE="${RPC_INLINE:-}"
 DECODE_LEADER="${DECODE_LEADER:-}"
 PREPARE_AFTER_ACK="${PREPARE_AFTER_ACK:-}"
 PREPARE_LIGHT="${PREPARE_LIGHT:-}"
+INFLIGHT="${INFLIGHT:-}"
+RUN_MERGE="${RUN_MERGE:-}"
+PAIR_HOLD_MS="${PAIR_HOLD_MS:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -104,14 +117,15 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
  handoff_prepare, inline_meta, final_step, event_pump, bootstrap_poll,
  inline_prepare, own_table, register_ready, broker_poll, early_terminal,
  slot_at_cleanup, ack_in_poll, combined_report, start_in_reply,
- targeted_wake, rpc_inline, decode_leader, prepare_after_ack, prepare_light) = sys.argv[1:]
+ targeted_wake, rpc_inline, decode_leader, prepare_after_ack, prepare_light,
+ inflight, run_merge, pair_hold_ms) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -142,10 +156,16 @@ for key, value in (("inline_start", inline), ("decode_skip_prefill_ranks", skip_
                    ("handoff_report_with_ready", combined_report),
                    ("start_in_report_reply", start_in_reply), ("targeted_wake", targeted_wake),
                    ("rpc_inline_fast_methods", rpc_inline), ("decode_leader_reports", decode_leader),
-                   ("handoff_prepare_after_ack", prepare_after_ack), ("decode_prepare_light", prepare_light)):
+                   ("handoff_prepare_after_ack", prepare_after_ack), ("decode_prepare_light", prepare_light),
+                   ("decode_run_merge", run_merge)):
     config.pop(key, None)
     if value:
         config[key] = True
+if inflight:
+    config["max_model_inflight"] = int(inflight)
+config.pop("prefill_pair_hold_ms", None)
+if pair_hold_ms:
+    config["prefill_pair_hold_ms"] = int(pair_hold_ms)
 config.pop("idle_cache_trim_mib", None)
 if trim_mib:
     config["idle_cache_trim_mib"] = int(trim_mib)
@@ -186,7 +206,10 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "rpc_inline=%s" % config.get("rpc_inline_fast_methods", False),
       "decode_leader=%s" % config.get("decode_leader_reports", False),
       "prepare_after_ack=%s" % config.get("handoff_prepare_after_ack", False),
-      "prepare_light=%s" % config.get("decode_prepare_light", False))
+      "prepare_light=%s" % config.get("decode_prepare_light", False),
+      "inflight=%s" % config.get("max_model_inflight", 1),
+      "run_merge=%s" % config.get("decode_run_merge", False),
+      "pair_hold_ms=%s" % config.get("prefill_pair_hold_ms", 0))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"
@@ -226,12 +249,19 @@ stop_launcher() {
 }
 trap stop_launcher EXIT
 
-"$PY" "$RUNTIME/tools/bench_fixed.py" --port 18080 --requests "$REQUESTS" --warmup "$WARMUP" \
-    --ready-timeout 7200 --supervisor-pid "$SUPERVISOR" --out "$OUT/bench.json" \
-    ${PHASE_ARGS[@]+"${PHASE_ARGS[@]}"} ${TRACE:+--phase-name concurrent} \
-    ${REFERENCE:+--reference "$REFERENCE"} ${FROZEN_BUNDLE:+--frozen-bundle "$FROZEN_BUNDLE"} \
-    ${WARMUP_TOTAL:+--warmup-total "$WARMUP_TOTAL"} 2>&1 | tee "$OUT/bench.log"
-echo "RESULT $OUT/bench.json"
+if [ -n "$XBENCH_DIR" ]; then
+    "$XBENCH_PY" -B "$XBENCH_DIR/xbench_wait_run.py" --port 18080 --output "$OUT/xbench" \
+        --batch "$(basename "$OUT" | sha256sum | cut -c1-12)" --ready-timeout 7200 --concurrency "$((3 * ${INFLIGHT:-1}))" \
+        --supervisor-pid "$SUPERVISOR" ${XBENCH_EXTRA_SITE:+--extra-site "$XBENCH_EXTRA_SITE"} 2>&1 | tee "$OUT/bench.log"
+    echo "RESULT $OUT/xbench/summary.json"
+else
+    "$PY" "$RUNTIME/tools/bench_fixed.py" --port 18080 --requests "$REQUESTS" --warmup "$WARMUP" \
+        --ready-timeout 7200 --supervisor-pid "$SUPERVISOR" --out "$OUT/bench.json" ${INFLIGHT:+--per-model "$INFLIGHT"} \
+        ${PHASE_ARGS[@]+"${PHASE_ARGS[@]}"} ${TRACE:+--phase-name concurrent} \
+        ${REFERENCE:+--reference "$REFERENCE"} ${FROZEN_BUNDLE:+--frozen-bundle "$FROZEN_BUNDLE"} \
+        ${WARMUP_TOTAL:+--warmup-total "$WARMUP_TOTAL"} 2>&1 | tee "$OUT/bench.log"
+    echo "RESULT $OUT/bench.json"
+fi
 
 if [ -n "$SOLO" ]; then
     for model in llama7b llama13b llama30b; do

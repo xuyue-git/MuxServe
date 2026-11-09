@@ -292,6 +292,9 @@ def main():
     parser.add_argument("--rpc-inline", action="store_true", help="config rpc_inline_fast_methods=true")
     parser.add_argument("--decode-leader", action="store_true", help="config decode_leader_reports=true")
     parser.add_argument("--prepare-after-ack", action="store_true", help="config handoff_prepare_after_ack=true")
+    parser.add_argument("--inflight", type=int, default=1, help="config max_model_inflight and client load")
+    parser.add_argument("--run-merge", action="store_true", help="config decode_run_merge=true")
+    parser.add_argument("--pair-hold-ms", type=int, default=0, help="config prefill_pair_hold_ms")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -329,7 +332,9 @@ def main():
                               targeted_wake=args.targeted_wake,
                               rpc_inline_fast_methods=args.rpc_inline,
                               decode_leader_reports=args.decode_leader,
-                              handoff_prepare_after_ack=args.prepare_after_ack)
+                              handoff_prepare_after_ack=args.prepare_after_ack,
+                              max_model_inflight=args.inflight, decode_run_merge=args.run_merge,
+                              prefill_pair_hold_ms=args.pair_hold_ms)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -405,6 +410,7 @@ def main():
     out = Path(directory) / "bench.json"
     bench = subprocess.run([sys.executable, str(ROOT / "tools/bench_fixed.py"), "--port", str(port),
                             "--models", args.bench_models, "--requests", str(args.requests), "--warmup", "1",
+                            "--per-model", str(args.inflight),
                             "--input-len", str(args.input_len), "--output-len", str(args.output_len),
                             "--ready-timeout", "30", "--request-timeout", "120", "--out", str(out)],
                            capture_output=True, text=True, timeout=600)

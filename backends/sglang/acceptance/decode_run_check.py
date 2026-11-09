@@ -304,6 +304,131 @@ class DecodeRunChecks(unittest.TestCase):
         self.assertEqual((request.output, request.valid_tokens, request.state), ([11, 12, 13], 5, "DECODING"))
         self.assertTrue(all(not any(refs) for refs in sim.controller.credits.refs.values()))
 
+    def two_waiting(self, **flags):
+        sim = Sim(run_steps=8, **flags)
+        sim.submit("a", "r", max_new=10)
+        sim.submit("a", "q", max_new=6)
+        sim.prefill("a", "r", 11)
+        sim.prefill("a", "q", 21)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        return sim, plan, reservation
+
+    def test_run_ends_for_a_waiting_decode_and_the_next_batch_holds_both(self):
+        sim, plan, reservation = self.two_waiting(max_model_inflight=2, decode_run_merge=True)
+        self.assertFalse(sim.step("a", plan, 0, 1, 12)["continue"])
+        self.assertFalse(sim.step("a", plan, 1, 1, 12)["continue"])
+        sim.finish_run("a", plan, reservation, 1, 12)
+        sim.quiesce("a", plan, reservation)
+        ControllerDriver(sim.controller, lambda event: None).step()
+        batch = next(b for b in sim.controller.groups["a"].batches.values() if b.status == "PREPARING")
+        self.assertEqual({ref.request_id for ref in batch.plan.requests}, {"r", "q"})
+        self.assertEqual(batch.plan.steps, 5)  # q has the fewest tokens left
+
+    def test_a_prefill_of_the_same_model_ends_the_run_and_holds_decode(self):
+        sim = Sim(run_steps=8, park=True, max_model_inflight=2, decode_run_merge=True)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        self.assertTrue(all(sim.step("a", plan, rank, 1, 12)["continue"] for rank in range(sim.tp)))
+        sim.submit("a", "q", max_new=6)
+        p_plan, p_out, p_reservation = sim.prefill_ready("a", "q")
+        self.assertFalse(sim.step("a", plan, 0, 2, 13)["continue"])
+        self.assertFalse(sim.step("a", plan, 1, 2, 13)["continue"])
+        sim.finish_run("a", plan, reservation, 2, 13)
+        sim.quiesce("a", plan, reservation)
+        self.assertIn(("a", "D"), sim.controller._snapshot_policy().busy)
+        sim.controller.start_batch(sim.group("a"), p_plan.batch_id)
+        sim.prefill_finish("a", "q", 21, p_plan, p_out, p_reservation)
+        self.assertNotIn(("a", "D"), sim.controller._snapshot_policy().busy)
+        ControllerDriver(sim.controller, lambda event: None).step()
+        batch = next(b for b in sim.controller.groups["a"].batches.values() if b.status == "PREPARING")
+        self.assertEqual({ref.request_id for ref in batch.plan.requests}, {"r", "q"})
+
+    PAIR = dict(run_steps=8, park=True, max_model_inflight=2, decode_run_merge=True,
+                inline_start=True, inline_prepare=True, prefill_pair_hold_ms=5)
+
+    def test_two_arrivals_at_an_idle_model_share_one_prefill(self):
+        sim = Sim(**self.PAIR)
+        sim.submit("a", "r", max_new=4)
+        sim.clock.now += 0.002
+        sim.submit("a", "q", max_new=4)
+        requests = sim.controller.requests
+        self.assertAlmostEqual(requests[("a", "r")].hold_until, 100.005)
+        self.assertEqual(requests[("a", "q")].hold_until, requests[("a", "r")].hold_until)
+        driver = ControllerDriver(sim.controller, lambda event: None)
+        driver.step()
+        self.assertEqual(sim.controller.groups["a"].batches, {})
+        self.assertFalse(sim.controller._prefill_eligible())
+        sim.clock.now = requests[("a", "r")].hold_until
+        self.assertTrue(sim.controller._prefill_eligible())
+        driver.step()
+        batch = next(iter(sim.controller.groups["a"].batches.values()))
+        self.assertEqual((batch.plan.stage, [ref.request_id for ref in batch.plan.requests]), ("P", ["r", "q"]))
+
+    def test_a_request_goes_alone_after_the_window(self):
+        sim = Sim(**self.PAIR)
+        sim.submit("a", "r", max_new=4)
+        sim.clock.now = 100.006
+        driver = ControllerDriver(sim.controller, lambda event: None)
+        driver.step()
+        batch = next(iter(sim.controller.groups["a"].batches.values()))
+        self.assertEqual([ref.request_id for ref in batch.plan.requests], ["r"])
+
+    def test_no_wait_while_the_model_is_active(self):
+        sim = Sim(**self.PAIR)
+        sim.submit("a", "r", max_new=10)
+        sim.clock.now = 100.006
+        sim.prefill("a", "r", 11)
+        sim.submit("a", "q", max_new=4)
+        self.assertIsNone(sim.controller.requests[("a", "q")].hold_until)
+
+    def test_expired_waiter_does_not_extend_the_window(self):
+        sim = Sim(**self.PAIR)
+        sim.submit("a", "r", max_new=4)
+        sim.clock.now = 100.006
+        sim.submit("a", "q", max_new=4)
+        self.assertIsNone(sim.controller.requests[("a", "q")].hold_until)
+
+    def test_other_models_do_not_share_a_window(self):
+        sim = Sim(models=("a", "b"), **self.PAIR)
+        sim.submit("a", "r", max_new=4)
+        sim.clock.now += 0.002
+        sim.submit("b", "q", max_new=4)
+        self.assertAlmostEqual(sim.controller.requests[("b", "q")].hold_until, 100.007)
+
+    def test_gateway_thread_waits_out_the_window_then_wakes_the_driver(self):
+        sim = Sim(**self.PAIR)
+        sim.submit("a", "r", max_new=4)
+        sim.controller.wake.clear()
+        started = time.monotonic()
+        sim.controller.prepare_submitted("a", "r")
+        self.assertGreaterEqual(time.monotonic() - started, 0.004)
+        self.assertTrue(sim.controller.wake.is_set())
+        self.assertEqual(sim.controller.groups["a"].batches, {})
+
+    def test_without_the_switch_a_request_is_never_held(self):
+        sim = Sim(run_steps=8, max_model_inflight=2, decode_run_merge=True)
+        sim.submit("a", "r", max_new=4)
+        self.assertIsNone(sim.controller.requests[("a", "r")].hold_until)
+
+    def test_without_the_switch_a_run_ignores_a_waiting_decode(self):
+        sim, plan, _ = self.two_waiting(max_model_inflight=2)
+        self.assertTrue(all(sim.step("a", plan, rank, 1, 12)["continue"] for rank in range(sim.tp)))
+
+    def test_a_full_batch_does_not_end_for_a_waiting_decode(self):
+        sim = Sim(run_steps=8, max_model_inflight=1, decode_run_merge=True)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, _ = sim.prepare_decode("a", "r", 8)
+        sim.submit("a", "q", max_new=6)
+        sim.controller.requests[("a", "q")].state = "DECODING"
+        self.assertTrue(all(sim.step("a", plan, rank, 1, 12)["continue"] for rank in range(sim.tp)))
+
+    def test_a_finished_or_cancelled_waiter_does_not_end_the_run(self):
+        sim, plan, _ = self.two_waiting(max_model_inflight=2, decode_run_merge=True)
+        sim.controller.requests[("a", "q")].pending_reason = "cancel"
+        self.assertTrue(all(sim.step("a", plan, rank, 1, 12)["continue"] for rank in range(sim.tp)))
+
     def parked(self):
         sim = Sim(("a", "b"), run_steps=8, park=True)
         sim.submit("a", "r", max_new=10)

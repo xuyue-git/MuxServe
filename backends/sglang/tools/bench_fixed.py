@@ -162,6 +162,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--models", default="llama7b,llama13b,llama30b")
+    parser.add_argument("--per-model", type=int, default=1,
+                        help="requests in flight per model during the measured phase")
     parser.add_argument("--requests", type=int, default=64, help="measured requests per model")
     parser.add_argument("--warmup", type=int, default=4, help="unmeasured requests per model first")
     parser.add_argument("--input-len", type=int, default=512)
@@ -204,11 +206,13 @@ def main() -> None:
     print(f"BENCH_READY models={models} input={args.input_len} output={args.output_len} "
           f"inputs={'frozen bundle' if expected else 'synthetic seed %d' % args.seed} warmup={warmups}", flush=True)
 
-    def run(phase: str, counts) -> dict:
+    def run(phase: str, counts, per_model: int = 1) -> dict:
         records = {m: [] for m in models}
+        total = {m: counts[m] if isinstance(counts, dict) else counts for m in models}
+        pending = {m: iter(range(total[m])) for m in models}
         def loop(model):
-            count = counts[model] if isinstance(counts, dict) else counts
-            for index in range(count):
+            count = total[model]
+            for index in pending[model]:
                 record = generate(args.port, model, inputs[model], args.output_len, args.request_timeout)
                 records[model].append(record)
                 if record["error"]:
@@ -216,7 +220,7 @@ def main() -> None:
                     return
                 if (index + 1) % 8 == 0 or index + 1 == count:
                     print(f"BENCH_PROGRESS {phase} {model} {index + 1}/{count}", flush=True)
-        threads = [threading.Thread(target=loop, args=(m,)) for m in models]
+        threads = [threading.Thread(target=loop, args=(m,)) for m in models for _ in range(per_model)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -231,7 +235,7 @@ def main() -> None:
     except OSError:
         pass
     phase_start = time.monotonic()
-    measured = run("measured", args.requests)
+    measured = run("measured", args.requests, args.per_model)
     if args.phase_file:
         with open(args.phase_file, "a", encoding="utf-8") as handle:
             handle.write(f"{args.phase_name} {phase_start} {time.monotonic()}\n")
@@ -262,7 +266,7 @@ def main() -> None:
                                         "frozen_bundle": args.frozen_bundle,
                                         "requests_per_model": args.requests,
                                         "warmup_per_model": warmups,
-                                        "concurrency": "one in flight per model (closed loop)",
+                                        "concurrency": f"{args.per_model} in flight per model (closed loop)",
                                         "boundary": "client HTTP send to streamed token receipt"},
               "summary": summary, "stage_breakdown_ms": stage_breakdown(before, after, summary),
               "errors": errors, "outputs_consistent": consistency, "reference_match": reference_match,

@@ -946,7 +946,8 @@ class HandoffRoundTrips(unittest.TestCase):
         config = load()
         for name in ("handoff_ack_in_poll", "handoff_report_with_ready",
                      "start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods",
-                     "decode_leader_reports", "decode_prepare_light", "handoff_prepare_after_ack"):
+                     "decode_leader_reports", "decode_prepare_light", "handoff_prepare_after_ack",
+                     "decode_run_merge"):
             self.assertFalse(getattr(config, name))
             expect("INVALID_CONFIG", lambda: load(**{name: 1}))
         for name in ("start_in_report_reply", "targeted_wake", "rpc_inline_fast_methods",

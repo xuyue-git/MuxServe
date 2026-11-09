@@ -43,6 +43,17 @@ class DecodeGraphConfigChecks(unittest.TestCase):
         with self.assertRaises(IntegrationError):
             self.config(decode_cuda_graph=1)
 
+    def test_pair_hold_needs_its_prerequisites(self):
+        pair = dict(max_model_inflight=2, decode_run_merge=True, inline_start=True, inline_prepare=True)
+        self.assertEqual(self.config().prefill_pair_hold_ms, 0)
+        self.assertEqual(self.config(prefill_pair_hold_ms=5, **pair).prefill_pair_hold_ms, 5)
+        for bad in (dict(pair, prefill_pair_hold_ms=51), dict(pair, prefill_pair_hold_ms=True),
+                    dict(pair, prefill_pair_hold_ms=5, max_model_inflight=1),
+                    dict(pair, prefill_pair_hold_ms=5, decode_run_merge=False),
+                    dict(pair, prefill_pair_hold_ms=5, inline_prepare=False)):
+            with self.assertRaises(IntegrationError):
+                self.config(**bad)
+
     def test_park_flag_defaults_off_and_must_be_boolean(self):
         self.assertFalse(self.config().decode_run_park)
         self.assertTrue(self.config(decode_run_park=True).decode_run_park)
@@ -87,6 +98,9 @@ class PrefillGraphChecks(unittest.TestCase):
         d = ns['_native_fields'](cfg, model, 'D')
         self.assertFalse(p['disable_cuda_graph'] or p['disable_prefill_cuda_graph'])
         self.assertEqual((p['cuda_graph_backend_prefill'], p['cuda_graph_bs_prefill']), ('breakable', [512]))
+        cfg.prefill_pair_hold_ms = 5
+        self.assertEqual(ns['_native_fields'](cfg, model, 'P')['cuda_graph_bs_prefill'], [512, 1024])
+        cfg.prefill_pair_hold_ms = 0
         self.assertTrue(p['disable_decode_cuda_graph'])
         self.assertEqual(p['cuda_graph_backend_decode'], 'disabled')
         self.assertEqual((d['cuda_graph_backend_decode'], d['cuda_graph_backend_prefill']), ('full', 'disabled'))

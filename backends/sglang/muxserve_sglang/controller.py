@@ -96,6 +96,8 @@ class _Request:
     # Every P rank released this attempt's native request: its last prefill
     # batch quiesced normally on all P ranks, and none was prepared since.
     p_released: bool = False
+    # prefill_pair_hold_ms: no prefill batch selects this request before then.
+    hold_until: float | None = None
 
     @property
     def identity(self) -> RequestIdentity:
@@ -692,7 +694,8 @@ class MuxController:
                 raise IntegrationError("QUEUE_FULL", "Model retained request limit is full")
             now = self.clock()
             self._ordinal += 1
-            request = _Request(deepcopy(spec), now, now + spec.timeout_ms / 1000, self._ordinal)
+            request = _Request(deepcopy(spec), now, now + spec.timeout_ms / 1000, self._ordinal,
+                               hold_until=self._pair_hold_until(spec.model_id, now))
             self.requests[key] = request
             self._notify()
             return self._output(request)
@@ -702,6 +705,15 @@ class MuxController:
         outside its own lock. Prepare the prefill exactly as the driver would
         for this proposal; any refusal leaves it to the driver."""
         if not self.config.inline_prepare:
+            return
+        with self.lock:
+            request = self.requests.get((model_id, request_id))
+            hold = None if request is None else request.hold_until
+        if hold is not None:
+            # The window expires by itself; this only wakes the driver on time.
+            # Its next pass selects every waiting request, up to the batch limit.
+            time.sleep(max(0.0, hold - self.clock()))
+            self.wake.set()
             return
         with self.lock:
             request = self.requests.get((model_id, request_id))
@@ -724,6 +736,27 @@ class MuxController:
                     self.inline_start_error = exc  # the driver re-raises it, as its own
                     self._inline_start_allowed = False
                     self.wake.set()
+
+    def _pair_hold_until(self, model_id: str, now: float) -> float | None:
+        """Caller holds the lock. A request of an idle model opens a window; one
+        arriving inside it shares that window; any active request means no wait."""
+        if not self.config.prefill_pair_hold_ms or not self._merging:
+            return None
+        window = None
+        for other in self.requests.values():
+            if other.spec.model_id != model_id:
+                continue
+            if other.state in ("PREPARING", "RUNNING", "DECODING", "REBUILD"):
+                return None
+            if other.state == "QUEUED":
+                if not self._held(other, now):
+                    return None
+                window = other.hold_until
+        return now + self.config.prefill_pair_hold_ms / 1000 if window is None else window
+
+    @staticmethod
+    def _held(request: _Request, now: float) -> bool:
+        return request.hold_until is not None and now < request.hold_until
 
     @staticmethod
     def _output(request: _Request) -> dict:
@@ -794,7 +827,8 @@ class MuxController:
             if not group.ready:
                 blocked.add(model.model_id)
             rows = [r for r in self.requests.values() if r.spec.model_id == model.model_id]
-            prefill = tuple(r.spec.request_id for r in rows if r.state == "QUEUED")
+            now = self.clock()
+            prefill = tuple(r.spec.request_id for r in rows if r.state == "QUEUED" and not self._held(r, now))
             rebuild = tuple(r.spec.request_id for r in rows if r.state == "REBUILD")
             protected = self.recovery_protected.get(self._recovery_key(model.model_id))
             decode = tuple(r.spec.request_id for r in rows if r.state == "DECODING"
@@ -806,6 +840,8 @@ class MuxController:
                                 max(0, len(r.output) - 1) for r in rows}))
             active = [b for b in group.batches.values() if b.status not in ("DONE", "ABORTED")]
             busy.update((model.model_id, b.plan.stage) for b in active)
+            if self._merging and self._prefill_needs_d(group):
+                busy.add((model.model_id, "D"))
             counts[model.model_id] = sum(self._occupies_slot(r) for r in rows)
         rank_free = {rank: data["free_blocks"] for rank, data in self.store.rank_usage().items()}
         # With decode_run_park a prefill prepares without credits (it takes
@@ -1871,6 +1907,8 @@ class MuxController:
         inline. Any refusal leaves the ordinary driver path to prepare it."""
         if not self._inline_start_allowed or self.protected_failure is not None or group.fenced:
             return
+        if self._merging and self._other_decoding(group, batch):
+            return  # The driver prepares one batch holding every decodable request.
         refs, remaining = [], []
         for ref in batch.plan.requests:
             request = self._request(group.model_id, ref.request_id)
@@ -2106,6 +2144,8 @@ class MuxController:
         if protected is not None and {(group.model_id, ref.request_id)
                                       for ref in batch.plan.requests} != {protected}:
             return False
+        if protected is None and self._decode_waiting(group, batch):
+            return False
         if not park:
             return True
         # Source ADBS gives a waiting prefill priority: per-token grants stop
@@ -2114,6 +2154,28 @@ class MuxController:
         if not self._prefill_waiting_for_credits():
             return True
         return "PARK" if self.config.decode_run_park else False
+
+    def _decode_waiting(self, group: _Group, batch: _Batch) -> bool:
+        """decode_run_merge: end this run so another request of its model can join."""
+        if (not self._merging or len(batch.plan.requests) >= self.config.max_model_inflight):
+            return False
+        return self._prefill_needs_d(group) or self._other_decoding(group, batch)
+
+    @property
+    def _merging(self) -> bool:
+        return self.config.decode_run_merge and self.config.max_model_inflight > 1
+
+    @staticmethod
+    def _prefill_needs_d(group: _Group) -> bool:
+        """A prefill's PREPARE and HANDOFF run on this group's D ranks."""
+        return any(b.plan.stage == "P" and b.status in ("PREPARING", "RUNNING", "HANDOFF")
+                   for b in group.batches.values())
+
+    def _other_decoding(self, group: _Group, batch: _Batch) -> bool:
+        members = {ref.request_id for ref in batch.plan.requests}
+        return any(r.spec.model_id == group.model_id and r.spec.request_id not in members
+                   and r.state == "DECODING" and not r.pending_reason and not r.finish_reason
+                   for r in self.requests.values())
 
     def _prefill_waiting_for_credits(self) -> bool:
         if self.config.decode_run_park:
@@ -2150,7 +2212,9 @@ class MuxController:
                    for b in group.batches.values()):
                 continue
             rows = [r for r in self.requests.values() if r.spec.model_id == model.model_id]
-            if not any(r.state in ("QUEUED", "REBUILD") and not r.pending_reason for r in rows):
+            now = self.clock()
+            if not any(r.state in ("QUEUED", "REBUILD") and not r.pending_reason and not self._held(r, now)
+                       for r in rows):
                 continue
             occupied = sum(self._occupies_slot(r) for r in rows)
             if occupied < min(self.config.max_model_inflight, self.policy.limits[model.model_id]):
