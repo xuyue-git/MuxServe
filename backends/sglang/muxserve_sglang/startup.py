@@ -304,7 +304,7 @@ def run_initialization(controller, tokenizers, cards, deadline, observe, stop_re
         for model in config.models:
             for name in phase_names:
                 phase(name, (model.model_id,), 1)
-        if config.max_model_inflight == 2:
+        if config.max_model_inflight >= 2:
             with controller.lock:
                 controller.policy.last_adjustment = deadline
             evidence["initialization_batch2_limit_override"] = {"original_limits": saved_limits, "temporary_limit": 2}

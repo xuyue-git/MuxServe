@@ -422,7 +422,8 @@ class Supervisor:
         # Initialization already ACKed this service epoch's event history.
         for model_id, receiver in self.driver.receivers.items():
             receiver.last_seq = initialization_driver.receivers[model_id].last_seq
-        self.gateway = GatewayServer(self.gateway_state, self.config.controller_port)
+        self.gateway = GatewayServer(self.gateway_state, self.config.controller_port,
+                                     maximum_connections=self.config.gateway_connections)
         self.driver.start()
         self.http_thread = Thread(target=self.gateway.serve_forever, name="http-gateway", daemon=False)
         self.http_thread.start()

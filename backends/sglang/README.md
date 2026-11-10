@@ -145,6 +145,23 @@ turns them all on, and `tools/run_perf_point.sh` lists the matching switches.
 | Request end | `cleanup_skip_prefill_ranks`, `cleanup_with_quiesce`, `idle_cache_trim_mib`, `terminal_before_cleanup`, `slot_free_at_cleanup` |
 | Control transport | `event_pump_thread`, `start_in_report_reply`, `targeted_wake`, `rpc_inline_fast_methods` |
 
+Open-loop load (requests sent at trace arrival times, so many wait in the
+queue) uses larger limits and two opt-in KV paths, all off or unchanged by
+default: `max_model_inflight` (1..16), `max_new_tokens` (256..2047),
+`request_timeout_ms` and `gateway_connections` (one HTTP stream per queued
+request). `capacity_recovery_all_decode` handles a full KV pool as original
+MuxServe does: only new prefills wait, every decode that still fits keeps
+running, a one-step decode batch that cannot get its KV preempts the youngest
+idle decoding request younger than the batch, and a finished request lets
+prefills resume. `decode_kv_trim` returns a decode run's unused up-front KV
+reservation to the pool when the run ends. `tools/run_perf_point.sh` takes
+`INFLIGHT`, `MAX_NEW_TOKENS`, `REQUEST_TIMEOUT_MS`, `GATEWAY_CONNECTIONS`,
+`RECOVERY_ALL_DECODE=1` and `KV_TRIM=1`. Independently of any switch, the
+gateway wakes only the stream whose request changed, a request stays known
+until its batch is fed back, and a decode run is shortened so that its event
+reservation fits the group's event window (this only applies to batches of
+eight or more requests).
+
 ## Known limitations
 
 Prefill CUDA graphs (unless `prefill_cuda_graph`), overlap scheduling and custom all-reduce remain disabled.

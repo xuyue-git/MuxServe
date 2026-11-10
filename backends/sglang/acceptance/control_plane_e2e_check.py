@@ -138,7 +138,7 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                             "rank": rank, "native_payload": {}})
                     time.sleep(prefill_s)
                     results = [{"request_id": i["request_id"], "attempt": i["attempt"],
-                                "token_id": token_for(len(i["output_token_ids"])),
+                                "token_id": None if prep.get("purpose") == "REBUILD" else token_for(len(i["output_token_ids"])),
                                 "valid_tokens": i["target_valid_tokens"]} for i in prep["requests"]]
                     payload = {"reservation_id": prep["reservation_id"], "results": results,
                                "duration_ms": (time.monotonic() - start) * 1000, "gpu_forward_ms": prefill_s * 1000}
@@ -293,8 +293,13 @@ def main():
     parser.add_argument("--decode-leader", action="store_true", help="config decode_leader_reports=true")
     parser.add_argument("--prepare-after-ack", action="store_true", help="config handoff_prepare_after_ack=true")
     parser.add_argument("--inflight", type=int, default=1, help="config max_model_inflight and client load")
+    parser.add_argument("--clients", type=int, default=0,
+                        help="closed-loop clients per model instead of --inflight (the rest queue on open streams)")
     parser.add_argument("--run-merge", action="store_true", help="config decode_run_merge=true")
     parser.add_argument("--pair-hold-ms", type=int, default=0, help="config prefill_pair_hold_ms")
+    parser.add_argument("--recovery-all-decode", action="store_true", help="config capacity_recovery_all_decode=true")
+    parser.add_argument("--max-new", type=int, default=256, help="config max_new_tokens")
+    parser.add_argument("--kv-trim", action="store_true", help="config decode_kv_trim=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -334,7 +339,9 @@ def main():
                               decode_leader_reports=args.decode_leader,
                               handoff_prepare_after_ack=args.prepare_after_ack,
                               max_model_inflight=args.inflight, decode_run_merge=args.run_merge,
-                              prefill_pair_hold_ms=args.pair_hold_ms)
+                              prefill_pair_hold_ms=args.pair_hold_ms,
+                              capacity_recovery_all_decode=args.recovery_all_decode, max_new_tokens=args.max_new,
+                              decode_kv_trim=args.kv_trim)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -391,7 +398,7 @@ def main():
         time.sleep(0.05)
     state = GatewayState(controller, {m: Tokenizer() for m in MODELS})
     driver = ControllerDriver(controller, state.apply_event, state.maintain)
-    gateway = GatewayServer(state, port)
+    gateway = GatewayServer(state, port, maximum_connections=max(32, 6 * args.inflight, 6 * args.clients))
     driver.start()
     http_thread = threading.Thread(target=gateway.serve_forever, daemon=True)
     http_thread.start()
@@ -410,7 +417,7 @@ def main():
     out = Path(directory) / "bench.json"
     bench = subprocess.run([sys.executable, str(ROOT / "tools/bench_fixed.py"), "--port", str(port),
                             "--models", args.bench_models, "--requests", str(args.requests), "--warmup", "1",
-                            "--per-model", str(args.inflight),
+                            "--per-model", str(args.clients or args.inflight),
                             "--input-len", str(args.input_len), "--output-len", str(args.output_len),
                             "--ready-timeout", "30", "--request-timeout", "120", "--out", str(out)],
                            capture_output=True, text=True, timeout=600)

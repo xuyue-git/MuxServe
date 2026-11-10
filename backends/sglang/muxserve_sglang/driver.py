@@ -146,6 +146,13 @@ class ControllerDriver:
                 request = self.controller.requests.get((proposal.model_id, output["request_id"]))
                 budget = request.spec.max_new_tokens if request is not None else maximum
                 remaining.append(budget - output["output_count"])
+            # A run reserves (steps + 1) * requests + 2 event slots at prepare; one slot of
+            # the window always stays reserved for a group error. A run that could never
+            # fit would fail with EVENT_BACKPRESSURE on every retry.
+            group = self.controller.groups.get(proposal.model_id)
+            window = group.outbox.maximum_pending if group is not None else None
+        if window is not None and outputs:
+            remaining.append((window - 3) // len(outputs) - 1)
         return max(1, min([limit] + remaining))
 
     def _prepare(self, proposal):

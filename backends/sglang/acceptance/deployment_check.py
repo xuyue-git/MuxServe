@@ -17,7 +17,7 @@ from pathlib import Path
 import socket
 import sys
 from tempfile import TemporaryDirectory
-from threading import RLock, Event, Thread
+from threading import Condition, RLock, Event, Thread
 import time
 from types import SimpleNamespace
 import unittest
@@ -31,7 +31,7 @@ from controller_check import Fixture
 from muxserve_sglang.config import load_config
 from muxserve_sglang import config as deployment_config
 from muxserve_sglang.contracts import IntegrationError
-from muxserve_sglang.gateway import GatewayServer, GatewayState
+from muxserve_sglang.gateway import GatewayServer, GatewayState, OutputRecord
 from muxserve_sglang.launcher import Supervisor, _native_fields
 from muxserve_sglang import preflight
 from muxserve_sglang import startup
@@ -439,6 +439,22 @@ class DeploymentChecks(unittest.TestCase):
         deliver(fixture, state)
         fixture.ack_all_commands()
         self.assert_retired(fixture, state, record)
+
+    def test_a_token_wakes_only_its_own_stream(self):
+        fixture, state = gateway_fixture()
+        first, second = (OutputRecord("m", name, "id-" + name, 2, 1, wake=Condition(state._lock)) for name in "ab")
+        state.records.update({first.internal_id: first, second.internal_id: second})
+        for record in (first, second):
+            record.wake.notify_all = Mock()
+        state.condition.notify_all = Mock()
+        state.apply_event(SimpleNamespace(kind="TOKEN", request_id=first.internal_id, attempt=0, model_id="m",
+                                          payload={"output_index": 0, "token_ids": (7,)}))
+        self.assertEqual(first.tokens, [7])
+        first.wake.notify_all.assert_called_once_with()
+        second.wake.notify_all.assert_not_called()
+        state.condition.notify_all.assert_not_called()
+        state._wake_all()  # shutdown and group errors still reach every stream
+        second.wake.notify_all.assert_called_once_with()
 
     def test_gateway_counters_separate_admission_and_confirmed_terminal(self):
         fixture, state = gateway_fixture()

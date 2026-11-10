@@ -114,6 +114,9 @@ class DeploymentConfig:
     prepare_timeout_ms: int = 30000
     controller_port: int = 18080
     queue_limit: int = 4096
+    # Concurrent HTTP streams the gateway accepts. Open-loop load holds one
+    # stream per queued request, so it needs more than the closed-loop default.
+    gateway_connections: int = 32
     runtime_dir: str = ""
     asset_lock_dir: str = ""
     # Maximum consecutive decode forwards under one D grant. 1 is the original
@@ -241,6 +244,15 @@ class DeploymentConfig:
     # and skips the GPU read-back and synchronize; those tensors were just
     # built from the same CPU values on this rank.
     decode_prepare_light: bool = False
+    # Full KV pool, as the original MuxServe handles it: only new prefills wait, every
+    # decode that still fits keeps running, and any finished request ends the wait. A
+    # one-step decode batch that cannot get its KV preempts (suspends) the youngest idle
+    # decoding request that is younger than the batch, as the original's scheduler preempts.
+    # Off: only the oldest request may decode until it finishes.
+    capacity_recovery_all_decode: bool = False
+    # Return a decode run's unused up-front reservation to the pool when the run ends,
+    # so KV grows with the committed tokens as in the original's per-token allocation.
+    decode_kv_trim: bool = False
     # With two requests of a model in flight: D ranks take no commands inside a
     # decode run, so a run ends at its next step boundary when a prefill of its
     # model needs them or another request waits to decode, and no decode batch
@@ -305,7 +317,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
     integer_limits = ("tp_size", "batch_history_limit", "kv_bytes_per_rank", "extra_headroom_bytes_per_rank",
                       "max_model_inflight", "credit_multiplier", "max_input_tokens",
                       "max_new_tokens", "max_context_tokens", "request_timeout_ms",
-                      "prepare_timeout_ms", "controller_port", "queue_limit", "decode_run_steps")
+                      "prepare_timeout_ms", "controller_port", "queue_limit", "decode_run_steps",
+                      "gateway_connections")
     if any(type(getattr(config, name)) is not int or getattr(config, name) <= 0
            for name in integer_limits):
         raise IntegrationError("INVALID_CONFIG", "Deployment limits must be positive integers")
@@ -331,7 +344,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "slot_free_at_cleanup", "handoff_ack_in_poll",
                  "handoff_report_with_ready", "start_in_report_reply", "targeted_wake",
                  "rpc_inline_fast_methods", "decode_leader_reports", "handoff_prepare_after_ack",
-                 "decode_prepare_light", "decode_run_merge"):
+                 "decode_prepare_light", "decode_run_merge", "capacity_recovery_all_decode",
+                 "decode_kv_trim"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if type(config.prefill_pair_hold_ms) is not int or not 0 <= config.prefill_pair_hold_ms <= 50:
@@ -363,9 +377,13 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "Queue limit exceeds the bounded lifetime ceiling")
     if config.tp_size not in (1, 2, 4):
         raise IntegrationError("INVALID_CONFIG", "Initial TP is 1, 2 or 4; acceptance requires TP4")
-    if config.max_model_inflight not in (1, 2) or config.credit_multiplier not in (1, 3):
+    if config.gateway_connections > 4096:
+        raise IntegrationError("INVALID_CONFIG", "gateway_connections must be at most 4096")
+    # 16 is the decode graph buffers' batch limit (sglang_memory.init_graph_buffers).
+    if not 1 <= config.max_model_inflight <= 16 or config.credit_multiplier not in (1, 3):
         raise IntegrationError("INVALID_CONFIG", "Initial inflight and credit profiles are restricted")
-    if (config.max_input_tokens, config.max_new_tokens, config.max_context_tokens) != (1792, 256, 2048):
+    if (config.max_input_tokens != 1792 or config.max_context_tokens != 2048
+            or not 256 <= config.max_new_tokens <= 2047):
         raise IntegrationError("INVALID_CONFIG", "Initial token limits must match the approved design")
     if config.kv_bytes_per_rank < 8192 or config.extra_headroom_bytes_per_rank < 1024**3:
         raise IntegrationError("INVALID_CONFIG", "KV budget or workspace headroom is invalid")

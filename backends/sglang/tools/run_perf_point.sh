@@ -11,7 +11,11 @@
 # same closed-loop load in the client), RUN_MERGE=1 (a waiting decode joins at the next
 # step boundary: config decode_run_merge=true), PAIR_HOLD_MS=N (a request of an idle
 # model waits N ms so the next one shares its prefill batch: config prefill_pair_hold_ms=N;
-# needs INFLIGHT=2, RUN_MERGE, INLINE_PREPARE).
+# needs INFLIGHT=2, RUN_MERGE, INLINE_PREPARE). INFLIGHT may be 1..16.
+# MAX_NEW_TOKENS=N (config max_new_tokens, 256..2047), REQUEST_TIMEOUT_MS=N (config
+# request_timeout_ms), GATEWAY_CONNECTIONS=N (config gateway_connections) for open-loop load.
+# RECOVERY_ALL_DECODE=1 (full KV pool pauses only new prefills: config capacity_recovery_all_decode=true).
+# KV_TRIM=1 (a decode run returns its unused KV reservation when it ends: config decode_kv_trim=true).
 # Optional env: GPUS (default 1,2,3,4), MODELS_ROOT, REFERENCE (bench JSON to
 # compare output tokens against), KV_FRACTION (size the KV pool like original
 # MuxServe: gpu_memory_utilization x total GPU memory, instead of kv_bytes_per_rank),
@@ -110,6 +114,11 @@ PREPARE_LIGHT="${PREPARE_LIGHT:-}"
 INFLIGHT="${INFLIGHT:-}"
 RUN_MERGE="${RUN_MERGE:-}"
 PAIR_HOLD_MS="${PAIR_HOLD_MS:-}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
+REQUEST_TIMEOUT_MS="${REQUEST_TIMEOUT_MS:-}"
+GATEWAY_CONNECTIONS="${GATEWAY_CONNECTIONS:-}"
+RECOVERY_ALL_DECODE="${RECOVERY_ALL_DECODE:-}"
+KV_TRIM="${KV_TRIM:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -117,7 +126,7 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
@@ -125,7 +134,7 @@ import json, sys
  inline_prepare, own_table, register_ready, broker_poll, early_terminal,
  slot_at_cleanup, ack_in_poll, combined_report, start_in_reply,
  targeted_wake, rpc_inline, decode_leader, prepare_after_ack, prepare_light,
- inflight, run_merge, pair_hold_ms) = sys.argv[1:]
+ inflight, run_merge, pair_hold_ms, max_new, timeout_ms, gateway, recovery_all_decode, kv_trim) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -163,6 +172,16 @@ for key, value in (("inline_start", inline), ("decode_skip_prefill_ranks", skip_
         config[key] = True
 if inflight:
     config["max_model_inflight"] = int(inflight)
+if max_new:
+    config["max_new_tokens"] = int(max_new)
+if timeout_ms:
+    config["request_timeout_ms"] = int(timeout_ms)
+if gateway:
+    config["gateway_connections"] = int(gateway)
+if recovery_all_decode:
+    config["capacity_recovery_all_decode"] = True
+if kv_trim:
+    config["decode_kv_trim"] = True
 config.pop("prefill_pair_hold_ms", None)
 if pair_hold_ms:
     config["prefill_pair_hold_ms"] = int(pair_hold_ms)
@@ -209,7 +228,12 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "prepare_light=%s" % config.get("decode_prepare_light", False),
       "inflight=%s" % config.get("max_model_inflight", 1),
       "run_merge=%s" % config.get("decode_run_merge", False),
-      "pair_hold_ms=%s" % config.get("prefill_pair_hold_ms", 0))
+      "pair_hold_ms=%s" % config.get("prefill_pair_hold_ms", 0),
+      "max_new=%s" % config.get("max_new_tokens", 256),
+      "timeout_ms=%s" % config.get("request_timeout_ms", 120000),
+      "gateway=%s" % config.get("gateway_connections", 32),
+      "recovery_all_decode=%s" % config.get("capacity_recovery_all_decode", False),
+      "kv_trim=%s" % config.get("decode_kv_trim", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

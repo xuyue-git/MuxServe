@@ -41,13 +41,15 @@ class OutputRecord:
     completed_at: float | None = None
     deadline: float = 0.0
     terminal_counted: bool = False
+    wake: Condition | None = None  # wakes only this request's stream; shares the gateway lock
 
 
 class GatewayState:
     def __init__(self, controller, tokenizers):
         self.controller, self.config = controller, controller.config
         self.tokenizers = tokenizers
-        self.condition = Condition(RLock())
+        self._lock = RLock()
+        self.condition = Condition(self._lock)
         self.tokenizer_lock = RLock()
         self.records = {}
         # Exact service-epoch RID rejection avoids returning an old controller
@@ -105,7 +107,7 @@ class GatewayState:
         if not 0 < len(inputs) <= self.config.max_input_tokens:
             raise IntegrationError("INVALID_ARGUMENT", "Prompt exceeds the fixed input limit")
         identity = uuid4().hex
-        record = OutputRecord(model_id, rid, identity, len(inputs), interval)
+        record = OutputRecord(model_id, rid, identity, len(inputs), interval, wake=Condition(self._lock))
         with self.condition:
             if not self.accepting or len(self.records) >= self.config.queue_limit:
                 raise IntegrationError("NOT_READY", "Gateway is draining or its output window is full")
@@ -131,13 +133,22 @@ class GatewayState:
             prepare(model_id, identity)  # inline_prepare; outside the gateway lock
         return record
 
+    def _wake(self, record):
+        (record.wake or self.condition).notify_all()
+
+    def _wake_all(self):
+        self.condition.notify_all()
+        for record in self.records.values():
+            if record.wake is not None:
+                record.wake.notify_all()
+
     def apply_event(self, event):
         with self.condition:
             if event.kind == "GROUP_ERROR":
                 for record in self.records.values():
                     if record.model_id == event.model_id and record.state not in _TERMINAL:
                         record.error = event.payload["reason"]
-                self.condition.notify_all()
+                self._wake_all()
                 return
             record = self.records.get(event.request_id)
             if record is None:
@@ -167,7 +178,7 @@ class GatewayState:
                     record.completed_at = time.monotonic()
                     if record.state != "FINISHED":
                         record.error = record.finish_reason or "request_failed"
-            self.condition.notify_all()
+            self._wake(record)
 
     def maintain(self):
         # Event ACK and lifecycle work never wait for a client's socket writes.
@@ -189,7 +200,7 @@ class GatewayState:
                             raise
                     else:
                         record.state, record.attempt = output["state"], output["attempt"]
-                        self.condition.notify_all()
+                        self._wake(record)
             if record.state in _TERMINAL and not record.forgotten:
                 try:
                     self.controller.forget_request(record.model_id, record.internal_id, record.attempt)
@@ -227,7 +238,7 @@ class GatewayState:
                 result = self.controller.resume_request(model_id, identity, record.resume_record_id)
                 record.manual_suspend = False
                 record.state, record.attempt = result["state"], result["attempt"]
-                self.condition.notify_all()
+                self._wake(record)
                 return result
             raise IntegrationError("INVALID_ARGUMENT", "Unsupported request operation")
 
@@ -243,7 +254,7 @@ class GatewayState:
         """End HTTP continuation without asserting GPU completion or release."""
         record.manual_suspend = True
         record.error = record.error or reason
-        self.condition.notify_all()
+        self._wake(record)
 
     def _cancel_abandoned(self, record):
         if record.error == "timeout":
@@ -270,7 +281,7 @@ class GatewayState:
             for record in self.records.values():
                 if record.state not in _TERMINAL:
                     self._abandon(record, "supervisor_shutdown")
-            self.condition.notify_all()
+            self._wake_all()
 
     def fail(self, reason):
         with self.condition:
@@ -278,7 +289,7 @@ class GatewayState:
             for record in self.records.values():
                 if record.state not in _TERMINAL:
                     record.error = reason
-            self.condition.notify_all()
+            self._wake_all()
 
     def payload(self, record, *, terminal=False):
         with self.condition:
@@ -296,6 +307,8 @@ class GatewayServer(ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = True
     allow_reuse_address = False
+    # socketserver's default of 5 resets connections in a burst of arrivals.
+    request_queue_size = 1024
     admission_timeout = 10.0
     write_timeout = 10.0
 
@@ -481,7 +494,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             last_write = time.monotonic()
             while True:
                 with state.condition:
-                    state.condition.wait_for(lambda: record.error or record.state in _TERMINAL
+                    (record.wake or state.condition).wait_for(lambda: record.error or record.state in _TERMINAL
                         or len(record.tokens) - sent >= record.stream_interval, timeout=1)
                     error, terminal = record.error, record.state in _TERMINAL
                     count = len(record.tokens)

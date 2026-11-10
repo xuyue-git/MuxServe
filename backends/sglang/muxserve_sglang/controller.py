@@ -245,6 +245,7 @@ class MuxController:
         self.records: dict[str, ResumeRecord] = {}
         self.capacity_blocked: set[str] = set()
         self.recovery_protected: dict[str, tuple[str, str]] = {}
+        self.recovery_owners: dict[str, tuple[tuple[str, str], ...]] = {}
         self.recovery_cycles = self.recovery_suspensions = 0
         self._ordinal = 0
         self.credits = CreditLedger(config.credit_multiplier, tuple(range(config.tp_size)))
@@ -830,7 +831,7 @@ class MuxController:
             now = self.clock()
             prefill = tuple(r.spec.request_id for r in rows if r.state == "QUEUED" and not self._held(r, now))
             rebuild = tuple(r.spec.request_id for r in rows if r.state == "REBUILD")
-            protected = self.recovery_protected.get(self._recovery_key(model.model_id))
+            protected = self._decode_only_for(model.model_id)
             decode = tuple(r.spec.request_id for r in rows if r.state == "DECODING"
                            and (protected is None or
                                 (r.spec.model_id, r.spec.request_id) == protected))
@@ -885,6 +886,12 @@ class MuxController:
         return ({model.model_id for model in self.config.models}
                 if self.config.kv_pool_mode == "shared" else {key})
 
+    def _decode_only_for(self, model_id: str) -> tuple[str, str] | None:
+        """The one request decode is restricted to during capacity recovery, if any."""
+        if self.config.capacity_recovery_all_decode:
+            return None
+        return self.recovery_protected.get(self._recovery_key(model_id))
+
     def _enter_capacity_recovery(self, model_id: str) -> None:
         """Protect one oldest physical owner across the affected physical pool."""
         key = self._recovery_key(model_id)
@@ -899,7 +906,9 @@ class MuxController:
         protected = owners[0]
         identity = (protected.spec.model_id, protected.spec.request_id)
         self.recovery_protected[key] = identity
+        self.recovery_owners[key] = tuple((r.spec.model_id, r.spec.request_id) for r in owners)
         self.recovery_cycles += 1
+        trace.ev("recovery_enter", None, m=model_id, owners=len(owners), protected=identity[1])
         self.capacity_blocked.update(models)
         # Do not let a previously prepared younger P consume the released
         # capacity after this protection decision. Started work still completes.
@@ -908,8 +917,34 @@ class MuxController:
             for batch in tuple(group.batches.values()):
                 identities = {(model, ref.request_id) for ref in batch.plan.requests}
                 if (batch.status == "PREPARING" and identities != {identity}
-                        and (batch.plan.stage == "D" or identity not in identities)):
+                        and ((batch.plan.stage == "D" and not self.config.capacity_recovery_all_decode)
+                             or (batch.plan.stage == "P" and identity not in identities))):
                     self._abort_prepared(group, batch, "capacity_recovery")
+
+    def _preempt_younger(self, plan: BatchPlan) -> None:
+        """capacity_recovery_all_decode: free KV for a one-step decode batch that does not
+        fit by suspending the youngest idle decoding request younger than the batch, and
+        pause fresh prefills until a request finishes. Caller holds the lock."""
+        key = self._recovery_key(plan.model_id)
+        members = {(plan.model_id, ref.request_id) for ref in plan.requests}
+        oldest_young = max(self._request(plan.model_id, ref.request_id).ordinal for ref in plan.requests)
+        victims = sorted((r for r in self.requests.values()
+                          if r.spec.model_id in self._recovery_models(key)
+                          and (r.spec.model_id, r.spec.request_id) not in members
+                          and r.ordinal > oldest_young and r.state == "DECODING" and not r.pending_reason
+                          and self._active(r) is None and self._occupies_slot(r)),
+                         key=lambda r: r.ordinal, reverse=True)
+        if not victims:
+            return
+        self._enter_capacity_recovery(plan.model_id)
+        self._stop_request(victims[0], "suspend")
+        self.recovery_suspensions += 1
+        trace.ev("preempt", None, m=victims[0].spec.model_id, req=victims[0].spec.request_id, for_m=plan.model_id)
+
+    def _owner_finished(self, owner: tuple[str, str]) -> bool:
+        """A suspended owner stays known and resumes, so it does not count."""
+        request = self.requests.get(owner)
+        return request is None or request.state in ("FINISHED", "CANCELLED", "TIMED_OUT", "FAILED")
 
     def _advance_capacity_recovery(self) -> None:
         for key, identity in tuple(self.recovery_protected.items()):
@@ -919,7 +954,16 @@ class MuxController:
                 # A terminal cleanup or explicit suspension ended ownership.
                 # One free decode step is deliberately NOT an exit condition.
                 del self.recovery_protected[key]
+                self.recovery_owners.pop(key, None)
                 self.capacity_blocked.difference_update(models)
+                trace.ev("recovery_exit", None, why="protected_released")
+                continue
+            if self.config.capacity_recovery_all_decode and any(
+                    self._owner_finished(owner) for owner in self.recovery_owners.get(key, ())):
+                del self.recovery_protected[key]
+                self.recovery_owners.pop(key, None)
+                self.capacity_blocked.difference_update(models)
+                trace.ev("recovery_exit", None, why="owner_finished")
                 continue
             if (protected.pending_reason or protected.state != "DECODING"
                     or self._active(protected) is not None
@@ -933,6 +977,7 @@ class MuxController:
             if victims:
                 self._stop_request(victims[0], "suspend")
                 self.recovery_suspensions += 1
+                trace.ev("preempt", None, m=victims[0].spec.model_id, req=victims[0].spec.request_id, for_m="protected")
 
     def tick(self, *, include_adjustments: bool = True) -> dict:
         """Run deadline/recovery accounting and return ADBS proposals; no implicit START."""
@@ -1032,7 +1077,7 @@ class MuxController:
                 raise IntegrationError("STAGE_BUSY", "Stage already has active work")
             if plan.stage == "P" and plan.model_id in self.capacity_blocked:
                 raise IntegrationError("OUT_OF_CAPACITY", "Fresh P admission paused during D recovery")
-            protected = self.recovery_protected.get(self._recovery_key(plan.model_id))
+            protected = self._decode_only_for(plan.model_id)
             if protected is not None and any(
                     (plan.model_id, ref.request_id) != protected for ref in plan.requests):
                 raise IntegrationError("OUT_OF_CAPACITY", "Only the protected oldest owner may advance")
@@ -1131,6 +1176,9 @@ class MuxController:
                         try:
                             if not self._single_decode_fits(plan.model_id):
                                 self._enter_capacity_recovery(plan.model_id)
+                            elif (self.config.capacity_recovery_all_decode and plan.stage == "D"
+                                  and plan.steps == 1):
+                                self._preempt_younger(plan)
                         except IntegrationError:
                             # A failed diagnostic supplies no proof for
                             # suspension. Preserve the definite capacity error.
@@ -1232,7 +1280,8 @@ class MuxController:
             protected = self.recovery_protected.get(self._recovery_key(group.model_id))
             identities = {(group.model_id, ref.request_id) for ref in batch.plan.requests}
             if (protected is not None and identities != {protected}
-                    and (batch.plan.stage == "D" or protected not in identities)):
+                    and ((batch.plan.stage == "D" and not self.config.capacity_recovery_all_decode)
+                         or (batch.plan.stage == "P" and protected not in identities))):
                 self._abort_prepared(group, batch, "capacity_recovery")
                 raise IntegrationError("NOT_READY", "Capacity recovery revoked younger preparation")
             now = self.clock()
@@ -1818,9 +1867,12 @@ class MuxController:
                     raise IntegrationError("HANDOFF_NOT_READY", "All P ranks must stage native metadata")
         failed = bool(batch.failure_reason and batch.failure_reason.startswith("rank_error:"))
         try:
+            trim = (self.config.decode_kv_trim and not failed and batch.plan.stage == "D"
+                    and batch.plan.purpose == "GENERATE")
             committed = self.store.finish_kv_batch(batch.reservation.reservation_id,
                                                    "FAILURE" if failed else "SUCCESS",
-                                                   {} if failed else valid, group.ranks)
+                                                   {} if failed else valid, group.ranks,
+                                                   **({"trim_to_valid": True} if trim else {}))
         except IntegrationError as exc:
             self._fence(group, batch, "store_commit:" + exc.code)
             raise
@@ -2140,7 +2192,7 @@ class MuxController:
             if (request.attempt != ref.attempt or request.pending_reason or request.finish_reason
                     or now >= request.deadline):
                 return False
-        protected = self.recovery_protected.get(self._recovery_key(group.model_id))
+        protected = self._decode_only_for(group.model_id)
         if protected is not None and {(group.model_id, ref.request_id)
                                       for ref in batch.plan.requests} != {protected}:
             return False
@@ -2157,8 +2209,9 @@ class MuxController:
 
     def _decode_waiting(self, group: _Group, batch: _Batch) -> bool:
         """decode_run_merge: end this run so another request of its model can join."""
-        if (not self._merging or len(batch.plan.requests) >= self.config.max_model_inflight):
-            return False
+        if (not self._merging or len(batch.plan.requests) >= min(self.config.max_model_inflight,
+                                                                 self.policy.limits[group.model_id])):
+            return False  # A full batch has no room for another request of its model.
         return self._prefill_needs_d(group) or self._other_decoding(group, batch)
 
     @property
@@ -2719,7 +2772,7 @@ class MuxController:
                 raise IntegrationError("UNKNOWN_REQUEST", "Unknown request")
             if (group.uncertain_batches or request.attempt != attempt or request.state not in (
                     "FINISHED", "CANCELLED", "TIMED_OUT", "FAILED", "SUSPENDED")
-                    or self._active(request) is not None or any(
+                    or self._active(request) is not None or self._batch_holds_request(group, request_id) or any(
                         event.request_id == request_id for event in group.outbox.pending.values())
                     or any(self._command_refs_request(group, cmd, request_id)
                            for rank in group.registered.values() for cmd in rank.commands.values())
@@ -2731,6 +2784,14 @@ class MuxController:
             del self.requests[(model_id, request_id)]
             self._retire_completed(group)
             return {"forgotten": True}
+
+    @staticmethod
+    def _batch_holds_request(group: _Group, request_id: str) -> bool:
+        """A batch reads its requests until it is fed back: a request that timed out
+        while a batch-mate is still cleaning up must stay known until then."""
+        return any((batch.status not in ("DONE", "ABORTED") or (batch.status == "DONE" and not batch.feedback_sent))
+                   and any(ref.request_id == request_id for ref in batch.plan.requests)
+                   for batch in group.batches.values())
 
     @staticmethod
     def _command_refs_request(group: _Group, command: dict | CommandSnapshot, request_id: str) -> bool:

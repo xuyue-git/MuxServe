@@ -326,7 +326,11 @@ class HeadwiseStore:
             batch.state = "RUNNING"
 
     def finish_kv_batch(self, reservation_id: str, outcome: str,
-                        valid_lengths: dict[str, int], completed_ranks: Sequence[int]) -> tuple[KVView, ...]:
+                        valid_lengths: dict[str, int], completed_ranks: Sequence[int],
+                        trim_to_valid: bool = False) -> tuple[KVView, ...]:
+        """trim_to_valid: on success, return every page past the committed length to the
+        free pool (a decode run reserves all of its steps up front and may stop early).
+        The next reservation appends pages again; no rank keeps a mapping between batches."""
         if not isinstance(outcome, str):
             raise IntegrationError("INVALID_ARGUMENT", "Outcome must be a string")
         outcome = outcome.upper()
@@ -388,6 +392,8 @@ class HeadwiseStore:
                 for aid in batch.old_capacity:
                     allocation = self._allocation(aid)
                     allocation.valid = batch.success_lengths[aid]
+                    if trim_to_valid:
+                        self._trim(allocation)
                     allocation.version += 1
                     allocation.active = None
                     result.append(self._view(allocation))
@@ -617,6 +623,16 @@ class HeadwiseStore:
                                   for rank in a.arrays})
         return KVView(a.allocation_id, a.identity, a.capacity, a.valid,
                       a.layout.block_size, dict(a.packed[1]), a.version)
+
+    def _trim(self, allocation: _Allocation) -> None:
+        size = allocation.layout.block_size
+        keep = (allocation.valid + size - 1) // size
+        if keep >= allocation.pages:
+            return
+        for rank, table in allocation.arrays.items():
+            self._free_source(allocation, rank).put(table[:, :, keep:allocation.pages].reshape(-1))
+        allocation.capacity = keep * size
+        allocation.epoch += 1
 
     def _rollback(self, batch: _Batch) -> None:
         for aid, capacity in batch.old_capacity.items():

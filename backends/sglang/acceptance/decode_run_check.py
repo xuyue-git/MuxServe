@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -323,6 +325,116 @@ class DecodeRunChecks(unittest.TestCase):
         batch = next(b for b in sim.controller.groups["a"].batches.values() if b.status == "PREPARING")
         self.assertEqual({ref.request_id for ref in batch.plan.requests}, {"r", "q"})
         self.assertEqual(batch.plan.steps, 5)  # q has the fewest tokens left
+
+    def test_a_large_batch_run_fits_the_event_window(self):
+        sim = Sim(run_steps=128, max_model_inflight=16, decode_run_merge=True)
+        sim.controller.policy.limits["a"] = 16
+        names = ["r%d" % index for index in range(10)]
+        for index, name in enumerate(names):
+            sim.submit("a", name, max_new=200)
+            sim.prefill("a", name, 11 + index)
+        controller = sim.controller
+        outputs = [controller.request_output("a", name) for name in names]
+        driver = ControllerDriver(controller, lambda event: None)
+        steps = driver._run_steps(SimpleNamespace(model_id="a", stage="D", purpose="GENERATE"), outputs)
+        window = controller.groups["a"].outbox.maximum_pending
+        self.assertEqual(steps, (window - 3) // 10 - 1)  # 128 steps would need 1292 slots
+        self.assertLessEqual((steps + 1) * 10 + 2, window - 1)
+        events = controller.poll_events(sim.group("a"), 0)  # the prefills' events, delivered
+        controller.ack_events(sim.group("a"), events[-1].event_seq)
+        plan = BatchPlan(sim.group("a"), "d-ten", "a", "D", tuple(
+            RequestRef(o["request_id"], o["attempt"], o["output_count"]) for o in outputs), steps=steps)
+        controller.prepare_batch(plan)  # the event reservation fits
+        self.assertEqual(driver._run_steps(SimpleNamespace(model_id="a", stage="D", purpose="GENERATE"),
+                                           outputs[:2]), 128)
+
+    def test_a_run_returns_its_unused_reservation_with_the_switch(self):
+        for trim in (False, True):
+            # q waits to decode, so r's eight-step run ends after its first step.
+            sim = Sim(run_steps=8, max_model_inflight=2, decode_run_merge=True, decode_kv_trim=trim)
+            sim.submit("a", "r", max_new=20, input_ids=tuple(range(1, 16)))
+            sim.submit("a", "q", max_new=6)
+            sim.prefill("a", "r", 11)
+            sim.prefill("a", "q", 21)
+            plan, reservation = sim.prepare_decode("a", "r", 8)
+            store = sim.controller.store
+            identity = sim.controller.requests[("a", "r")].identity
+            aid = next(a for a, v in store.snapshot()["allocations"].items() if v["identity"] == identity)
+            before = store.snapshot()["allocations"][aid]["capacity_tokens"]
+            free_before = min(v["free_blocks"] for v in store.rank_usage().values())
+            self.assertFalse(sim.step("a", plan, 0, 1, 12)["continue"])
+            self.assertFalse(sim.step("a", plan, 1, 1, 12)["continue"])
+            sim.finish_run("a", plan, reservation, 1, 12)
+            sim.quiesce("a", plan, reservation)
+            after = store.snapshot()["allocations"][aid]["capacity_tokens"]
+            valid = sim.controller.requests[("a", "r")].valid_tokens
+            self.assertEqual(before, 32)  # 15 prompt tokens + 8 reserved steps
+            self.assertEqual(after, 16 * ((valid + 15) // 16) if trim else before)
+            self.assertEqual(min(v["free_blocks"] for v in store.rank_usage().values()) > free_before, trim)
+            store.assert_integrity()
+
+    def test_a_decode_that_cannot_get_kv_preempts_a_younger_request_with_the_switch(self):
+        for relaxed in (False, True):
+            sim = Sim(run_steps=8, max_model_inflight=2, decode_run_merge=True,
+                      capacity_recovery_all_decode=relaxed)
+            sim.submit("a", "r", max_new=10)
+            sim.submit("a", "q", max_new=10)
+            sim.prefill("a", "r", 11)
+            sim.prefill("a", "q", 21)
+            controller = sim.controller
+            out = controller.request_output("a", "r")
+            plan = BatchPlan(sim.group("a"), "d-full", "a", "D", (RequestRef("r", out["attempt"], out["output_count"]),), steps=1)
+            with mock.patch.object(controller.store, "reserve_kv",
+                                   side_effect=IntegrationError("OUT_OF_CAPACITY", "full")), \
+                    mock.patch.object(controller, "_single_decode_fits", return_value=True):
+                with self.assertRaises(IntegrationError):
+                    controller.prepare_batch(plan)
+            q = controller.requests[("a", "q")]
+            self.assertEqual(q.pending_reason == "suspend", relaxed)
+            self.assertEqual(controller.recovery_suspensions, 1 if relaxed else 0)
+            self.assertEqual("a" in controller.capacity_blocked, relaxed)
+
+    def test_capacity_recovery_restricts_decode_only_without_the_switch(self):
+        for relaxed, expected in ((False, ()), (True, ("q",))):
+            sim, plan, reservation = self.two_waiting(max_model_inflight=2, decode_run_merge=True,
+                                                      capacity_recovery_all_decode=relaxed)
+            controller = sim.controller
+            key = controller._recovery_key("a")
+            controller.recovery_protected[key] = ("a", "r")
+            controller.recovery_owners[key] = (("a", "r"), ("a", "q"))
+            controller.capacity_blocked.add("a")
+            demand = next(d for d in controller._snapshot_policy().demands if d.model_id == "a")
+            self.assertEqual(demand.decode, expected)
+            controller.requests[("a", "q")].state = "FINISHED"
+            controller._advance_capacity_recovery()
+            self.assertEqual(key in controller.recovery_protected, not relaxed)
+            self.assertEqual("a" in controller.capacity_blocked, not relaxed)
+
+    def test_a_request_stays_known_until_its_batch_is_fed_back(self):
+        sim, plan, reservation = self.two_waiting(max_model_inflight=2, decode_run_merge=True)
+        controller = sim.controller
+        group, request = controller.groups["a"], controller.requests[("a", "r")]
+        batch = group.batches[plan.batch_id]
+        request.state = "TIMED_OUT"
+        group.outbox.pending.clear()
+        with mock.patch.object(controller, "_active", return_value=None), \
+                mock.patch.object(controller, "_command_refs_request", return_value=False), \
+                mock.patch.object(controller.store, "allocation_identities", return_value=set()):
+            for status, fed_back in (("RUNNING", False), ("DONE", False)):
+                batch.status, batch.feedback_sent = status, fed_back
+                with self.assertRaises(IntegrationError) as caught:
+                    controller.forget_request("a", "r", request.attempt)
+                self.assertEqual(caught.exception.code, "NOT_READY")
+            batch.feedback_sent = True
+            self.assertTrue(controller.forget_request("a", "r", request.attempt)["forgotten"])
+
+    def test_a_run_ends_for_a_waiting_decode_only_below_the_policy_limit(self):
+        sim, plan, reservation = self.two_waiting(max_model_inflight=4, decode_run_merge=True)
+        sim.controller.policy.limits["a"] = 1  # the batch holding r is already full
+        self.assertTrue(sim.step("a", plan, 0, 1, 12)["continue"])
+        sim, plan, reservation = self.two_waiting(max_model_inflight=4, decode_run_merge=True)
+        sim.controller.policy.limits["a"] = 4
+        self.assertFalse(sim.step("a", plan, 0, 1, 12)["continue"])
 
     def test_a_prefill_of_the_same_model_ends_the_run_and_holds_decode(self):
         sim = Sim(run_steps=8, park=True, max_model_inflight=2, decode_run_merge=True)

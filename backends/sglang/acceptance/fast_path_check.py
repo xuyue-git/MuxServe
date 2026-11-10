@@ -962,6 +962,17 @@ class HandoffRoundTrips(unittest.TestCase):
         expect("INVALID_CONFIG", lambda: load(handoff_prepare_after_ack=True))
         expect("INVALID_CONFIG", lambda: load(**chain, handoff_prepare_after_ack=True))
         self.assertTrue(load(**ack, handoff_prepare_after_ack=True).handoff_prepare_after_ack)
+        self.assertEqual(load(max_model_inflight=16).max_model_inflight, 16)
+        expect("INVALID_CONFIG", lambda: load(max_model_inflight=17))
+        self.assertEqual(load(max_new_tokens=2047).max_new_tokens, 2047)
+        for bad in (255, 2048):
+            expect("INVALID_CONFIG", lambda: load(max_new_tokens=bad))
+        self.assertTrue(load(capacity_recovery_all_decode=True).capacity_recovery_all_decode)
+        self.assertTrue(load(decode_kv_trim=True).decode_kv_trim)
+        expect("INVALID_CONFIG", lambda: load(decode_kv_trim=1))
+        expect("INVALID_CONFIG", lambda: load(capacity_recovery_all_decode=1))
+        self.assertEqual(load(gateway_connections=4096).gateway_connections, 4096)
+        expect("INVALID_CONFIG", lambda: load(gateway_connections=4097))
 
 
 class PrepareAfterAck(unittest.TestCase):
