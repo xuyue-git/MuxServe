@@ -162,6 +162,80 @@ until its batch is fed back, and a decode run is shortened so that its event
 reservation fits the group's event window (this only applies to batches of
 eight or more requests).
 
+Two further opt-in switches change how a decode run admits work, both off by
+default. With `decode_step_join` a running decode run no longer ends for its
+model's next request: at a step boundary its D ranks take that prefill's
+PREPARE, REVOKE, CLEANUP and KV HANDOFF (the owner holds every rank at the
+same boundary until each handoff, which contains a TP collective, finished on
+all of them), and a request whose handoff finished joins the running batch at
+the next boundary, up to the batch limit, as original MuxServe adds requests
+to its running batch. With `decode_kv_per_page` (requires `decode_step_join`)
+a run reserves only its first step's page and gets one more page at the
+boundary before a request needs it; a page that cannot be had ends the run and
+the full-pool recovery above applies. `tools/run_perf_point.sh` takes
+`STEP_JOIN=1` and `KV_PER_PAGE=1`. With `decode_step_pipeline` (requires
+`decode_leader_reports`; `STEP_PIPELINE=1`) the decode leader no longer waits
+for the owner at a step boundary the owner granted ahead: each answer to a step
+report also says whether the next boundary may simply continue, and the leader
+then reports that step while the next forward runs. A boundary with anything
+new for the run (a prefill waiting for credits, prefill work for its D ranks, a
+request to join, a page needed, a request stopping) is decided as before, one
+step later than without the switch. With `decode_step_leave` (requires
+`decode_step_join` and `decode_leader_reports`; `STEP_LEAVE=1`) a request that
+finishes, is cancelled or times out leaves the running decode run at the next
+step boundary: its KV is committed on its own and released by the ordinary
+cleanup while the others go on, and a run is sized by its longest member rather
+than its shortest. `decode_kv_grow_pages` (1..8, `KV_GROW_PAGES=N`) sets how many
+pages `decode_kv_per_page` adds at a time; a boundary that grows one member also
+tops up every member within a page of its end, and only the new pages are sent.
+Three switches take work off the owner process, all off by default:
+`decode_wait_commands` (`WAIT_COMMANDS=1`; requires `decode_step_join` and
+`handoff_ack_in_poll`) lets a D rank waiting at a run boundary take its
+commands, broker state and handoff ACKs through the `decode_resume` call it
+makes anyway; `prefill_stage_in_gpu_done` (`STAGE_IN_DONE=1`) has a P rank
+send its staged KV metadata inside GPU_DONE instead of one `broker_stage` RPC
+per request; `driver_min_interval_ms` (0..50, `DRIVER_INTERVAL_MS=N`) spaces
+driver passes and builds the policy snapshot from one batch index.
+
+Prefill and decode overlap, all off by default: `prefill_graph_tokens`
+(`PREFILL_GRAPH_TOKENS=16,32,...`) sets the token counts captured for prefill
+CUDA graphs; `prefill_break_slim` (`BREAK_SLIM=1`) makes each layer's graph
+break lighter (same results, checked on GPU by
+`acceptance/graph_break_slim_gpu_check.py`); `prefill_start_unparked`
+(`START_UNPARKED=1`) starts a READY prefill before every decode run parked;
+`handoff_local_success` (`HANDOFF_LOCAL=1`) lets a waiting D rank pop a
+validated handoff at once; `prefill_overlap_decode` (`OVERLAP=1`, requires
+`decode_run_park`) keeps decode runs running while a prefill runs, with MPS
+sharing the GPUs. `kv_release_at_finish` (`KV_EARLY_FREE=1`) returns a finished
+request's KV when it leaves its run instead of after its cleanup.
+
+ADBS: `policy_arrival_rates` (`ARRIVAL_RATES=model=rate,...`) sizes each model's
+starting request limit from its arrival rate exactly as the source's
+`init_max_num_seqs`; `policy_step_history` (`STEP_HISTORY=1`) feeds the 8 s
+re-sizing one batch size per decode-run step, as the source appends
+`hist_num_seqs` per decode batch (without it a run is one entry, which
+understates busy models under `decode_step_join`/`decode_step_leave`);
+`policy_log_adjustments` (`ADBS_LOG=1`) prints one `POLICY_ADJUST` line per
+re-sizing.
+
+Owner process, all off by default: `gateway_process` (`GATEWAY_PROC=1`) runs
+the HTTP gateway (sockets, SSE, tokenizer) in a child process fed by one pipe;
+`event_lean_copies` (`LEAN_EVENTS=1`) passes runtime events on without deep
+copies; `driver_lean_locking` (`DRIVER_LEAN=1`) takes the owner lock fewer
+times per driver pass; `owner_switch_interval_us` (`OWNER_SWITCH_US=500`) sets
+the owner's interpreter switch interval. `acceptance/owner_speed_check.py`
+covers them on CPU.
+
+The fastest open-loop ShareGPT configuration so far (alpha 0.7, rate scale 1.0,
+257 requests; three rounds 510-525 tok/s against the original's 480.56) is the
+xbench common switches plus `OPEN_LOOP=1 RECOVERY_ALL_DECODE=1 KV_TRIM=1
+STEP_JOIN=1 STEP_PIPELINE=1 STEP_LEAVE=1 KV_PER_PAGE=1 KV_GROW_PAGES=4
+WAIT_COMMANDS=1 STAGE_IN_DONE=1 DRIVER_INTERVAL_MS=5 PER_MODEL=16
+PAIR_HOLD_MS=10 START_UNPARKED=1 HANDOFF_LOCAL=1 PREFILL_GRAPH_TOKENS=16,32,64,128,256,512,1024,2048
+BREAK_SLIM=1 OVERLAP=1 ARRIVAL_RATES=llama7b=2.0,llama13b=1.2311444133449163,llama30b=0.9269261135439395
+KV_EARLY_FREE=1 GATEWAY_PROC=1 LEAN_EVENTS=1 DRIVER_LEAN=1 OWNER_SWITCH_US=500
+STEP_HISTORY=1`.
+
 ## Known limitations
 
 Prefill CUDA graphs (unless `prefill_cuda_graph`), overlap scheduling and custom all-reduce remain disabled.
