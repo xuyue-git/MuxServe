@@ -388,6 +388,41 @@ class MuxController:
             "decode_step", "decode_resume", "broker_stage", "broker_lookup", "broker_ack",
             "broker_poll", "broker_register_destination", "broker_bootstrap"))
 
+    def _trace_kv_usage(self) -> None:
+        """Trace only, caller holds the lock: per model, KV tokens by what holds them."""
+        usage = {}
+        counted = set()
+        for group in self.groups.values():
+            row = dict(decode_used=0, decode_slack=0, prefill_reserved=0, finished_held=0, idle_held=0)
+            for batch in group.batches.values():
+                if batch.status in ("DONE", "ABORTED"):
+                    continue
+                if batch.plan.stage == "P":
+                    for ref in batch.plan.requests:
+                        view = batch.views.get(ref.request_id)
+                        if view is not None:
+                            row["prefill_reserved"] += view.capacity_tokens
+                elif batch.plan.steps > 1 and batch.status == "RUNNING":
+                    step = batch.run_applied
+                    for ref in batch.members(max(1, step)):
+                        view = batch.views.get(ref.request_id)
+                        if view is None:
+                            continue
+                        used = batch.run_start_valid.get(ref.request_id, 0) + step
+                        row["decode_used"] += used
+                        row["decode_slack"] += max(0, view.capacity_tokens - used)
+                        counted.add((group.model_id, ref.request_id))
+            for (model, _), request in self.requests.items():
+                if model != group.model_id or not request.allocation_id or (model, request.spec.request_id) in counted:
+                    continue
+                key = "finished_held" if request.state == "CLEANUP_PENDING" else "idle_held"
+                row[key] += request.valid_tokens
+            row["blocks_per_token"] = self._capacities[group.model_id]["blocks_per_token_group"]
+            usage[group.model_id] = row
+        ranks = self.store.rank_usage()
+        first = ranks[min(ranks)]
+        trace.ev("kv_usage", None, free_blocks=first["free_blocks"], total_blocks=first["total_blocks"], models=usage)
+
     def _release_credits(self, batch_id: str) -> None:
         """Caller holds the lock. Parked decode runs re-check on every release."""
         self.credits.release(batch_id)
@@ -1062,6 +1097,9 @@ class MuxController:
                     m: {"group_id": g.group_id, "ready": False, "fenced": g.fenced}
                     for m, g in self.groups.items()}}
             now = self.clock()
+            if trace.enabled() and now - getattr(self, "_kv_trace_at", 0.0) >= 1.0:
+                self._kv_trace_at = now
+                self._trace_kv_usage()
             for request in self.requests.values():
                 if request.state in ("FINISHED", "CANCELLED", "TIMED_OUT", "FAILED"):
                     continue
@@ -2090,6 +2128,10 @@ class MuxController:
                 self._finish_run_tokens(group, batch)
             else:
                 self._apply_tokens(group, batch)
+            for ref in batch.plan.requests:
+                request = self._request(group.model_id, ref.request_id)
+                if request.attempt == ref.attempt:
+                    self._release_finished_kv(request)
             # Same as P above: every D rank finished its forwards, so the
             # quiesce round trip uses no SMs. Releasing now lets a waiting
             # prefill (which needs all credits) start one round trip sooner.
@@ -2726,6 +2768,18 @@ class MuxController:
         if self.clock() >= request.deadline and request.pending_reason is None and not request.finish_reason:
             request.pending_reason = "timeout"
         request.state = "CLEANUP_PENDING"
+        self._release_finished_kv(request)
+
+    def _release_finished_kv(self, request: _Request) -> None:
+        """kv_release_at_finish: a request that finished generating gives its KV back now.
+        Its CLEANUP still releases native state on the ranks (logical IDs only)."""
+        if (not self.config.kv_release_at_finish or not request.allocation_id
+                or request.pending_reason is not None or request.finish_reason not in ("eos", "length")):
+            return
+        allocation_id = request.allocation_id
+        self.store.release_kv(allocation_id, self._d_holder(request))
+        request.allocation_id, request.valid_tokens, request.version = None, 0, 0
+        trace.ev("kv_free_early", None, m=request.spec.model_id, req=request.spec.request_id)
 
     def _grow_run(self, group: _Group, batch: _Batch, step: int):
         """Run step + 1 (decode_step_join). In order, so a refusal changes nothing the

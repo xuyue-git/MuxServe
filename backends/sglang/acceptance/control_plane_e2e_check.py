@@ -450,6 +450,7 @@ def main():
     parser.add_argument("--start-unparked", action="store_true", help="config prefill_start_unparked=true")
     parser.add_argument("--handoff-local", action="store_true", help="config handoff_local_success=true")
     parser.add_argument("--overlap", action="store_true", help="config prefill_overlap_decode=true")
+    parser.add_argument("--kv-early-free", action="store_true", help="config kv_release_at_finish=true")
     parser.add_argument("--stage-in-done", action="store_true", help="config prefill_stage_in_gpu_done=true")
     parser.add_argument("--driver-interval-ms", type=int, default=0, help="config driver_min_interval_ms")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
@@ -502,7 +503,8 @@ def main():
                               driver_min_interval_ms=args.driver_interval_ms,
                               prefill_start_unparked=args.start_unparked,
                               handoff_local_success=args.handoff_local,
-                              prefill_overlap_decode=args.overlap)
+                              prefill_overlap_decode=args.overlap,
+                              kv_release_at_finish=args.kv_early_free)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")

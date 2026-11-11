@@ -321,6 +321,11 @@ class DeploymentConfig:
     # ACKs ride in its HANDOFF_READY, which the owner accepts once that rank ACKed.
     # Requires decode_wait_commands.
     handoff_local_success: bool = False
+    # A request that finished (eos/length) returns its KV to the shared pool when it
+    # leaves its decode run or its run commits, as the original frees a finished
+    # request's cache at once, instead of after its CLEANUP round trip. Ranks hold only
+    # logical IDs for it; no rank writes those blocks again.
+    kv_release_at_finish: bool = False
     # Decode runs keep running while a prefill runs: the prefill STARTs without
     # taking decode credits, no run parks for it, and new decode batches are not held
     # back; MPS shares the GPUs between them. Prefills still run one at a time, and
@@ -442,7 +447,7 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline",
                  "decode_step_leave", "decode_wait_commands", "prefill_stage_in_gpu_done",
                  "prefill_start_unparked", "handoff_local_success", "prefill_break_slim",
-                 "prefill_overlap_decode"):
+                 "prefill_overlap_decode", "kv_release_at_finish"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_kv_per_page and not config.decode_step_join:

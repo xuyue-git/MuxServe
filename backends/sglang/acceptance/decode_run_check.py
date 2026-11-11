@@ -1480,6 +1480,66 @@ class OverlapChecks(unittest.TestCase):
         self.assertIn(plan.batch_id, sim.controller.credits.leases)
 
 
+class EarlyFreeChecks(unittest.TestCase):
+    """kv_release_at_finish: a finished request returns its KV before its CLEANUP completes."""
+
+    JOIN = dict(StepJoinChecks.JOIN, decode_leader_reports=True, decode_step_leave=True)
+    step = StepJoinChecks.step
+    batch = staticmethod(StepJoinChecks.batch)
+
+    def run_to_finish(self, **flags):
+        sim = Sim(run_steps=8, **self.JOIN, **flags)
+        sim.submit("a", "r", max_new=3)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        free_before = sim.store.rank_usage()[0]["free_blocks"]
+        for step, token in ((1, 12), (2, 13)):
+            for rank in range(sim.tp):
+                self.step(sim, plan.batch_id, rank, step, {"r": token}, finished=(step == 2))
+        StepJoinChecks.finish(self, sim, plan.batch_id, reservation, 2, {"r": 13})
+        request = sim.controller.requests[("a", "r")]
+        return sim, request, free_before
+
+    def test_finished_request_frees_its_kv_before_cleanup(self):
+        sim, request, _ = self.run_to_finish(kv_release_at_finish=True)
+        self.assertEqual((request.state, request.allocation_id), ("CLEANUP_PENDING", None))
+        self.assertEqual(sim.store.allocation_ids(), frozenset())  # every block is back in the pool
+        cleanup = next(iter(sim.controller.groups["a"].cleanups.values()))
+        for stage, rank in sorted(cleanup.participants):  # the cleanup still completes on every rank
+            sim.report("a", stage, rank, cleanup.cleanup_id, "QUIESCED", {
+                "cleanup_id": cleanup.cleanup_id, "request_id": "r", "attempt": request.attempt})
+        self.assertEqual(request.state, "FINISHED")
+        sim.store.assert_integrity()
+
+    def test_a_member_that_leaves_frees_its_kv_while_the_run_goes_on(self):
+        leave = StepLeaveChecks()
+        sim, plan, reservation = leave.joined_pair(kv_release_at_finish=True)
+        for rank in range(sim.tp):
+            leave.step(sim, plan.batch_id, rank, 2, {"r": 13, "q": 22})
+        q = sim.controller.requests[("a", "q")]
+        held = set(sim.store.allocation_ids())
+        for rank in range(sim.tp):
+            self.assertEqual(leave.step(sim, plan.batch_id, rank, 3, {"r": 14, "q": 23})["leave"], ("q",))
+        self.assertEqual((q.state, q.allocation_id), ("CLEANUP_PENDING", None))
+        self.assertEqual(len(sim.store.allocation_ids()), len(held) - 1)  # q's blocks are back
+        sim.store.assert_integrity()
+        sim.cleanup("a", "q")
+        self.assertEqual((q.state, q.output), ("FINISHED", [21, 22, 23]))
+        token = 15
+        for step in range(4, 9):
+            for rank in range(sim.tp):
+                self.assertIs(leave.step(sim, plan.batch_id, rank, step, {"r": token})["continue"], step < 8)
+            token += 1
+        leave.finish(sim, plan.batch_id, reservation, 8, {"r": token - 1})
+        sim.store.assert_integrity()
+
+    def test_without_the_switch_kv_waits_for_cleanup(self):
+        sim, request, _ = self.run_to_finish()
+        self.assertEqual(request.state, "CLEANUP_PENDING")
+        self.assertIsNotNone(request.allocation_id)
+        self.assertEqual(len(sim.store.allocation_ids()), 1)
+
+
 class LongPollChecks(unittest.TestCase):
     def setUp(self):
         self.sim = Sim()
