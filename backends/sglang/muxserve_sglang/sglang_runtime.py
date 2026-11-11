@@ -716,7 +716,9 @@ class ControlledScheduler:
         if join:
             state.run_views = [self._own_view(item["reservation_view"]) for item in state.command["requests"]]
             state.command["requests"] = list(state.command["requests"])
+        prep_ms = 0.0  # trace only: the step boundary's local batch preparation
         while True:
+            forward_started = time.perf_counter()
             previous_output_counts = [len(req.output_ids) for req in state.reqs]
             self.s.cur_batch_for_debug = state.batch
             profiler = getattr(self, "step_profiler", None)
@@ -733,11 +735,16 @@ class ControlledScheduler:
             self.sync()
             if profiler is not None:
                 profiler.after()
-            trace.ev("step_fwd", command["batch_id"], step=step)
             permit = self.runner._muxserve_permit
             require(permit["consumed"] and permit.get("gpu_timing_finished"),
                     "Granted native forward was not consumed or timed")
-            gpu_forward_ms += permit["gpu_start_event"].elapsed_time(permit["gpu_end_event"])
+            step_gpu_ms = permit["gpu_start_event"].elapsed_time(permit["gpu_end_event"])
+            gpu_forward_ms += step_gpu_ms
+            # Trace only: batch size, forward wall (run_batch .. sync), its CUDA-event
+            # forward time, and the local preparation that preceded this step.
+            trace.ev("step_fwd", command["batch_id"], step=step, bs=len(state.reqs),
+                     fwd_ms=round((time.perf_counter() - forward_started) * 1000, 3),
+                     gpu_ms=round(step_gpu_ms, 3), prep_ms=round(prep_ms, 3))
             results = [{"request_id": item["request_id"], "attempt": item["attempt"],
                         "token_id": req.output_ids[-1], "valid_tokens": valid + step}
                        for req, item, valid in zip(state.reqs, state.command["requests"], start_valid)]
@@ -775,10 +782,12 @@ class ControlledScheduler:
                 reply = self.rpc("decode_resume", self.rank, self.pid, command["batch_id"], step, 100)
             if finished or step >= steps or reply.get("continue") is not True:
                 break
+            prepared_at = time.perf_counter()
             if join:
                 self._apply_growth(state, start_valid, reply, step)
             step += 1
             self._advance_run(state, start_valid, step, command["grant_id"])
+            prep_ms = (time.perf_counter() - prepared_at) * 1000
         self.s.cur_batch_for_debug = None
         payload = {"reservation_id": state.command["reservation_id"], "results": results,
                    "gpu_forward_ms": gpu_forward_ms, "duration_ms": (time.monotonic() - start) * 1000,
