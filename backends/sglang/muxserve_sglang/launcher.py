@@ -61,12 +61,12 @@ def _graph_fields(config, stage):
     """D-stage decode CUDA graphs (SGLang-native full graphs, bs 1..inflight);
     P-stage breakable prefill graphs (attention eager at graph breaks)."""
     if stage == "P" and getattr(config, "prefill_cuda_graph", False):
+        sizes = list(getattr(config, "prefill_graph_tokens", ()) or ()) or (
+            list(PREFILL_GRAPH_TOKENS) + ([2 * tokens for tokens in PREFILL_GRAPH_TOKENS]
+                                          if getattr(config, "prefill_pair_hold_ms", 0) else []))
         return dict(disable_cuda_graph=False, disable_prefill_cuda_graph=False,
                     disable_decode_cuda_graph=True, cuda_graph_backend_prefill="breakable",
-                    cuda_graph_backend_decode="disabled",
-                    cuda_graph_bs_prefill=list(PREFILL_GRAPH_TOKENS) + (
-                        [2 * tokens for tokens in PREFILL_GRAPH_TOKENS]
-                        if getattr(config, "prefill_pair_hold_ms", 0) else []))
+                    cuda_graph_backend_decode="disabled", cuda_graph_bs_prefill=sizes)
     if stage != "D" or not getattr(config, "decode_cuda_graph", False):
         return {}
     return dict(disable_cuda_graph=False, disable_prefill_cuda_graph=True,

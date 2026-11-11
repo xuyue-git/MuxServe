@@ -54,6 +54,17 @@ class DecodeGraphConfigChecks(unittest.TestCase):
             with self.assertRaises(IntegrationError):
                 self.config(**bad)
 
+    def test_prefill_graph_tokens_need_the_graph_and_increase(self):
+        self.assertEqual(tuple(self.config().prefill_graph_tokens), ())
+        good = self.config(prefill_cuda_graph=True, prefill_graph_tokens=[64, 128, 512, 2048])
+        self.assertEqual(list(good.prefill_graph_tokens), [64, 128, 512, 2048])
+        for bad in (dict(prefill_graph_tokens=[64]), dict(prefill_cuda_graph=True, prefill_graph_tokens=[128, 64]),
+                    dict(prefill_cuda_graph=True, prefill_graph_tokens=[8]),
+                    dict(prefill_cuda_graph=True, prefill_graph_tokens=[64, 64]),
+                    dict(prefill_cuda_graph=True, prefill_graph_tokens="512")):
+            with self.assertRaises(IntegrationError):
+                self.config(**bad)
+
     def test_step_join_flags_default_off_and_per_page_needs_join(self):
         config = self.config()
         self.assertFalse(config.decode_step_join or config.decode_kv_per_page)
@@ -116,6 +127,10 @@ class PrefillGraphChecks(unittest.TestCase):
         cfg.prefill_pair_hold_ms = 5
         self.assertEqual(ns['_native_fields'](cfg, model, 'P')['cuda_graph_bs_prefill'], [512, 1024])
         cfg.prefill_pair_hold_ms = 0
+        cfg.prefill_graph_tokens = (64, 128, 256, 512, 1024, 2048)
+        self.assertEqual(ns['_native_fields'](cfg, model, 'P')['cuda_graph_bs_prefill'],
+                         [64, 128, 256, 512, 1024, 2048])
+        cfg.prefill_graph_tokens = ()
         self.assertTrue(p['disable_decode_cuda_graph'])
         self.assertEqual(p['cuda_graph_backend_decode'], 'disabled')
         self.assertEqual((d['cuda_graph_backend_decode'], d['cuda_graph_backend_prefill']), ('full', 'disabled'))

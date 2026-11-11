@@ -134,6 +134,11 @@ class DeploymentConfig:
     # in segments, Head-wise attention eager at the breaks) for prompts of
     # exactly PREFILL_GRAPH_TOKENS; other lengths stay eager.
     prefill_cuda_graph: bool = False
+    # prefill_cuda_graph: the token counts captured instead of PREFILL_GRAPH_TOKENS
+    # (strictly increasing, 16..8192, at most 12). A prefill pads up to the nearest
+    # one, within SGLang's 2x padding limit; Head-wise attention still sees only the
+    # real tokens. Empty keeps PREFILL_GRAPH_TOKENS.
+    prefill_graph_tokens: tuple = ()
     # Original MuxServe sizing: KV = gpu_memory_utilization x total GPU memory
     # (see kv_bytes_from_fraction). When set, the launcher resolves it into
     # kv_bytes_per_rank before writing the runtime config; mutually exclusive
@@ -354,6 +359,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         if type(fraction) not in (int, float) or not 0 < fraction < 1:
             raise IntegrationError("INVALID_CONFIG", "kv_memory_fraction must be in (0, 1)")
     models = tuple(ModelDeployment(**item) for item in raw.pop("models"))
+    if isinstance(raw.get("prefill_graph_tokens"), list):
+        raw["prefill_graph_tokens"] = tuple(raw["prefill_graph_tokens"])  # JSON list; the config stays hashable
     config = DeploymentConfig(models=models, **raw)
     if not isinstance(config.asset_lock_dir, str):
         raise IntegrationError("INVALID_CONFIG", "asset_lock_dir must be a string")
@@ -379,6 +386,12 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "decode_run_park must be a boolean")
     if type(config.prefill_cuda_graph) is not bool:
         raise IntegrationError("INVALID_CONFIG", "prefill_cuda_graph must be a boolean")
+    tokens = config.prefill_graph_tokens
+    if (not isinstance(tokens, (tuple, list)) or len(tokens) > 12
+            or any(type(t) is not int or not 16 <= t <= 8192 for t in tokens)
+            or list(tokens) != sorted(set(tokens)) or (tokens and not config.prefill_cuda_graph)):
+        raise IntegrationError("INVALID_CONFIG", "prefill_graph_tokens must be increasing integers 16..8192 "
+                                                 "(at most 12) and needs prefill_cuda_graph")
     for name in ("inline_start", "decode_skip_prefill_ranks", "prefill_early_token",
                  "cleanup_skip_prefill_ranks", "cleanup_with_quiesce", "handoff_prepare_decode",
                  "handoff_inline_metadata", "final_step_in_gpu_done", "event_pump_thread",
