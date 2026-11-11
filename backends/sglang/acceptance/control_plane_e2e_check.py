@@ -451,6 +451,10 @@ def main():
     parser.add_argument("--handoff-local", action="store_true", help="config handoff_local_success=true")
     parser.add_argument("--overlap", action="store_true", help="config prefill_overlap_decode=true")
     parser.add_argument("--kv-early-free", action="store_true", help="config kv_release_at_finish=true")
+    parser.add_argument("--gateway-proc", action="store_true", help="config gateway_process=true")
+    parser.add_argument("--lean-events", action="store_true", help="config event_lean_copies=true")
+    parser.add_argument("--driver-lean", action="store_true", help="config driver_lean_locking=true")
+    parser.add_argument("--switch-us", type=int, default=0, help="config owner_switch_interval_us")
     parser.add_argument("--stage-in-done", action="store_true", help="config prefill_stage_in_gpu_done=true")
     parser.add_argument("--driver-interval-ms", type=int, default=0, help="config driver_min_interval_ms")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
@@ -504,7 +508,12 @@ def main():
                               prefill_start_unparked=args.start_unparked,
                               handoff_local_success=args.handoff_local,
                               prefill_overlap_decode=args.overlap,
-                              kv_release_at_finish=args.kv_early_free)
+                              kv_release_at_finish=args.kv_early_free,
+                              gateway_process=args.gateway_proc, event_lean_copies=args.lean_events,
+                              driver_lean_locking=args.driver_lean,
+                              owner_switch_interval_us=args.switch_us)
+    if args.switch_us:
+        sys.setswitchinterval(args.switch_us / 1e6)  # as the launcher does in the owner
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -567,9 +576,18 @@ def main():
         if time.monotonic() > deadline:
             raise SystemExit("ranks did not register")
         time.sleep(0.05)
-    state = GatewayState(controller, {m: Tokenizer() for m in MODELS})
+    connections = max(32, 6 * args.inflight, 6 * args.clients)
+    if args.gateway_proc:
+        from muxserve_sglang.gateway_proc import BridgedGatewayState, GatewayBridge
+        state = BridgedGatewayState(controller, {m: Tokenizer() for m in MODELS})
+    else:
+        state = GatewayState(controller, {m: Tokenizer() for m in MODELS})
     driver = ControllerDriver(controller, state.apply_event, state.maintain)
-    gateway = GatewayServer(state, port, maximum_connections=max(32, 6 * args.inflight, 6 * args.clients))
+    if args.gateway_proc:
+        gateway = GatewayBridge(state, context, port, connections, {m: Tokenizer() for m in MODELS},
+                                {"queue_limit": config.queue_limit, "fingerprint": config.fingerprint})
+    else:
+        gateway = GatewayServer(state, port, maximum_connections=connections)
     driver.start()
     http_thread = threading.Thread(target=gateway.serve_forever, daemon=True)
     http_thread.start()

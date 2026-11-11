@@ -22,7 +22,9 @@ class ControllerDriver:
         self.grant_lock = RLock()
         self.failure = None
         self.pending = set()
-        self.receivers = {model.model_id: EventReceiver(controller.group_id(model.model_id), apply_event)
+        lean = getattr(self.config, "event_lean_copies", False)
+        self.receivers = {model.model_id: EventReceiver(controller.group_id(model.model_id), apply_event,
+                                                        lean=lean)
                           for model in self.config.models}
         groups = controller.snapshot()["groups"]
         for model_id, receiver in self.receivers.items():
@@ -121,10 +123,13 @@ class ControllerDriver:
         if not self._pumping:
             self._pump_events()
         self.maintain()
-        progress = self.controller.batch_progress()
+        lean = getattr(self.config, "driver_lean_locking", False)
+        # driver_lean_locking: only the batches this driver waits on, and no lock at all
+        # when it waits on none.
+        progress = (self.controller.batch_progress(tuple(self.pending)) if self.pending else {}) if lean             else self.controller.batch_progress()
         everyone = {(stage, rank) for stage in ("P", "D") for rank in range(self.config.tp_size)}
         for model_id, batch_id in tuple(self.pending):
-            batch = progress[model_id].get(batch_id)
+            batch = progress.get(model_id, {}).get(batch_id)
             if batch is None or batch["status"] in ("DONE", "ABORTED"):
                 self.pending.discard((model_id, batch_id))
             elif batch["status"] == "PREPARING" and set(map(tuple, batch["ready"])) == (
@@ -152,17 +157,24 @@ class ControllerDriver:
         if proposal.stage != "D" or proposal.purpose != "GENERATE" or limit <= 1:
             return 1
         maximum = self.config.max_new_tokens
-        remaining = []
-        with self.controller.lock:
-            for output in outputs:
-                request = self.controller.requests.get((proposal.model_id, output["request_id"]))
-                budget = request.spec.max_new_tokens if request is not None else maximum
-                remaining.append(budget - output["output_count"])
-            # A run reserves (steps + 1) * requests + 2 event slots at prepare; one slot of
-            # the window always stays reserved for a group error. A run that could never
-            # fit would fail with EVENT_BACKPRESSURE on every retry.
+        if outputs and "remaining" in outputs[0]:
+            # driver_lean_locking: request_briefs already read the budgets; the event
+            # window is fixed at construction.
+            remaining = [output["remaining"] for output in outputs]
             group = self.controller.groups.get(proposal.model_id)
             window = group.outbox.maximum_pending if group is not None else None
+        else:
+            remaining = []
+            with self.controller.lock:
+                for output in outputs:
+                    request = self.controller.requests.get((proposal.model_id, output["request_id"]))
+                    budget = request.spec.max_new_tokens if request is not None else maximum
+                    remaining.append(budget - output["output_count"])
+                # A run reserves (steps + 1) * requests + 2 event slots at prepare; one slot
+                # of the window always stays reserved for a group error. A run that could
+                # never fit would fail with EVENT_BACKPRESSURE on every retry.
+                group = self.controller.groups.get(proposal.model_id)
+                window = group.outbox.maximum_pending if group is not None else None
         if getattr(self.config, "decode_step_leave", False) and remaining:
             # Members that reach their budget earlier leave the run; the longest decides.
             remaining = [max(remaining)]
@@ -176,8 +188,11 @@ class ControllerDriver:
         steps = None
         while request_ids:
             try:
-                outputs = [self.controller.request_output(proposal.model_id, identity)
-                           for identity in request_ids]
+                if getattr(self.config, "driver_lean_locking", False):
+                    outputs = self.controller.request_briefs(proposal.model_id, request_ids)
+                else:
+                    outputs = [self.controller.request_output(proposal.model_id, identity)
+                               for identity in request_ids]
                 if steps is None:
                     steps = self._run_steps(proposal, outputs)
                 plan = BatchPlan(

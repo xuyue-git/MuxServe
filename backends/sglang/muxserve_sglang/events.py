@@ -11,7 +11,7 @@ from .contracts import IntegrationError, RuntimeEvent
 
 
 class RuntimeOutbox:
-    def __init__(self, group_id: str, model_id: str, maximum_pending: int = 1024):
+    def __init__(self, group_id: str, model_id: str, maximum_pending: int = 1024, lean: bool = False):
         if type(maximum_pending) is not int or not 8 <= maximum_pending <= 1024:
             raise IntegrationError("INVALID_ARGUMENT", "Event window must be 8..1024")
         self.group_id = group_id
@@ -24,6 +24,9 @@ class RuntimeOutbox:
         self.reserved: dict[str, int] = {}
         # Called after every emitted event (e.g. to wake an event pump).
         self.on_emit: Callable[[], None] | None = None
+        # event_lean_copies: an emitted event is never changed (frozen, and no reader
+        # mutates its payload), so emit/replay share it instead of deep-copying it.
+        self.lean = lean
 
     def reserve(self, owner: str, count: int) -> None:
         with self.lock:
@@ -63,7 +66,7 @@ class RuntimeOutbox:
 
     def emit(self, kind: str, *, request_id=None, attempt=None, batch_id=None,
              payload=None, owner: str | None = None) -> RuntimeEvent:
-        payload = deepcopy(dict(payload or {}))
+        payload = dict(payload or {}) if self.lean else deepcopy(dict(payload or {}))
         if len(payload.get("token_ids", ())) > 256:
             raise IntegrationError("EVENT_TOO_LARGE", "Token payload exceeds 256 tokens")
         with self.lock:
@@ -79,7 +82,7 @@ class RuntimeOutbox:
                 self.reserved[owner] -= 1
             if self.on_emit is not None:
                 self.on_emit()
-            return deepcopy(event)
+            return event if self.lean else deepcopy(event)
 
     def ack(self, sequence: int) -> None:
         with self.lock:
@@ -94,13 +97,17 @@ class RuntimeOutbox:
         with self.lock:
             if type(after) is not int or after < self.acked_seq or after >= self.next_seq:
                 raise IntegrationError("EVENT_GAP", "Requested events precede acknowledged history")
-            return deepcopy(tuple(event for number, event in self.pending.items() if number > after))
+            events = tuple(event for number, event in self.pending.items() if number > after)
+            return events if self.lean else deepcopy(events)
 
 
 class EventReceiver:
-    def __init__(self, group_id: str, apply: Callable[[RuntimeEvent], None]):
+    def __init__(self, group_id: str, apply: Callable[[RuntimeEvent], None], lean: bool = False):
         self.group_id = group_id
         self.apply = apply
+        # lean: events are immutable, so the event itself is its fingerprint (dataclass
+        # equality compares every field) and buffering needs no copy.
+        self.lean = lean
         self.last_seq = 0
         self.gaps: dict[int, RuntimeEvent] = {}
         self.last_fingerprints: OrderedDict[int, dict] = OrderedDict()
@@ -110,7 +117,7 @@ class EventReceiver:
                 or type(event.event_seq) is not int or event.event_seq < 1
                 or len(event.payload.get("token_ids", ())) > 256):
             raise IntegrationError("STALE_GROUP", "Runtime event identity rejected")
-        fingerprint = asdict(event)
+        fingerprint = event if self.lean else asdict(event)
         if event.event_seq <= self.last_seq:
             prior = self.last_fingerprints.get(event.event_seq)
             if prior is None:
@@ -123,13 +130,13 @@ class EventReceiver:
             raise IntegrationError("EVENT_CONFLICT", "Buffered sequence changed contents")
         if event.event_seq - self.last_seq > 1024 or (prior is None and len(self.gaps) >= 1024):
             raise IntegrationError("EVENT_BACKPRESSURE", "Event gap exceeds replay window")
-        self.gaps[event.event_seq] = deepcopy(event)
+        self.gaps[event.event_seq] = event if self.lean else deepcopy(event)
         while self.last_seq + 1 in self.gaps:
             current = self.gaps[self.last_seq + 1]
             self.apply(current)
             del self.gaps[current.event_seq]
             self.last_seq = current.event_seq
-            self.last_fingerprints[current.event_seq] = asdict(current)
+            self.last_fingerprints[current.event_seq] = current if self.lean else asdict(current)
             if len(self.last_fingerprints) > 1024:
                 self.last_fingerprints.popitem(last=False)
         return self.last_seq

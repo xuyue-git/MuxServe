@@ -285,7 +285,8 @@ class MuxController:
             store.register_model(layout)
             group_id = uuid4().hex
             group = _Group(model.model_id, group_id, layout.ranks,
-                           RuntimeOutbox(group_id, model.model_id, event_window),
+                           RuntimeOutbox(group_id, model.model_id, event_window,
+                                         lean=config.event_lean_copies),
                            retired=_RetiredIds(config.batch_history_limit))
             group.outbox.reserve("group_error", 1)
             group.outbox.on_emit = self.events_wake.set
@@ -857,6 +858,19 @@ class MuxController:
         with self.lock:
             return deepcopy(self._output(self._request(model_id, request_id)))
 
+    def request_briefs(self, model_id: str, request_ids) -> list:
+        """driver_lean_locking: what the driver needs to plan a batch, for every request
+        in one lock and without copying token histories: request_id, attempt,
+        output_count, and remaining (output budget left)."""
+        with self.lock:
+            briefs = []
+            for request_id in request_ids:
+                request = self._request(model_id, request_id)
+                briefs.append({"request_id": request.spec.request_id, "attempt": request.attempt,
+                               "output_count": len(request.output),
+                               "remaining": request.spec.max_new_tokens - len(request.output)})
+            return briefs
+
     def poll_events(self, group_id: str, after_seq: int = 0) -> tuple:
         with self.lock:
             return self._group(group_id).outbox.replay(after_seq)
@@ -1100,13 +1114,22 @@ class MuxController:
             if trace.enabled() and now - getattr(self, "_kv_trace_at", 0.0) >= 1.0:
                 self._kv_trace_at = now
                 self._trace_kv_usage()
-            for request in self.requests.values():
+            # driver_lean_locking: deadlines and watchdogs are seconds long; scan them at
+            # most every 50 ms. Feedback of finished batches is not delayed.
+            scan = not self.config.driver_lean_locking or now - getattr(self, "_scan_at", -1.0) >= 0.05
+            if scan:
+                self._scan_at = now
+            for request in (self.requests.values() if scan else ()):
                 if request.state in ("FINISHED", "CANCELLED", "TIMED_OUT", "FAILED"):
                     continue
                 if now >= request.deadline and request.pending_reason is None:
                     self._stop_request(request, "timeout")
             for group in self.groups.values():
                 for batch in tuple(group.batches.values()):
+                    if not scan:
+                        if batch.status == "DONE" and not batch.feedback_sent:
+                            self._maybe_feedback(group, batch)
+                        continue
                     if batch.status == "PREPARING" and now - batch.prepared_at >= batch.plan.prepare_timeout_ms / 1000:
                         self._abort_prepared(group, batch, "prepare_timeout")
                     if batch.status == "DONE" and not batch.feedback_sent:
@@ -1126,7 +1149,7 @@ class MuxController:
                     elif (not group.fenced and batch.status in ("QUIESCE", "REVOKING")
                             and batch.quiesce_deadline is not None and now >= batch.quiesce_deadline):
                         self._fence(group, batch, "quiescence_watchdog")
-                for cleanup in tuple(group.cleanups.values()):
+                for cleanup in (tuple(group.cleanups.values()) if scan else ()):
                     if not group.fenced and now >= cleanup.deadline:
                         self._fence(group, None, "cleanup_watchdog")
                 if (group.fenced and not group.uncertain_batches and
@@ -3550,9 +3573,17 @@ class MuxController:
             group.retired.add("batch", batch_id)
             del group.batches[batch_id]
 
-    def batch_progress(self) -> dict:
-        """Detached READY/lifecycle state for the event pump, without diagnostics."""
+    def batch_progress(self, only=None) -> dict:
+        """Detached READY/lifecycle state for the event pump, without diagnostics.
+        only: (model_id, batch_id) pairs; just those batches (driver_lean_locking)."""
         with self.lock:
+            if only is not None:
+                progress = {model_id: {} for model_id in self.groups}
+                for model_id, batch_id in only:
+                    batch = self.groups[model_id].batches.get(batch_id)
+                    if batch is not None:
+                        progress[model_id][batch_id] = self._batch_view(batch)
+                return progress
             return {model_id: {bid: self._batch_view(batch) for bid, batch in group.batches.items()}
                     for model_id, group in self.groups.items()}
 

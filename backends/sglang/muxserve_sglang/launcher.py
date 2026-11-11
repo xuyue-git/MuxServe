@@ -329,6 +329,14 @@ class Supervisor:
             model_ids=tuple(model.model_id for model in self.config.models))
         rates = dict(getattr(self.config, "policy_arrival_rates", ()) or ()) or None
         self.controller = MuxController(self.config, store, initializing=True, arrival_rates=rates)
+        if self.config.owner_switch_interval_us:
+            # Owner threads hand the owner lock to each other; a waiter woken by a release
+            # otherwise waits up to 5 ms for the releasing thread to give up the interpreter.
+            sys.setswitchinterval(self.config.owner_switch_interval_us / 1e6)
+        print("OWNER_SPEED " + json.dumps({
+            "switch_interval_s": sys.getswitchinterval(), "gateway_process": self.config.gateway_process,
+            "event_lean_copies": self.config.event_lean_copies,
+            "driver_lean_locking": self.config.driver_lean_locking}), flush=True)
         print("POLICY_LIMITS " + json.dumps({"rates": rates, "limits": dict(self.controller.policy.limits)}),
               flush=True)
         self.gpu = GPUStorage(store, {rank: rank for rank in range(self.config.tp_size)})
@@ -421,14 +429,26 @@ class Supervisor:
         self.startup_gate_complete = True
         if self.manual_control:
             return
-        self.gateway_state = GatewayState(self.controller, tokenizers)
+        if self.config.gateway_process:
+            from .gateway_proc import BridgedGatewayState
+            self.gateway_state = BridgedGatewayState(self.controller, tokenizers)
+        else:
+            self.gateway_state = GatewayState(self.controller, tokenizers)
         self.driver = ControllerDriver(self.controller, self.gateway_state.apply_event,
                                        self.gateway_state.maintain)
         # Initialization already ACKed this service epoch's event history.
         for model_id, receiver in self.driver.receivers.items():
             receiver.last_seq = initialization_driver.receivers[model_id].last_seq
-        self.gateway = GatewayServer(self.gateway_state, self.config.controller_port,
-                                     maximum_connections=self.config.gateway_connections)
+        if self.config.gateway_process:
+            from .gateway_proc import GatewayBridge
+            self.gateway = GatewayBridge(
+                self.gateway_state, self.context, self.config.controller_port,
+                self.config.gateway_connections,
+                {model.model_id: model.tokenizer_path for model in self.config.models},
+                {"queue_limit": self.config.queue_limit, "fingerprint": self.config.fingerprint})
+        else:
+            self.gateway = GatewayServer(self.gateway_state, self.config.controller_port,
+                                         maximum_connections=self.config.gateway_connections)
         self.driver.start()
         self.http_thread = Thread(target=self.gateway.serve_forever, name="http-gateway", daemon=False)
         self.http_thread.start()

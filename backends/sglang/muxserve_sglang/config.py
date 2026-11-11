@@ -326,6 +326,24 @@ class DeploymentConfig:
     # request's cache at once, instead of after its CLEANUP round trip. Ranks hold only
     # logical IDs for it; no rank writes those blocks again.
     kv_release_at_finish: bool = False
+    # Owner speed. gateway_process: the HTTP gateway (sockets, SSE framing,
+    # tokenization and detokenization) runs in its own child process; the owner keeps
+    # the request records and confirmed events and streams each record's new tokens
+    # to it over one pipe, so HTTP threads no longer take the owner's interpreter lock.
+    gateway_process: bool = False
+    # event_lean_copies: runtime events are immutable once emitted; the outbox, the
+    # event pump and the receiver pass them on without deep copies or asdict
+    # fingerprints (one TOKEN event per request per step is copied 5 times otherwise).
+    event_lean_copies: bool = False
+    # driver_lean_locking: each driver pass takes the owner lock fewer times and for
+    # less work: batch progress only for the batches it waits on, one lock for a
+    # proposal's request facts (no deep copies), and deadline/watchdog scans at most
+    # every 50 ms instead of every tick.
+    driver_lean_locking: bool = False
+    # Owner process interpreter switch interval in microseconds (sys.setswitchinterval);
+    # 0 keeps Python's 5000. A thread that releases the owner lock otherwise keeps the
+    # interpreter for up to 5 ms before the waiter it woke can run.
+    owner_switch_interval_us: int = 0
     # Decode runs keep running while a prefill runs: the prefill STARTs without
     # taking decode credits, no run parks for it, and new decode batches are not held
     # back; MPS shares the GPUs between them. Prefills still run one at a time, and
@@ -447,7 +465,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline",
                  "decode_step_leave", "decode_wait_commands", "prefill_stage_in_gpu_done",
                  "prefill_start_unparked", "handoff_local_success", "prefill_break_slim",
-                 "prefill_overlap_decode", "kv_release_at_finish"):
+                 "prefill_overlap_decode", "kv_release_at_finish", "gateway_process",
+                 "event_lean_copies", "driver_lean_locking"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_kv_per_page and not config.decode_step_join:
@@ -470,6 +489,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "prefill_start_unparked requires decode_run_park")
     if config.handoff_local_success and not config.decode_wait_commands:
         raise IntegrationError("INVALID_CONFIG", "handoff_local_success requires decode_wait_commands")
+    if type(config.owner_switch_interval_us) is not int or not 0 <= config.owner_switch_interval_us <= 5000:
+        raise IntegrationError("INVALID_CONFIG", "owner_switch_interval_us must be an integer 0..5000")
     if type(config.driver_min_interval_ms) is not int or not 0 <= config.driver_min_interval_ms <= 50:
         raise IntegrationError("INVALID_CONFIG", "driver_min_interval_ms must be an integer 0..50")
     if type(config.decode_kv_grow_pages) is not int or not 1 <= config.decode_kv_grow_pages <= 8:
