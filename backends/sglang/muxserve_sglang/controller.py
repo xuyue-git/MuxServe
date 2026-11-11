@@ -161,6 +161,9 @@ class _Batch:
     run_join_step: dict[str, int] = field(default_factory=dict)
     run_sync: dict[int, set] = field(default_factory=dict)
     sync_since: dict[int, float] = field(default_factory=dict)
+    # decode_step_pipeline: step boundaries the owner already granted as a plain
+    # continue; the leader reports those steps after running on.
+    run_go: set = field(default_factory=set)
 
     def members(self, step: int) -> tuple:
         """The requests that take part in decode run step ``step``."""
@@ -2083,15 +2086,24 @@ class MuxController:
                 request.state = "FINISH_PENDING" if request.finish_reason else "DECODING"
 
     def decode_step(self, group_id: str, rank: int, pid: int, batch_id: str, step: int,
-                    results: list, finished: bool) -> dict:
+                    results: list, finished: bool, pregranted: bool = False) -> dict:
         """One D rank finished forward ``step`` of a multi-step grant.
 
         Every rank reports every step. Results must agree across ranks; a step
         is published once all ranks reported it. The continue decision is made
         once per step and replayed to every rank, so TP ranks never diverge on
         whether another forward follows.
+
+        decode_step_pipeline: the leader's reply also carries ``ahead``, whether the
+        next step boundary is already granted as a plain continue. A ``pregranted``
+        report is the leader's report of such a step, sent after it ran on: it is
+        recorded (and its tokens published) exactly as before, with the decision
+        fixed to continue.
         """
-        trace.ev("dstep", batch_id, gid=group_id, r=rank, step=step)
+        if type(pregranted) is not bool or (pregranted and (
+                not self.config.decode_step_pipeline or rank != _LEADER_RANK)):
+            raise IntegrationError("INVALID_ARGUMENT", "Only the decode leader reports a pre-granted step")
+        trace.ev("dstep", batch_id, gid=group_id, r=rank, step=step, **({"pre": True} if pregranted else {}))
         entered = time.perf_counter()
         with self.lock:
             locked = time.perf_counter()
@@ -2100,16 +2112,18 @@ class MuxController:
             if target is None or target.pid != pid or not target.alive:
                 raise IntegrationError("UNKNOWN_RANK", "Registered D rank/PID required")
             batch = self._batch(group, batch_id)
-            decision = self._record_step(group, batch, rank, step, results, finished)
+            decision = self._record_step(group, batch, rank, step, results, finished, pregranted)
             reply = (self._decision_reply(batch, step, rank, decision) if self.config.decode_step_join
                      else {"continue": decision})
+            if self.config.decode_step_pipeline and rank == _LEADER_RANK:
+                reply["ahead"] = self._lookahead(group, batch, step, decision)
             if trace.enabled():
                 trace.ev("dstep_end", batch_id, r=rank, step=step, lock_ms=round((locked - entered) * 1000, 3),
                          work_ms=round((time.perf_counter() - locked) * 1000, 3))
             return reply
 
     def _record_step(self, group: _Group, batch: _Batch, rank: int, step: int,
-                     results, finished: bool) -> bool | str:
+                     results, finished: bool, pregranted: bool = False) -> bool | str:
         """Caller holds the lock and verified the D rank. Returns the step's
         (once decided, replayed) continue decision."""
         batch_id = batch.plan.batch_id
@@ -2134,8 +2148,14 @@ class MuxController:
         leader_only = self.config.decode_leader_reports
         previous_reported = (rank in batch.run_reports.get(step - 1, {})
                              or (leader_only and rank != _LEADER_RANK))
-        if step > 1 and (not previous_reported or not self._granted(batch.run_decisions.get(step - 1))):
+        # decode_step_pipeline: a follower runs on when the leader runs on, which can be
+        # before the leader's own report of that granted-ahead step has arrived.
+        granted = (self._granted(batch.run_decisions.get(step - 1))
+                   or (rank != _LEADER_RANK and step - 1 in batch.run_go))
+        if step > 1 and (not previous_reported or not granted):
             raise IntegrationError("REPORT_GAP", "Decode step was not granted")
+        if pregranted and (step not in batch.run_go or finished or step >= batch.plan.steps):
+            raise IntegrationError("REPORT_GAP", "Decode step boundary was not granted ahead")
         for ref, result in zip(members, entry[0]):
             if (not isinstance(result, dict)
                     or set(result) != {"request_id", "attempt", "token_id", "valid_tokens"}
@@ -2156,6 +2176,8 @@ class MuxController:
             self._apply_run_step(group, batch, step, entry[0])
             applied = True
         decision = batch.run_decisions.get(step)
+        if decision is None and pregranted:
+            decision = batch.run_decisions[step] = True  # the leader already ran on
         if decision is None:
             decision = self._run_continues(group, batch, step, finished)
             if decision is True and self.config.decode_step_join:
@@ -2399,6 +2421,44 @@ class MuxController:
                 return reply
             self._park_cv.wait(remaining)
 
+    def _lookahead(self, group: _Group, batch: _Batch, step: int, decision) -> bool:
+        """decode_step_pipeline, caller holds the lock: grant step boundary ``step + 1``
+        as a plain continue now, if step ``step`` continues and nothing would make that
+        boundary anything else. A grant is final; what changes later waits one step."""
+        following = step + 1
+        if following in batch.run_go:
+            return True
+        if not self._granted(decision) or not self._plain_continue(group, batch, following):
+            return False
+        batch.run_go.add(following)
+        return True
+
+    def _plain_continue(self, group: _Group, batch: _Batch, step: int) -> bool:
+        """Would step boundary ``step`` be a plain continue as of now? No side effects."""
+        if batch.status != "RUNNING" or batch.parked_at is not None or step >= batch.plan.steps:
+            return False
+        if self._run_continues(group, batch, step, False) is not True:
+            return False
+        if not self.config.decode_step_join:
+            return True
+        if self._d_work_pending(group) or self._join_candidates(group, batch):
+            return False
+        return not (self.config.decode_kv_per_page and any(
+            batch.run_start_valid[ref.request_id] + step + 1 > batch.views[ref.request_id].capacity_tokens
+            for ref in batch.members(step + 1)))
+
+    def _join_candidates(self, group: _Group, batch: _Batch) -> list:
+        """This model's requests that may join the run now, oldest first, up to the limit."""
+        model = group.model_id
+        room = min(self.config.max_model_inflight, self.policy.limits[model]) - len(batch.plan.requests)
+        if room <= 0 or self._decode_only_for(model) is not None:
+            return []
+        now = self.clock()
+        members = {ref.request_id for ref in batch.plan.requests}
+        return sorted((r for r in self.requests.values()
+                       if r.spec.model_id == model and r.spec.request_id not in members
+                       and self._joinable(r, now)), key=lambda r: r.ordinal)[:room]
+
     def _joinable(self, request: _Request, now: float) -> bool:
         if (request.state != "DECODING" or request.pending_reason or request.finish_reason
                 or now >= request.deadline or request.allocation_id is None
@@ -2446,14 +2506,8 @@ class MuxController:
                         return False
                     extend = [(view.identity.request_id, view) for view in views]
             joined = []
-            limit = min(self.config.max_model_inflight, self.policy.limits[model])
-            room = limit - len(batch.plan.requests)
-            if room > 0 and self._decode_only_for(model) is None:
-                now = self.clock()
-                members = {ref.request_id for ref in batch.plan.requests}
-                picked = sorted((r for r in self.requests.values()
-                                 if r.spec.model_id == model and r.spec.request_id not in members
-                                 and self._joinable(r, now)), key=lambda r: r.ordinal)[:room]
+            picked = self._join_candidates(group, batch)
+            if picked:
                 left = batch.plan.steps - step
                 budget = {r.spec.request_id: min(left, r.spec.max_new_tokens - len(r.output)) for r in picked}
                 if picked:

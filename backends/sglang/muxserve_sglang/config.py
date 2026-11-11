@@ -268,6 +268,14 @@ class DeploymentConfig:
     # front. A page that cannot be had ends the run (full-pool recovery then applies).
     # Requires decode_step_join (new pages ride on the step decision).
     decode_kv_per_page: bool = False
+    # The decode leader's step report leaves the critical path: answering a report, the
+    # owner also says whether the next step boundary may simply continue (nothing new
+    # for the run: no prefill waiting for credits, no prefill work for its D ranks, no
+    # request to join, no page needed, nothing stopping). The leader then runs on and
+    # sends that step's report while the next forward runs; any other boundary is
+    # decided as before. Anything new is acted on one step later. Requires
+    # decode_leader_reports.
+    decode_step_pipeline: bool = False
     # With two requests of a model in flight: a request that finds its model
     # idle waits this many ms, so a request arriving just after it joins the
     # same prefill batch. The pair then decodes and finishes together, as under
@@ -355,11 +363,13 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "handoff_report_with_ready", "start_in_report_reply", "targeted_wake",
                  "rpc_inline_fast_methods", "decode_leader_reports", "handoff_prepare_after_ack",
                  "decode_prepare_light", "decode_run_merge", "capacity_recovery_all_decode",
-                 "decode_kv_trim", "decode_step_join", "decode_kv_per_page"):
+                 "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_kv_per_page and not config.decode_step_join:
         raise IntegrationError("INVALID_CONFIG", "decode_kv_per_page requires decode_step_join")
+    if config.decode_step_pipeline and not config.decode_leader_reports:
+        raise IntegrationError("INVALID_CONFIG", "decode_step_pipeline requires decode_leader_reports")
     if type(config.prefill_pair_hold_ms) is not int or not 0 <= config.prefill_pair_hold_ms <= 50:
         raise IntegrationError("INVALID_CONFIG", "prefill_pair_hold_ms must be an integer 0..50")
     if config.prefill_pair_hold_ms and not (config.inline_prepare and config.decode_run_merge

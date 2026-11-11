@@ -41,7 +41,7 @@ def token_for(output_count: int) -> int:
 
 def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False,
               register_ready=False, ack_in_poll=False, combined=False, start_reply=False,
-              leader_reports=False, step_join=False):
+              leader_reports=False, step_join=False, pipeline=False, barrier=None):
     """final_step: config final_step_in_gpu_done (a locally final run step is
     reported inside GPU_DONE). HANDOFF native_metadata and long-poll
     bootstrap_ready are used whenever the owner provides them. step_join: config
@@ -95,6 +95,11 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
 
     def run_decode(command, prep):
         steps = prep.get("run_steps", 1)
+        reports = None
+        if pipeline and box is not None and rank == 0:
+            from concurrent.futures import ThreadPoolExecutor
+            reports = ThreadPoolExecutor(max_workers=1)
+        in_flight, ahead = None, False
         start = time.monotonic()
         members = [{"request_id": i["request_id"], "attempt": i["attempt"], "base": len(i["output_token_ids"]),
                     "start": i["target_valid_tokens"] - 1, "max_new": i["max_new_tokens"],
@@ -105,6 +110,8 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
         tag = zlib.crc32(command["batch_id"].encode())
         while True:
             assert all(m["start"] + step <= m["cap"] for m in members), "decode step outside its KV mapping"
+            if barrier is not None:
+                barrier.wait(60)  # a TP forward is collective: every D rank enters it together
             time.sleep(decode_s)
             results = [{"request_id": m["request_id"], "attempt": m["attempt"],
                         "token_id": token_for(m["base"] + step - 1),
@@ -114,14 +121,24 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
             finished = any(m["base"] + step >= m["max_new"] for m in members)
             if box is not None:
                 digest = zlib.crc32(",".join(str(item["token_id"]) for item in results).encode(), digest)
+            if in_flight is not None:
+                ahead = in_flight.result().get("ahead") is True
+                in_flight = None
             if final_step and (finished or step >= steps):
                 final = {"step": step, "results": results, "finished": finished}
                 break
             continuing = not (finished or step >= steps)
-            if box is not None and continuing and rank != 0 and box.wait(tag, step, 30):
+            if (reports is not None and continuing and ahead
+                    and all(m["start"] + step + 1 <= m["cap"] for m in members)):
+                in_flight = reports.submit(call, "decode_step", rank, pid, command["batch_id"], step,
+                                           results, finished, True)
+                decision, ahead = {"continue": True}, False
+                box.publish(tag, step, True)
+            elif box is not None and continuing and rank != 0 and box.wait(tag, step, 30):
                 decision = {"continue": True}
             else:
                 decision = call("decode_step", rank, pid, command["batch_id"], step, results, finished)
+                ahead = decision.get("ahead") is True
                 if box is not None and continuing and rank == 0:
                     box.publish(tag, step, decision["continue"] is True
                                 and not decision.get("join") and not decision.get("extend"))
@@ -357,6 +374,7 @@ def main():
     parser.add_argument("--kv-trim", action="store_true", help="config decode_kv_trim=true")
     parser.add_argument("--step-join", action="store_true", help="config decode_step_join=true")
     parser.add_argument("--kv-per-page", action="store_true", help="config decode_kv_per_page=true")
+    parser.add_argument("--step-pipeline", action="store_true", help="config decode_step_pipeline=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -399,7 +417,8 @@ def main():
                               prefill_pair_hold_ms=args.pair_hold_ms,
                               capacity_recovery_all_decode=args.recovery_all_decode, max_new_tokens=args.max_new,
                               decode_kv_trim=args.kv_trim, decode_step_join=args.step_join,
-                              decode_kv_per_page=args.kv_per_page)
+                              decode_kv_per_page=args.kv_per_page,
+                              decode_step_pipeline=args.step_pipeline)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -441,11 +460,14 @@ def main():
     per_model = lambda text, default: ([float(x) / 1000 for x in text.split(",")] if text
                                        else [default] * len(MODELS))
     timing = dict(zip(MODELS, zip(per_model(args.prefill_ms, PREFILL_S), per_model(args.decode_ms, DECODE_S))))
+    barriers = {m: context.Barrier(TP) for m in MODELS}
     processes = [context.Process(target=rank_main, args=(address, key, controller.group_id(m), m, stage, rank,
                                                          0, stop, timing[m], args.final_step,
                                                          args.register_ready, args.ack_in_poll,
                                                          args.combined_report, args.start_in_reply,
-                                                         args.decode_leader, args.step_join), daemon=True)
+                                                         args.decode_leader, args.step_join,
+                                                         args.step_pipeline,
+                                                         barriers[m] if stage == "D" else None), daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()

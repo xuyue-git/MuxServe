@@ -92,6 +92,7 @@ class ControlledScheduler:
         self.reply_commands = ()  # start_in_report_reply
         self.step_box = None  # decode_leader_reports
         self._poll_epoch = None  # last broker epoch a command long-poll returned
+        self._report_pool = None  # decode_step_pipeline: sends the leader's step reports
         self.drained = False
         require(self.pool.headwise_shared and not scheduler.enable_overlap
                 and scheduler.spec_algorithm.is_none() and self.runner.ps.pp_size == 1
@@ -717,6 +718,13 @@ class ControlledScheduler:
             state.run_views = [self._own_view(item["reservation_view"]) for item in state.command["requests"]]
             state.command["requests"] = list(state.command["requests"])
         prep_ms = 0.0  # trace only: the step boundary's local batch preparation
+        # decode_step_pipeline (leader only): the previous step's report, still being
+        # answered while this step runs, and whether this boundary was granted ahead.
+        pipeline = leader_only and self.rank == 0 and self._flag("decode_step_pipeline")
+        if pipeline and self._report_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._report_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="step-report")
+        in_flight, ahead = None, False
         while True:
             forward_started = time.perf_counter()
             previous_output_counts = [len(req.output_ids) for req in state.reqs]
@@ -751,18 +759,31 @@ class ControlledScheduler:
             finished = any(req.finished() for req in state.reqs)
             if leader_only:
                 digest = zlib.crc32(",".join(str(item["token_id"]) for item in results).encode(), digest)
+            if in_flight is not None:
+                # The previous step's report: its answer says whether this boundary
+                # may simply continue (and raises the report's failure, if any).
+                ahead = in_flight.result().get("ahead") is True
+                in_flight = None
             if (finished or step >= steps) and getattr(getattr(self.ctx, "config", None), "final_step_in_gpu_done", False):
                 # The owner's decision for a locally final step is always to
                 # stop: report the step inside GPU_DONE (one RPC, not two).
                 final_step = {"step": step, "results": results, "finished": finished}
                 break
             continuing = not (finished or step >= steps)
-            if (leader_only and continuing and self.rank != 0
+            if (pipeline and continuing and ahead and all(
+                    view.capacity_tokens >= valid + step + 1 for view, valid in zip(state.run_views, start_valid))):
+                # Granted ahead: run on now, report this step while the next one runs.
+                in_flight = self._report_pool.submit(self.rpc, "decode_step", self.rank, self.pid,
+                                                     command["batch_id"], step, results, finished, True)
+                reply, ahead = {"continue": True}, False
+                self.step_box.publish(tag, step, True)
+            elif (leader_only and continuing and self.rank != 0
                     and self.step_box.wait(tag, step, self.ctx.config.prepare_timeout_ms / 1000)):
                 reply = {"continue": True}
             else:
                 reply = self.rpc("decode_step", self.rank, self.pid, command["batch_id"], step,
                                  results, finished)
+                ahead = reply.get("ahead") is True
                 if leader_only and continuing and self.rank == 0:
                     # Joins and new pages reach every rank through its own report.
                     self.step_box.publish(tag, step, reply.get("continue") is True

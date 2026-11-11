@@ -960,6 +960,94 @@ class StepJoinChecks(unittest.TestCase):
             store.assert_integrity()
 
 
+class StepPipelineChecks(unittest.TestCase):
+    """decode_step_pipeline: the leader runs on at boundaries the owner granted ahead."""
+
+    FLAGS = dict(park=True, max_model_inflight=2, decode_run_merge=True, decode_step_join=True,
+                 decode_leader_reports=True, decode_step_pipeline=True)
+
+    def step(self, sim, batch_id, rank, step, tokens, finished=False, pregranted=False):
+        batch = sim.controller.groups["a"].batches[batch_id]
+        results = [{"request_id": ref.request_id, "attempt": ref.attempt, "token_id": tokens[ref.request_id],
+                    "valid_tokens": batch.run_start_valid[ref.request_id] + step} for ref in batch.members(step)]
+        return sim.controller.decode_step(sim.group("a"), rank, sim.pid("a", "D", rank), batch_id, step,
+                                          results, finished, pregranted)
+
+    def running(self, **flags):
+        sim = Sim(run_steps=8, **{**self.FLAGS, **flags})
+        sim.submit("a", "r", max_new=12)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        return sim, plan, reservation
+
+    def test_granted_boundaries_run_on_and_publish_every_token_in_order(self):
+        sim, plan, reservation = self.running()
+        reply = self.step(sim, plan.batch_id, 0, 1, {"r": 12})
+        self.assertEqual((reply["continue"], reply["ahead"]), (True, True))  # boundary 2 granted
+        for step, token in ((2, 13), (3, 14)):
+            reply = self.step(sim, plan.batch_id, 0, step, {"r": token}, pregranted=True)
+            self.assertEqual((reply["continue"], reply["ahead"]), (True, True))
+        # A follower ends at step 5 before the leader's report of step 4 arrived.
+        for rank in range(1, sim.tp):
+            self.assertIs(self.step(sim, plan.batch_id, rank, 5, {"r": 16}, finished=True)["continue"], False)
+        self.step(sim, plan.batch_id, 0, 4, {"r": 15}, pregranted=True)
+        self.assertIs(self.step(sim, plan.batch_id, 0, 5, {"r": 16}, finished=True)["continue"], False)
+        batch = sim.controller.groups["a"].batches[plan.batch_id]
+        self.assertEqual(batch.run_decisions, {1: True, 2: True, 3: True, 4: True, 5: False})
+        self.assertEqual(sim.tokens("a")[-5:], [12, 13, 14, 15, 16])
+
+    def test_anything_new_for_the_run_withholds_the_grant(self):
+        cases = {
+            "prefill of its model": lambda sim: sim.controller.prepare_batch(BatchPlan(
+                sim.group("a"), "p-q", "a", "P", (RequestRef("q", 0, 0),))),
+            "cancelled": lambda sim: sim.controller.cancel_request("a", "r"),
+        }
+        for name, change in cases.items():
+            with self.subTest(name=name):
+                sim, plan, _ = self.running()
+                sim.submit("a", "q", max_new=6)
+                self.assertTrue(self.step(sim, plan.batch_id, 0, 1, {"r": 12})["ahead"])
+                change(sim)
+                # Step 2 was granted before the change: it still runs on ...
+                reply = self.step(sim, plan.batch_id, 0, 2, {"r": 13}, pregranted=True)
+                self.assertIs(reply["continue"], True)
+                self.assertIs(reply["ahead"], False)  # ... and boundary 3 is decided as before
+        sim = Sim(run_steps=8, **self.FLAGS)
+        sim.submit("a", "r", max_new=12)
+        sim.submit("a", "q", max_new=6)
+        sim.prefill("a", "r", 11)
+        sim.prefill("a", "q", 21)  # decodable, may join
+        plan, _ = sim.prepare_decode("a", "r", 8)
+        reply = self.step(sim, plan.batch_id, 0, 1, {"r": 12})
+        self.assertEqual([item["request_id"] for item in reply["join"]], ["q"])
+        self.assertIs(reply["ahead"], True)  # it joined: nothing else is new
+
+    def test_a_page_boundary_is_never_granted_ahead(self):
+        sim = Sim(run_steps=40, decode_kv_per_page=True, **self.FLAGS)
+        sim.submit("a", "r", max_new=40)
+        sim.prefill("a", "r", 11)  # 3 tokens, page of 16
+        plan, _ = sim.prepare_decode("a", "r", 30)
+        token, aheads = 12, []
+        for step in range(1, 14):
+            reply = self.step(sim, plan.batch_id, 0, step, {"r": token}, pregranted=step > 1 and aheads[-1])
+            aheads.append(reply["ahead"])
+            token += 1
+        # Boundary 13 (step 14 writes position 16) needs a page: decided, not granted.
+        self.assertEqual(aheads[:11], [True] * 11)
+        self.assertIs(aheads[11], False)
+        self.assertEqual(reply["extend"][0]["view"]["capacity_tokens"], 32)
+
+    def test_ungranted_or_follower_pregranted_reports_are_refused(self):
+        sim, plan, _ = self.running()
+        expect("REPORT_GAP", lambda: self.step(sim, plan.batch_id, 0, 1, {"r": 12}, pregranted=True))
+        self.assertNotIn(1, sim.controller.groups["a"].batches[plan.batch_id].run_reports)
+        self.step(sim, plan.batch_id, 0, 1, {"r": 12})
+        expect("INVALID_ARGUMENT", lambda: self.step(sim, plan.batch_id, 1, 2, {"r": 13}, pregranted=True))
+        sim2, plan2, _ = self.running(decode_step_pipeline=False)
+        self.assertNotIn("ahead", self.step(sim2, plan2.batch_id, 0, 1, {"r": 12}))
+        expect("INVALID_ARGUMENT", lambda: self.step(sim2, plan2.batch_id, 0, 2, {"r": 13}, pregranted=True))
+
+
 class LongPollChecks(unittest.TestCase):
     def setUp(self):
         self.sim = Sim()
