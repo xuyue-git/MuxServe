@@ -87,13 +87,20 @@ class ControllerDriver:
         # Wake on controller activity (reports, decode steps, submissions,
         # commands); the timeout keeps deadline/watchdog ticks periodic.
         wake = getattr(self.controller, "wake", None)
+        spacing = getattr(self.config, "driver_min_interval_ms", 0) / 1000
         try:
             while not self.stop_event.is_set():
                 if wake is not None:
                     # Clear before stepping: activity during step() keeps the
                     # flag set, so the wait below returns at once (no lost wake).
                     wake.clear()
+                started = time.monotonic()
                 self.step()
+                if spacing:
+                    # driver_min_interval_ms: wakes until then are handled by the next pass.
+                    rest = started + spacing - time.monotonic()
+                    if rest > 0:
+                        self.stop_event.wait(rest)
                 if wake is None:
                     self.stop_event.wait(0.005)
                 else:

@@ -41,7 +41,8 @@ def token_for(output_count: int) -> int:
 
 def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False,
               register_ready=False, ack_in_poll=False, combined=False, start_reply=False,
-              leader_reports=False, step_join=False, pipeline=False, barrier=None, leave=False):
+              leader_reports=False, step_join=False, pipeline=False, barrier=None, leave=False,
+              wait_commands=False, stage_in_done=False):
     """final_step: config final_step_in_gpu_done (a locally final run step is
     reported inside GPU_DONE). HANDOFF native_metadata and long-poll
     bootstrap_ready are used whenever the owner provides them. step_join: config
@@ -143,6 +144,8 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                 if box is not None and continuing and rank == 0:
                     box.publish(tag, step, decision["continue"] is True and not decision.get("join")
                                 and not decision.get("extend") and not decision.get("leave"))
+            if step_join and wait_commands:
+                decision = wait_at_boundary(command["batch_id"], step, decision)
             if step_join:
                 while decision["continue"] in ("PARK", "SYNC"):
                     handoffs = tuple(decision.get("handoffs", ()))
@@ -219,18 +222,25 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
             prep = st.prepared[command["batch_id"]]
             start = time.monotonic()
             if prep["batch_stage"] == "P":
+                staged = []
                 for item in prep["requests"]:
                     view = item["reservation_view"]
-                    call("broker_stage", item["bootstrap_room"], rank, pid, {
+                    metadata = {
                         "bootstrap_room": item["bootstrap_room"], "allocation_id": view["allocation_id"],
                         "reserved_version": view["version"], "target_valid_tokens": item["target_valid_tokens"],
-                        "rank": rank, "native_payload": {}})
+                        "rank": rank, "native_payload": {}}
+                    if stage_in_done:
+                        staged.append(metadata)
+                    else:
+                        call("broker_stage", item["bootstrap_room"], rank, pid, metadata)
                 time.sleep(prefill_s)
                 results = [{"request_id": i["request_id"], "attempt": i["attempt"],
                             "token_id": None if prep.get("purpose") == "REBUILD" else token_for(len(i["output_token_ids"])),
                             "valid_tokens": i["target_valid_tokens"]} for i in prep["requests"]]
                 payload = {"reservation_id": prep["reservation_id"], "results": results,
                            "duration_ms": (time.monotonic() - start) * 1000, "gpu_forward_ms": prefill_s * 1000}
+                if stage_in_done:
+                    payload["staged"] = tuple(staged)
             else:
                 payload = run_decode(command, prep)
             report(command["batch_id"], "GPU_DONE", payload)
@@ -287,6 +297,40 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                     report(waiting["batch_id"], "HANDOFF_READY", {"requests": waiting["requests"]})
                 st.waiting_handoff = None
         absorb()
+
+    def accept_in_run(handoffs):
+        while st.backlog and st.waiting_handoff is None:
+            command = st.backlog[0]
+            kind = command["kind"]
+            prep = st.prepared.get(command.get("batch_id"))
+            if not ((kind == "PREPARE" and command["batch_stage"] == "P")
+                    or (kind == "REVOKE" and prep is not None and prep["batch_stage"] == "P")
+                    or kind == "CLEANUP"
+                    or (kind == "HANDOFF" and command["batch_id"] in handoffs)):
+                break
+            st.backlog.pop(0)
+            handle(command)
+
+    def take(reply):
+        if "commands" in reply:
+            st.epoch = reply["epoch"]
+            st.broker_status = dict(reply["broker_status"])
+            st.backlog.extend(reply["commands"])
+
+    def wait_at_boundary(batch_id, step, decision):
+        """decode_wait_commands: commands, broker state and ACKs ride on decode_resume."""
+        while decision["continue"] in ("PARK", "SYNC"):
+            take(decision)
+            handoffs = tuple(decision.get("handoffs", ()))
+            accept_in_run(handoffs)
+            progress()
+            acks = tuple(st.pending_acks)
+            after = st.backlog[-1]["command_seq"] if st.backlog else st.cursor
+            decision = call("decode_resume", rank, pid, batch_id, step, 100, after, st.epoch, handoffs,
+                            st.cursor or None, acks)
+            del st.pending_acks[:len(acks)]
+        take(decision)
+        return decision
 
     def serve_in_run(handoffs):
         """Exactly the commands a real D rank takes at a run's step boundary."""
@@ -386,6 +430,9 @@ def main():
     parser.add_argument("--step-pipeline", action="store_true", help="config decode_step_pipeline=true")
     parser.add_argument("--step-leave", action="store_true", help="config decode_step_leave=true")
     parser.add_argument("--kv-grow-pages", type=int, default=1, help="config decode_kv_grow_pages")
+    parser.add_argument("--wait-commands", action="store_true", help="config decode_wait_commands=true")
+    parser.add_argument("--stage-in-done", action="store_true", help="config prefill_stage_in_gpu_done=true")
+    parser.add_argument("--driver-interval-ms", type=int, default=0, help="config driver_min_interval_ms")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -430,7 +477,10 @@ def main():
                               decode_kv_trim=args.kv_trim, decode_step_join=args.step_join,
                               decode_kv_per_page=args.kv_per_page,
                               decode_step_pipeline=args.step_pipeline, decode_step_leave=args.step_leave,
-                              decode_kv_grow_pages=args.kv_grow_pages)
+                              decode_kv_grow_pages=args.kv_grow_pages,
+                              decode_wait_commands=args.wait_commands,
+                              prefill_stage_in_gpu_done=args.stage_in_done,
+                              driver_min_interval_ms=args.driver_interval_ms)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -465,6 +515,8 @@ def main():
         import cProfile  # Python 3.12+: one interpreter-wide profiler covers every thread
         profiles.append(cProfile.Profile())
         profiles[0].enable()
+    from muxserve_sglang import trace as owner_trace
+    owner_trace.start_sampler()  # MXS_TRACE_DIR only: owner CPU by thread, as in the launcher
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     context = multiprocessing.get_context("spawn")  # like the launcher; fork+threads can deadlock
@@ -480,7 +532,8 @@ def main():
                                                          args.decode_leader, args.step_join,
                                                          args.step_pipeline,
                                                          barriers[m] if stage == "D" else None,
-                                                         args.step_leave), daemon=True)
+                                                         args.step_leave, args.wait_commands,
+                                                         args.stage_in_done), daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()

@@ -271,6 +271,7 @@ class MuxController:
         self.recovery_protected: dict[str, tuple[str, str]] = {}
         self.recovery_owners: dict[str, tuple[tuple[str, str], ...]] = {}
         self._decode_states: dict[str, str] = {}  # trace only: last traced decode state per model
+        self._active_lookup = None  # driver_min_interval_ms: indexed _active during a snapshot
         self.recovery_cycles = self.recovery_suspensions = 0
         self._ordinal = 0
         self.credits = CreditLedger(config.credit_multiplier, tuple(range(config.tp_size)))
@@ -819,6 +820,9 @@ class MuxController:
             self._retire_completed(group)
 
     def _active(self, request: _Request) -> _Batch | None:
+        lookup = self._active_lookup
+        if lookup is not None:  # a policy snapshot in progress: nothing changes meanwhile
+            return lookup(request)
         group = self._model(request.spec.model_id)
         for batch in group.batches.values():
             if (batch.status not in ("DONE", "ABORTED") and any(
@@ -847,7 +851,28 @@ class MuxController:
         return (request.allocation_id is not None or self._active(request) is not None
                 or any(cleanup.identity == request.identity for cleanup in group.cleanups.values()))
 
+    def _active_index(self) -> dict:
+        """(model, request, attempt) -> the batch _active would return. One pass over every
+        unfinished batch, in each group's order (driver_min_interval_ms)."""
+        index = {}
+        for group in self.groups.values():
+            for batch in group.batches.values():
+                if batch.status not in ("DONE", "ABORTED"):
+                    for ref in batch.plan.requests:
+                        index.setdefault((group.model_id, ref.request_id, ref.attempt), batch)
+        return index
+
     def _snapshot_policy(self) -> PolicySnapshot:
+        if self.config.driver_min_interval_ms:
+            index = self._active_index()
+            self._active_lookup = lambda request: index.get(
+                (request.spec.model_id, request.spec.request_id, request.attempt))
+        try:
+            return self._snapshot_policy_inner()
+        finally:
+            self._active_lookup = None
+
+    def _snapshot_policy_inner(self) -> PolicySnapshot:
         demands = []
         busy = set()
         blocked = set()
@@ -1635,6 +1660,8 @@ class MuxController:
             elif kind == "GPU_DONE":
                 if batch.status not in ("RUNNING", "FENCED"):
                     raise IntegrationError("STALE_REPORT", "GPU_DONE requires started batch")
+                if "staged" in payload:
+                    payload = self._stage_from_gpu_done(group, batch, rank, pid, payload)
                 if "final_step" in payload:
                     payload = self._record_final_step(group, batch, rank, payload)
                 self._gpu_done(group, batch, rank, payload)
@@ -1770,34 +1797,37 @@ class MuxController:
         """P sender.send stores CPU metadata privately; this never publishes it."""
         trace.ev("brk", None, op="stage", gid=group_id, room=room, r=rank)
         with self.lock:
-            group = self._group(group_id)
-            target = group.registered.get(("P", rank))
-            entry = group.broker.get(room)
-            if (type(room) is not int or not 0 < room <= _INT64_MAX
-                    or target is None or target.pid != pid or not target.alive or entry is None):
-                raise IntegrationError("INVALID_BROKER", "Unknown P rank, PID or room")
-            batch = self._batch(group, entry["batch_id"])
-            if (group.fenced or set(entry["destinations"]) != set(group.ranks)
-                    or batch.status not in ("RUNNING", "HANDOFF") or entry["state"] not in ("PREPARING", "STAGED", "PUBLISHED")
-                    or not isinstance(metadata, dict) or set(metadata) != {
-                        "bootstrap_room", "allocation_id", "reserved_version",
-                        "target_valid_tokens", "rank", "native_payload"}
-                    or metadata["bootstrap_room"] != room or metadata["rank"] != rank
-                    or metadata["allocation_id"] != entry["allocation_id"]
-                    or metadata["reserved_version"] != entry["reserved_version"]
-                    or metadata["target_valid_tokens"] != entry["target_valid_tokens"]
-                    or not isinstance(metadata["native_payload"], dict)
-                    or len(repr(metadata)) > 65536 or not self._plain_metadata(metadata)):
-                raise IntegrationError("INVALID_BROKER", "Small plain CPU metadata required")
-            previous = entry["metadata"].get(rank)
-            if previous is not None and previous != metadata:
-                self._fence(group, batch, "broker_content_conflict")
-                raise IntegrationError("IDENTITY_CONFLICT", "Staged native metadata changed")
-            entry["metadata"][rank] = deepcopy(metadata)
-            if entry["state"] == "PREPARING":
-                entry["state"] = "STAGED"
-            self._notify(group)
-            return {"room": room, "staged": True, "published": entry["state"] == "PUBLISHED"}
+            return self._stage(self._group(group_id), room, rank, pid, metadata)
+
+    def _stage(self, group: _Group, room: int, rank: int, pid: int, metadata: dict) -> dict:
+        """broker_stage's checks and effect; caller holds the lock."""
+        target = group.registered.get(("P", rank))
+        entry = group.broker.get(room)
+        if (type(room) is not int or not 0 < room <= _INT64_MAX
+                or target is None or target.pid != pid or not target.alive or entry is None):
+            raise IntegrationError("INVALID_BROKER", "Unknown P rank, PID or room")
+        batch = self._batch(group, entry["batch_id"])
+        if (group.fenced or set(entry["destinations"]) != set(group.ranks)
+                or batch.status not in ("RUNNING", "HANDOFF") or entry["state"] not in ("PREPARING", "STAGED", "PUBLISHED")
+                or not isinstance(metadata, dict) or set(metadata) != {
+                    "bootstrap_room", "allocation_id", "reserved_version",
+                    "target_valid_tokens", "rank", "native_payload"}
+                or metadata["bootstrap_room"] != room or metadata["rank"] != rank
+                or metadata["allocation_id"] != entry["allocation_id"]
+                or metadata["reserved_version"] != entry["reserved_version"]
+                or metadata["target_valid_tokens"] != entry["target_valid_tokens"]
+                or not isinstance(metadata["native_payload"], dict)
+                or len(repr(metadata)) > 65536 or not self._plain_metadata(metadata)):
+            raise IntegrationError("INVALID_BROKER", "Small plain CPU metadata required")
+        previous = entry["metadata"].get(rank)
+        if previous is not None and previous != metadata:
+            self._fence(group, batch, "broker_content_conflict")
+            raise IntegrationError("IDENTITY_CONFLICT", "Staged native metadata changed")
+        entry["metadata"][rank] = deepcopy(metadata)
+        if entry["state"] == "PREPARING":
+            entry["state"] = "STAGED"
+        self._notify(group)
+        return {"room": room, "staged": True, "published": entry["state"] == "PUBLISHED"}
 
     @staticmethod
     def _plain_metadata(value: Any, depth: int = 0) -> bool:
@@ -2078,6 +2108,21 @@ class MuxController:
                 self._inline_start_allowed = False
                 self.wake.set()
 
+    def _stage_from_gpu_done(self, group: _Group, batch: _Batch, rank: int, pid: int, payload: dict) -> dict:
+        """prefill_stage_in_gpu_done: a P rank's GPU_DONE carries its staged native metadata,
+        one per room of the batch; each is checked and stored exactly as broker_stage."""
+        staged = payload["staged"]
+        rooms = {room for room, entry in group.broker.items() if entry["batch_id"] == batch.plan.batch_id}
+        if (not self.config.prefill_stage_in_gpu_done or batch.plan.stage != "P"
+                or not isinstance(staged, (tuple, list))
+                or not all(isinstance(item, dict) for item in staged)
+                or sorted(item.get("bootstrap_room") for item in staged) != sorted(rooms)):
+            raise IntegrationError("INVALID_REPORT", "GPU_DONE must stage every room of its prefill")
+        if batch.status == "RUNNING":
+            for item in staged:
+                self._stage(group, item["bootstrap_room"], rank, pid, item)
+        return {key: value for key, value in payload.items() if key != "staged"}
+
     def _record_final_step(self, group: _Group, batch: _Batch, rank: int, payload: dict) -> dict:
         """final_step_in_gpu_done: the rank ended its run locally (finished or
         last granted step), whose decision is always to stop; record that step
@@ -2222,7 +2267,8 @@ class MuxController:
 
     def decode_resume(self, group_id: str, rank: int, pid: int, batch_id: str, step: int,
                       wait_ms: int | float = 100, after_seq: int | None = None,
-                      epoch: int | None = None, handoffs_seen: tuple | list = ()) -> dict:
+                      epoch: int | None = None, handoffs_seen: tuple | list = (),
+                      ack_seq: int | None = None, broker_acks: tuple | list = ()) -> dict:
         """Long-poll of a D rank whose run parked after ``step``.
 
         Returns PARK (poll again), True (run step + 1) or False (end the run
@@ -2233,6 +2279,10 @@ class MuxController:
         rank serves its model's prefill commands there; this returns early once
         it has a command after ``after_seq``, its group's broker epoch differs
         from ``epoch``, or the boundary runs a handoff not in ``handoffs_seen``.
+
+        decode_wait_commands: the call also ACKs commands through ``ack_seq`` and carries
+        this rank's broker ACKs, exactly as poll_commands_wait; the reply then has the
+        commands after ``after_seq``, the broker epoch and every room's broker status.
         """
         if type(wait_ms) not in (int, float) or not 0 <= wait_ms <= 1000:
             raise IntegrationError("INVALID_ARGUMENT", "Resume wait must be 0..1000 ms")
@@ -2244,8 +2294,15 @@ class MuxController:
                 raise IntegrationError("UNKNOWN_RANK", "Registered D rank/PID required")
             batch = self._batch(group, batch_id)
             if self.config.decode_step_join:
-                return self._resume_join(group, batch, target, rank, step, deadline,
-                                         after_seq, epoch, handoffs_seen)
+                if self.config.decode_wait_commands:
+                    epoch = self._take_acks(group, target, rank, pid, after_seq, ack_seq, broker_acks, epoch)
+                elif ack_seq is not None or broker_acks:
+                    raise IntegrationError("INVALID_ARGUMENT", "Resume ACKs need decode_wait_commands")
+                reply = self._resume_join(group, batch, target, rank, step, deadline,
+                                          after_seq, epoch, handoffs_seen)
+                if self.config.decode_wait_commands:
+                    reply.update(self._waiting_state(group, target, rank, after_seq))
+                return reply
             if (batch.plan.stage != "D" or batch.plan.steps < 2 or type(step) is not int
                     or rank not in batch.run_reports.get(step, {})
                     or batch.run_decisions.get(step) not in ("PARK", True, False)):
@@ -2447,6 +2504,47 @@ class MuxController:
             if remaining <= 0:
                 return reply
             self._park_cv.wait(remaining)
+
+    def _take_acks(self, group: _Group, target: _Rank, rank: int, pid: int, after_seq, ack_seq,
+                   broker_acks, epoch):
+        """decode_wait_commands: poll_commands_wait's command and broker ACK handling for a
+        rank waiting in decode_resume. Returns the epoch to wait on: after this rank's own
+        ACK, the others' ACKs are what it waits for. Caller holds the lock."""
+        if ack_seq is not None:
+            if type(ack_seq) is not int or not target.acked_command <= ack_seq < target.next_command:
+                raise IntegrationError("INVALID_ACK", "Invalid contiguous command ACK")
+            if ack_seq > target.acked_command:
+                for seq in list(target.commands):
+                    if seq <= ack_seq:
+                        del target.commands[seq]
+                target.acked_command = ack_seq
+                self._retire_completed(group)
+        if type(after_seq) is not int or after_seq < target.acked_command or after_seq >= target.next_command:
+            raise IntegrationError("COMMAND_GAP", "Command replay precedes retained history")
+        if not isinstance(broker_acks, (tuple, list)) or not all(
+                isinstance(a, (tuple, list)) and len(a) == 5 for a in broker_acks):
+            raise IntegrationError("INVALID_ARGUMENT", "Malformed broker ACKs")
+        for room, allocation_id, version, valid_tokens, table in broker_acks:
+            self.broker_ack(group.group_id, room, rank, pid, allocation_id, version, valid_tokens, table)
+        if broker_acks and not all(group.broker[a[0]]["acked"] == set(group.ranks) for a in broker_acks):
+            return group.epoch
+        return epoch
+
+    def _waiting_state(self, group: _Group, target: _Rank, rank: int, after_seq: int) -> dict:
+        """What poll_commands_wait would return to this D rank now. Caller holds the lock."""
+        commands = tuple(cmd.detach() if isinstance(cmd, CommandSnapshot) else deepcopy(cmd)
+                         for seq, cmd in target.commands.items() if seq > after_seq)
+        if trace.enabled():
+            for cmd in commands:
+                trace.ev("dlv", cmd.get("batch_id") or cmd.get("cleanup_id"), kind=cmd.get("kind"),
+                         m=group.model_id, s="D", r=rank, seq=cmd.get("command_seq"), resume=True)
+        if group.ack_gates:
+            self._note_ack_seen(group, rank)
+        return {"commands": commands, "epoch": group.epoch, "broker_status": tuple(
+            (room, "ABORTED" if group.fenced or entry["state"] == "ABORTED" else
+             "SUCCESS" if entry["state"] == "PUBLISHED" and entry["acked"] == set(group.ranks)
+             else "PENDING")
+            for room, entry in group.broker.items())}
 
     def _lookahead(self, group: _Group, batch: _Batch, step: int, decision) -> bool:
         """decode_step_pipeline, caller holds the lock: grant step boundary ``step + 1``

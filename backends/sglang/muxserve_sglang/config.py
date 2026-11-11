@@ -287,6 +287,20 @@ class DeploymentConfig:
     # boundary that grows one request also tops up every other member about to need a
     # page, so fewer boundaries need the owner's decision.
     decode_kv_grow_pages: int = 1
+    # A D rank waiting at a run's step boundary takes its commands, broker state and
+    # handoff ACKs through the decode_resume call it makes anyway, instead of separate
+    # command polls: a prefill handoff there needs fewer owner round trips. Requires
+    # decode_step_join and handoff_ack_in_poll.
+    decode_wait_commands: bool = False
+    # A P rank stages its prefill's native KV metadata inside its GPU_DONE report
+    # instead of one broker_stage RPC per request during the forward. The owner checks
+    # each exactly as broker_stage does before it handles the GPU_DONE.
+    prefill_stage_in_gpu_done: bool = False
+    # Driver passes (tick, lifecycle maintenance, START and prepare attempts) start at
+    # most every this many ms; wakes in between are coalesced. Its policy snapshot
+    # finds each request's batch through one index instead of a scan per request.
+    # 0 keeps a pass on every wake.
+    driver_min_interval_ms: int = 0
     # With two requests of a model in flight: a request that finds its model
     # idle waits this many ms, so a request arriving just after it joins the
     # same prefill batch. The pair then decodes and finishes together, as under
@@ -375,7 +389,7 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "rpc_inline_fast_methods", "decode_leader_reports", "handoff_prepare_after_ack",
                  "decode_prepare_light", "decode_run_merge", "capacity_recovery_all_decode",
                  "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline",
-                 "decode_step_leave"):
+                 "decode_step_leave", "decode_wait_commands", "prefill_stage_in_gpu_done"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_kv_per_page and not config.decode_step_join:
@@ -387,6 +401,11 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         # the decision sees which members that very step finished.
         raise IntegrationError("INVALID_CONFIG", "decode_step_leave requires decode_step_join and "
                                                  "decode_leader_reports")
+    if config.decode_wait_commands and not (config.decode_step_join and config.handoff_ack_in_poll):
+        raise IntegrationError("INVALID_CONFIG", "decode_wait_commands requires decode_step_join and "
+                                                 "handoff_ack_in_poll")
+    if type(config.driver_min_interval_ms) is not int or not 0 <= config.driver_min_interval_ms <= 50:
+        raise IntegrationError("INVALID_CONFIG", "driver_min_interval_ms must be an integer 0..50")
     if type(config.decode_kv_grow_pages) is not int or not 1 <= config.decode_kv_grow_pages <= 8:
         raise IntegrationError("INVALID_CONFIG", "decode_kv_grow_pages must be an integer 1..8")
     if type(config.prefill_pair_hold_ms) is not int or not 0 <= config.prefill_pair_hold_ms <= 50:

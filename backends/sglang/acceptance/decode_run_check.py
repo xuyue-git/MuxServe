@@ -1207,6 +1207,132 @@ class StepLeaveChecks(unittest.TestCase):
         self.assertEqual(reply["extend"][0]["capacity_tokens"], 32)
 
 
+class OwnerHopChecks(unittest.TestCase):
+    """decode_wait_commands, prefill_stage_in_gpu_done and driver_min_interval_ms."""
+
+    WAIT = dict(park=True, max_model_inflight=2, decode_run_merge=True, decode_step_join=True,
+                decode_wait_commands=True, handoff_ack_in_poll=True, broker_status_in_poll=True)
+    step = StepJoinChecks.step
+    batch = staticmethod(StepJoinChecks.batch)
+
+    def parked_with_handoff(self, **flags):
+        sim = Sim(run_steps=8, **{**self.WAIT, **flags})
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, _ = sim.prepare_decode("a", "r", 8)
+        sim.submit("a", "q", max_new=6)
+        p_plan, _, p_reservation = sim.prefill_ready("a", "q")
+        for rank in range(sim.tp):
+            self.assertEqual(self.step(sim, plan.batch_id, rank, 1, {"r": 12})["continue"], "PARK")
+        sim.controller.start_batch(sim.group("a"), p_plan.batch_id)
+        return sim, plan, p_plan, p_reservation
+
+    def stage(self, sim, p_plan, rank):
+        item = next(c for c in sim.commands("a", "P", rank, "PREPARE")
+                    if c["batch_id"] == p_plan.batch_id)["requests"][0]
+        view = item["reservation_view"]
+        return {"bootstrap_room": item["bootstrap_room"], "allocation_id": view["allocation_id"],
+                "reserved_version": view["version"], "target_valid_tokens": 3, "rank": rank,
+                "native_payload": {"x": 1}}
+
+    def prefill_done(self, sim, p_plan, p_reservation, staged=False):
+        for rank in range(sim.tp):
+            payload = {"reservation_id": p_reservation, "duration_ms": 1.0, "gpu_forward_ms": 1.0,
+                       "results": [{"request_id": "q", "attempt": 0, "token_id": 21, "valid_tokens": 3}]}
+            if staged:
+                payload["staged"] = (self.stage(sim, p_plan, rank),)
+            else:
+                metadata = self.stage(sim, p_plan, rank)
+                sim.controller.broker_stage(sim.group("a"), metadata["bootstrap_room"], rank,
+                                            sim.pid("a", "P", rank), metadata)
+            sim.report("a", "P", rank, p_plan.batch_id, "GPU_DONE", payload)
+
+    def resume(self, sim, plan, rank, **kwargs):
+        args = dict(after_seq=sim.acked[("a", "D", rank)], epoch=None, handoffs_seen=(), ack_seq=None,
+                    broker_acks=())
+        args.update(kwargs)
+        return sim.controller.decode_resume(sim.group("a"), rank, sim.pid("a", "D", rank), plan.batch_id, 1, 0,
+                                            args["after_seq"], args["epoch"], args["handoffs_seen"],
+                                            args["ack_seq"], args["broker_acks"])
+
+    def test_a_waiting_rank_gets_the_handoff_and_acks_it_through_decode_resume(self):
+        sim, plan, p_plan, p_reservation = self.parked_with_handoff()
+        self.prefill_done(sim, p_plan, p_reservation)
+        group = sim.controller.groups["a"]
+        handoffs, acks = {}, {}
+        for rank in range(sim.tp):
+            reply = self.resume(sim, plan, rank)
+            self.assertEqual((reply["continue"], reply["handoffs"]), ("PARK", (p_plan.batch_id,)))
+            command = next(c for c in reply["commands"] if c["kind"] == "HANDOFF")
+            item = command["requests"][0]
+            self.assertEqual(dict(reply["broker_status"])[item["bootstrap_room"]], "PENDING")
+            handoffs[rank] = item
+            acks[rank] = (item["bootstrap_room"], item["allocation_id"], item["version"],
+                          item["valid_tokens"], item["rank_block_table"])
+        for rank in range(sim.tp):  # each rank's next call carries its ACK
+            reply = self.resume(sim, plan, rank, after_seq=sim.acked[("a", "D", rank)] + 0,
+                                epoch=group.epoch, handoffs_seen=(p_plan.batch_id,), broker_acks=(acks[rank],))
+        room = handoffs[0]["bootstrap_room"]
+        self.assertEqual(dict(reply["broker_status"])[room], "SUCCESS")  # the last ACK completes it
+        self.assertEqual(group.broker[room]["acked"], set(range(sim.tp)))
+        for rank in range(sim.tp):
+            sim.report("a", "D", rank, p_plan.batch_id, "HANDOFF_READY", {"requests": [handoffs[rank]]})
+        reply = self.resume(sim, plan, 0, handoffs_seen=(p_plan.batch_id,))
+        self.assertIs(reply["continue"], True)
+        self.assertEqual([item["request_id"] for item in reply["join"]], ["q"])
+        expect("COMMAND_GAP", lambda: self.resume(sim, plan, 1, after_seq=10 ** 6))
+        sim2, plan2, _, _ = self.parked_with_handoff(decode_wait_commands=False)
+        expect("INVALID_ARGUMENT", lambda: self.resume(sim2, plan2, 0, ack_seq=0))
+
+    def test_a_prefill_stages_its_metadata_inside_gpu_done(self):
+        sim, plan, p_plan, p_reservation = self.parked_with_handoff(prefill_stage_in_gpu_done=True)
+        bad = {"reservation_id": p_reservation, "duration_ms": 1.0, "gpu_forward_ms": 1.0, "staged": (),
+               "results": [{"request_id": "q", "attempt": 0, "token_id": 21, "valid_tokens": 3}]}
+        expect("INVALID_REPORT", lambda: sim.controller.rank_report(
+            sim.group("a"), "P", 0, sim.pid("a", "P", 0), str(sim.seq[("a", "P", 0)] + 1), p_plan.batch_id,
+            "GPU_DONE", bad))
+        self.prefill_done(sim, p_plan, p_reservation, staged=True)
+        group = sim.controller.groups["a"]
+        entry = next(e for e in group.broker.values() if e["batch_id"] == p_plan.batch_id)
+        self.assertEqual((entry["state"], set(entry["metadata"])), ("PUBLISHED", set(range(sim.tp))))
+        self.assertEqual(sim.controller.groups["a"].batches[p_plan.batch_id].status, "HANDOFF")
+        sim2, plan2, p_plan2, p_res2 = self.parked_with_handoff()
+        with self.assertRaises(IntegrationError):  # without the switch a staged GPU_DONE is refused
+            self.prefill_done(sim2, p_plan2, p_res2, staged=True)
+
+    def test_the_indexed_snapshot_equals_the_scanning_one(self):
+        sim = Sim(("a", "b"), run_steps=8, park=True, max_model_inflight=4, decode_run_merge=True,
+                  decode_step_join=True, driver_min_interval_ms=5)
+        for index, name in enumerate(("r", "q", "s")):
+            sim.submit("a", name, max_new=10)
+            sim.prefill("a", name, 11 + index)
+        sim.submit("a", "w", max_new=6)
+        sim.submit("b", "x", max_new=6)
+        sim.prepare_decode("a", "r", 8)
+        controller = sim.controller
+        with controller.lock:
+            self.assertEqual(controller._snapshot_policy(), controller._snapshot_policy_inner())
+            self.assertIsNone(controller._active_lookup)
+
+    def test_driver_passes_are_spaced(self):
+        sim = Sim(driver_min_interval_ms=20)
+        driver = ControllerDriver(sim.controller, lambda event: None)
+        passes = []
+
+        def step():
+            passes.append(time.monotonic())
+            sim.controller.wake.set()  # constant activity
+
+        driver.step = step
+        worker = threading.Thread(target=driver.run, daemon=True)
+        worker.start()
+        time.sleep(0.25)
+        driver.stop_event.set()
+        worker.join(2)
+        self.assertLessEqual(len(passes), 15)
+        self.assertGreaterEqual(min(b - a for a, b in zip(passes, passes[1:])), 0.018)
+
+
 class LongPollChecks(unittest.TestCase):
     def setUp(self):
         self.sim = Sim()

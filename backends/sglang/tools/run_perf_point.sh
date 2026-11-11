@@ -23,6 +23,10 @@
 # next step runs: config decode_step_pipeline=true; needs DECODE_LEADER). STEP_LEAVE=1 (a
 # finished request leaves a running decode run: config decode_step_leave=true; needs STEP_JOIN,
 # DECODE_LEADER). KV_GROW_PAGES=N (pages per KV growth: config decode_kv_grow_pages=N).
+# WAIT_COMMANDS=1 (a D rank waiting at a run boundary takes commands and ACKs through
+# decode_resume: config decode_wait_commands=true). STAGE_IN_DONE=1 (P stages KV metadata
+# inside GPU_DONE: config prefill_stage_in_gpu_done=true). DRIVER_INTERVAL_MS=N (driver
+# passes at most every N ms: config driver_min_interval_ms=N).
 # Optional env: GPUS (default 1,2,3,4), MODELS_ROOT, REFERENCE (bench JSON to
 # compare output tokens against), KV_FRACTION (size the KV pool like original
 # MuxServe: gpu_memory_utilization x total GPU memory, instead of kv_bytes_per_rank),
@@ -131,6 +135,9 @@ KV_PER_PAGE="${KV_PER_PAGE:-}"
 STEP_PIPELINE="${STEP_PIPELINE:-}"
 STEP_LEAVE="${STEP_LEAVE:-}"
 KV_GROW_PAGES="${KV_GROW_PAGES:-}"
+WAIT_COMMANDS="${WAIT_COMMANDS:-}"
+STAGE_IN_DONE="${STAGE_IN_DONE:-}"
+DRIVER_INTERVAL_MS="${DRIVER_INTERVAL_MS:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -138,7 +145,7 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" "$STEP_JOIN" "$KV_PER_PAGE" "$STEP_PIPELINE" "$STEP_LEAVE" "$KV_GROW_PAGES" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" "$STEP_JOIN" "$KV_PER_PAGE" "$STEP_PIPELINE" "$STEP_LEAVE" "$KV_GROW_PAGES" "$WAIT_COMMANDS" "$STAGE_IN_DONE" "$DRIVER_INTERVAL_MS" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
@@ -147,7 +154,8 @@ import json, sys
  slot_at_cleanup, ack_in_poll, combined_report, start_in_reply,
  targeted_wake, rpc_inline, decode_leader, prepare_after_ack, prepare_light,
  inflight, run_merge, pair_hold_ms, max_new, timeout_ms, gateway, recovery_all_decode, kv_trim,
- step_join, kv_per_page, step_pipeline, step_leave, grow_pages) = sys.argv[1:]
+ step_join, kv_per_page, step_pipeline, step_leave, grow_pages,
+ wait_commands, stage_in_done, driver_interval) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -205,6 +213,12 @@ if step_leave:
     config["decode_step_leave"] = True
 if grow_pages:
     config["decode_kv_grow_pages"] = int(grow_pages)
+if wait_commands:
+    config["decode_wait_commands"] = True
+if stage_in_done:
+    config["prefill_stage_in_gpu_done"] = True
+if driver_interval:
+    config["driver_min_interval_ms"] = int(driver_interval)
 config.pop("prefill_pair_hold_ms", None)
 if pair_hold_ms:
     config["prefill_pair_hold_ms"] = int(pair_hold_ms)
@@ -261,7 +275,10 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "kv_per_page=%s" % config.get("decode_kv_per_page", False),
       "step_pipeline=%s" % config.get("decode_step_pipeline", False),
       "step_leave=%s" % config.get("decode_step_leave", False),
-      "grow_pages=%s" % config.get("decode_kv_grow_pages", 1))
+      "grow_pages=%s" % config.get("decode_kv_grow_pages", 1),
+      "wait_commands=%s" % config.get("decode_wait_commands", False),
+      "stage_in_done=%s" % config.get("prefill_stage_in_gpu_done", False),
+      "driver_interval_ms=%s" % config.get("driver_min_interval_ms", 0))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

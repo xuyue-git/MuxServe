@@ -44,6 +44,8 @@ class SharedHeadwiseKVManager(BaseKVManager):
         # (the rank's READY for that prefill batch carries and clears them).
         self.pending_destinations = []
         self.pending_acks = []  # handoff_ack_in_poll: sent with the next long poll
+        # prefill_stage_in_gpu_done: staged native metadata, sent inside GPU_DONE.
+        self.pending_stages = []
         # broker_status_in_poll: {room: broker_poll status} from the latest
         # command long-poll (None: not provided, ask the owner).
         self.broker_status = None
@@ -178,11 +180,15 @@ class SharedHeadwiseKVSender(_Room, BaseKVSender):
                    "cached_tokens": buffers.cached_tokens[self.aux_index].tolist(),
                    "bootstrap_room": self.bootstrap_room}
         view = self.item["reservation_view"]
-        self.kv_mgr.rpc("broker_stage", self.bootstrap_room, self.kv_mgr.rank,
-                       self.kv_mgr.pid, {"bootstrap_room": self.bootstrap_room,
-                       "allocation_id": view["allocation_id"], "reserved_version": view["version"],
-                       "target_valid_tokens": self.item["target_valid_tokens"],
-                       "rank": self.kv_mgr.rank, "native_payload": payload})
+        metadata = {"bootstrap_room": self.bootstrap_room,
+                    "allocation_id": view["allocation_id"], "reserved_version": view["version"],
+                    "target_valid_tokens": self.item["target_valid_tokens"],
+                    "rank": self.kv_mgr.rank, "native_payload": payload}
+        if getattr(self.kv_mgr.ctx.config, "prefill_stage_in_gpu_done", False):
+            self.kv_mgr.pending_stages.append(metadata)  # reported with this rank's GPU_DONE
+        else:
+            self.kv_mgr.rpc("broker_stage", self.bootstrap_room, self.kv_mgr.rank,
+                            self.kv_mgr.pid, metadata)
         self.sent = True
 
     def get_transfer_metric(self):

@@ -691,10 +691,12 @@ class ControlledScheduler:
                     "token_id": None if state.command["purpose"] == "REBUILD" else req.output_ids[-1],
                     "valid_tokens": item["target_valid_tokens"]}
                    for req, item in zip(state.reqs, state.command["requests"])]
-        self._report(command["batch_id"], "GPU_DONE", {
-            "reservation_id": state.command["reservation_id"], "results": results,
-            "gpu_forward_ms": gpu_forward_ms,
-            "duration_ms": (time.monotonic() - start) * 1000})
+        payload = {"reservation_id": state.command["reservation_id"], "results": results,
+                   "gpu_forward_ms": gpu_forward_ms, "duration_ms": (time.monotonic() - start) * 1000}
+        if self.ctx.stage == "P" and self._flag("prefill_stage_in_gpu_done"):
+            payload["staged"] = tuple(self.manager.pending_stages)
+            self.manager.pending_stages = []
+        self._report(command["batch_id"], "GPU_DONE", payload)
 
     def _start_run(self, command, state):
         """Execute a multi-step D grant: forward, report, then continue only on
@@ -794,6 +796,8 @@ class ControlledScheduler:
                     # Joins and new pages reach every rank through its own report.
                     self.step_box.publish(tag, step, reply.get("continue") is True and not reply.get("join")
                                           and not reply.get("extend") and not reply.get("leave"))
+            if join and self._flag("decode_wait_commands"):
+                reply = self._wait_at_boundary(command["batch_id"], step, reply)
             if join:
                 while reply.get("continue") in ("PARK", "SYNC"):
                     # Waiting at the boundary (GPU idle, synchronized above):
@@ -857,6 +861,48 @@ class ControlledScheduler:
     def _own_view(self, value):
         view = view_from_dict(value)
         return replace(view, block_tables={self.rank: view.block_tables[self.rank]})
+
+    def _accept_in_run(self, handoffs):
+        """Take, in command order, the backlog's commands a running D batch may interleave."""
+        while self.backlog and self.handoff_pending is None:
+            command = self.backlog[0]
+            kind = command["kind"]
+            state = self.prepared.get(command.get("batch_id"))
+            if not ((kind == "PREPARE" and command["batch_stage"] == "P")
+                    or (kind == "REVOKE" and state is not None and state.command["batch_stage"] == "P")
+                    or kind == "CLEANUP"
+                    or (kind == "HANDOFF" and command["batch_id"] in handoffs)):
+                break
+            self.backlog.pop(0)
+            tag = command.get("batch_id") or command.get("cleanup_id")
+            trace.ev("acc", tag, kind=kind, seq=command.get("command_seq"), in_run=True)
+            self._accept(command)
+            self._absorb_reply_commands()
+
+    def _wait_at_boundary(self, batch_id, step, reply):
+        """decode_wait_commands: wait at a step boundary through decode_resume alone. Each
+        call ACKs the commands taken, carries this rank's broker ACKs and returns the next
+        commands and broker state, exactly as a command long-poll would."""
+        while reply.get("continue") in ("PARK", "SYNC"):
+            if "commands" in reply:
+                self._poll_epoch = reply["epoch"]
+                self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
+                self.backlog.extend(reply["commands"])
+            handoffs = tuple(reply.get("handoffs", ()))
+            self._accept_in_run(handoffs)
+            self._progress()
+            self._absorb_reply_commands()
+            acks = tuple(getattr(self.manager, "pending_acks", ()))
+            after = self.backlog[-1]["command_seq"] if self.backlog else self.cursor
+            reply = self.rpc("decode_resume", self.rank, self.pid, batch_id, step, 100, after,
+                             self._poll_epoch, handoffs, self.cursor or None, acks)
+            if acks:
+                del self.manager.pending_acks[:len(acks)]
+        if "commands" in reply:
+            self._poll_epoch = reply["epoch"]
+            self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
+            self.backlog.extend(reply["commands"])
+        return reply
 
     def _service_in_run(self, handoffs):
         """decode_step_join, at a decode-run step boundary (GPU idle): take, in command
