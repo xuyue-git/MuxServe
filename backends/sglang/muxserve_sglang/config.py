@@ -134,6 +134,10 @@ class DeploymentConfig:
     # in segments, Head-wise attention eager at the breaks) for prompts of
     # exactly PREFILL_GRAPH_TOKENS; other lengths stay eager.
     prefill_cuda_graph: bool = False
+    # prefill_cuda_graph: each layer's graph break checks the grant once per forward,
+    # keeps Q/K/V as views and writes attention straight into SGLang's output buffer
+    # (fewer copies and Python per layer; same results).
+    prefill_break_slim: bool = False
     # prefill_cuda_graph: the token counts captured instead of PREFILL_GRAPH_TOKENS
     # (strictly increasing, 16..8192, at most 12). A prefill pads up to the nearest
     # one, within SGLang's 2x padding limit; Head-wise attention still sees only the
@@ -431,7 +435,7 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "decode_prepare_light", "decode_run_merge", "capacity_recovery_all_decode",
                  "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline",
                  "decode_step_leave", "decode_wait_commands", "prefill_stage_in_gpu_done",
-                 "prefill_start_unparked", "handoff_local_success"):
+                 "prefill_start_unparked", "handoff_local_success", "prefill_break_slim"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_kv_per_page and not config.decode_step_join:
@@ -446,6 +450,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
     if config.decode_wait_commands and not (config.decode_step_join and config.handoff_ack_in_poll):
         raise IntegrationError("INVALID_CONFIG", "decode_wait_commands requires decode_step_join and "
                                                  "handoff_ack_in_poll")
+    if config.prefill_break_slim and not config.prefill_cuda_graph:
+        raise IntegrationError("INVALID_CONFIG", "prefill_break_slim requires prefill_cuda_graph")
     if config.prefill_start_unparked and not config.decode_run_park:
         raise IntegrationError("INVALID_CONFIG", "prefill_start_unparked requires decode_run_park")
     if config.handoff_local_success and not config.decode_wait_commands:

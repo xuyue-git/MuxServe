@@ -194,12 +194,45 @@ class FakeTensor:
         shape.pop(dim)
         return FakeTensor(shape, self.name)
 
+    # prefill_break_slim: dense views, slices, in-place copies (copies are recorded).
+    def dim(self):
+        return len(self.shape)
+
+    def stride(self, dim):
+        strides, step = [], 1
+        for size in reversed(self.shape):
+            strides.insert(0, step)
+            step *= size
+        return strides[dim]
+
+    def view(self, *shape):
+        return self.reshape(*shape)
+
+    def is_contiguous(self):
+        return True
+
+    def new_empty(self, shape):
+        return FakeTensor(shape, 'new')
+
+    def __getitem__(self, item):
+        rows = range(self.shape[0])[item]
+        return FakeTensor((len(rows),) + self.shape[1:], self.name)
+
+    def copy_(self, other):
+        assert tuple(other.shape) == self.shape, (other.shape, self.shape)
+        COPIES.append(self.shape)
+        return self
+
+
+COPIES = []
+
 
 def attention_backend(stores, breakable):
     tree = ast.parse((ROOT / 'muxserve_sglang/sglang_attention.py').read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'HeadwiseAttentionBackend')
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in (
-        'forward', '_forward_extend_graph_break', '_extend_attention', '_validate_layer', 'init_forward_metadata')]
+        'forward', '_forward_extend_graph_break', '_extend_attention', '_validate_layer', 'init_forward_metadata',
+        '_break_slim', '_graph_break_slim', '_head_view', '_attention_into')]
     cls.bases = []
     torch = SimpleNamespace(Tensor=FakeTensor, float16='fp16',
                             cuda=SimpleNamespace(is_current_stream_capturing=lambda: False),
@@ -218,9 +251,12 @@ def attention_backend(stores, breakable):
 
 
 class PrefillGraphBreakAttentionChecks(unittest.TestCase):
+    SLIM = False
+
     def setup(self, bound=True):
         stores, breakable = [], [True]
         backend = attention_backend(stores, breakable).__new__(attention_backend(stores, breakable))
+        backend._slim = self.SLIM
         pool, _, live = fixture(Uploads(), 'PREFILL', (33,), layers=3)
         if not bound:
             pool._bound = None
@@ -271,6 +307,50 @@ class PrefillGraphBreakAttentionChecks(unittest.TestCase):
         backend.token_to_kv_pool = decode
         with self.assertRaises(IntegrationError):
             backend.forward(*self.qkv(1), layer, static, True)
+
+
+class SlimGraphBreakAttentionChecks(PrefillGraphBreakAttentionChecks):
+    """prefill_break_slim: the same checks, plus its own output handling."""
+    SLIM = True
+
+    def test_attention_lands_in_the_graph_output_buffer(self):
+        backend, pool, live, static, layer, stores = self.setup()
+        backend.init_forward_metadata(live)
+        buffer = FakeTensor((33, 384), 'graph-out')
+        static = SimpleNamespace(**{**vars(static), '_attn_output': buffer})
+        del COPIES[:]
+        out = backend.forward(*self.qkv(), layer, static, True)
+        self.assertIs(out, buffer)  # SGLang skips its own copy of the result
+        self.assertEqual(COPIES, [(33, 3, 128)])  # one copy: the attention output itself
+        self.assertIs(stores[0], pool.layer_slots(1))
+        # Without a usable buffer the result is a fresh tensor of the same shape.
+        static.__dict__['_attn_output'] = FakeTensor((32, 384), 'short')
+        self.assertEqual(backend.forward(*self.qkv(), layer, static, True).shape, (33, 384))
+
+    def test_each_request_attends_only_to_itself(self):
+        backend, pool, live, static, layer, stores = self.setup()
+        segments = []
+        backend._attention_into = lambda q, k, v, lengths, scaling, target: segments.append(
+            (tuple(lengths), target.shape))
+        backend.init_forward_metadata(live)
+        backend.forward(*self.qkv(), layer, static, True)
+        self.assertEqual(segments, [((33,), (33, 3, 128))])
+        del COPIES[:]
+        target = FakeTensor((33, 3, 128), 'target')
+        type(backend)._attention_into(*[FakeTensor((33, 3, 128), n) for n in 'qkv'], (20, 13), 0.1, target)
+        self.assertEqual(COPIES, [(20, 3, 128), (13, 3, 128)])
+
+    def test_grant_geometry_is_checked_once_per_forward(self):
+        backend, pool, live, static, layer, stores = self.setup()
+        backend.init_forward_metadata(live)
+        backend.forward(*self.qkv(), layer, static, True)
+        self.assertIs(backend._slim_checked, pool.bound_forward)
+        # A later layer of the same forward skips the grant-mode and dtype checks.
+        pool.bound_forward.extend_checked = False
+        backend.forward(*self.qkv(), layer, static, True)
+        backend._slim_checked = None  # a new forward checks again
+        with self.assertRaises(IntegrationError):
+            backend.forward(*self.qkv(), layer, static, True)
 
 
 class GraphReplayMetadataChecks(unittest.TestCase):

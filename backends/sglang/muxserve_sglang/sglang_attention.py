@@ -170,6 +170,8 @@ class HeadwiseAttentionBackend(AttentionBackend):
             shaped = [tensor.reshape(rows, heads, 128) for tensor in (q, k, v)]
             return self._extend_attention(*shaped, (rows,), layer.scaling)
         bound = pool.bound_forward
+        if self._break_slim():
+            return self._graph_break_slim(q, k, v, layer, forward_batch, bound, heads, rows)
         _require(bound.mode in ("PREFILL", "REBUILD") and bound.extend_checked and bound.batch is not None,
                  "Prefill graph replay requires the validated live grant", "FORWARD_MISMATCH")
         _require(forward_batch.batch_size == len(bound.req_pool_indices)
@@ -186,6 +188,72 @@ class HeadwiseAttentionBackend(AttentionBackend):
         q, k, v = shaped
         ops.store(k, v, pool.pool_key, pool.pool_value, pool.layer_slots(layer.layer_id))
         return self._extend_attention(q, k, v, bound.write_lengths, layer.scaling)
+
+    # ---- prefill_break_slim: the same graph break with less per-layer work ----
+    # The grant's mode and Q/K/V dtype/device are checked once per forward (its first
+    # layer); every layer still checks the batch geometry, its row count and shapes. Q/K/V stay views
+    # of the projection output (the Head-wise store takes a token stride, attention any
+    # strides), and attention writes straight into the output buffer SGLang's graph
+    # break provides, so SGLang's own copy of the result is skipped.
+    def _break_slim(self):
+        slim = getattr(self, "_slim", None)
+        if slim is None:
+            try:
+                from .sglang_hooks import context
+                slim = bool(getattr(context().config, "prefill_break_slim", False))
+            except Exception:
+                slim = False
+            self._slim = slim
+        return slim
+
+    def _graph_break_slim(self, q, k, v, layer, forward_batch, bound, heads, rows):
+        pool = self.token_to_kv_pool
+        if getattr(self, "_slim_checked", None) is not bound:
+            _require(bound.mode in ("PREFILL", "REBUILD") and bound.extend_checked and bound.batch is not None,
+                     "Prefill graph replay requires the validated live grant", "FORWARD_MISMATCH")
+            for tensor in (q, k, v):
+                _require(isinstance(tensor, torch.Tensor) and tensor.dtype == torch.float16
+                         and tensor.device == pool.device, "Q/K/V must use the pool CUDA device and FP16")
+            self._slim_checked = bound
+        _require(forward_batch.batch_size == len(bound.req_pool_indices)
+                 and getattr(forward_batch, "global_num_token_non_padded_cpu", None) == bound.total_written
+                 and rows == bound.total_written,
+                 "Prefill graph replay geometry differs from the grant", "FORWARD_MISMATCH")
+        shapes = ((rows, heads, 128), (rows, heads * 128))
+        _require(tuple(q.shape) in shapes and tuple(k.shape) in shapes and tuple(v.shape) in shapes,
+                 "Q/K/V geometry mismatch")
+        q, k, v = (self._head_view(tensor, rows, heads) for tensor in (q, k, v))
+        ops.store(k, v, pool.pool_key, pool.pool_value, pool.layer_slots(layer.layer_id))
+        out = getattr(forward_batch, "_attn_output", None)
+        if out is None or tuple(out.shape) != (rows, heads * 128) or not out.is_contiguous():
+            out = q.new_empty((rows, heads * 128))
+        self._attention_into(q, k, v, bound.write_lengths, layer.scaling, out.view(rows, heads, 128))
+        return out
+
+    @staticmethod
+    def _head_view(tensor, rows, heads):
+        """[rows, heads, 128] without a copy when the last dimension is dense."""
+        if tensor.dim() == 3 and tensor.stride(2) == 1 and tensor.stride(1) == 128:
+            return tensor
+        if tensor.stride(-1) == 1:
+            try:
+                return tensor.view(rows, heads, 128)
+            except RuntimeError:
+                pass
+        return tensor.reshape(rows, heads, 128).contiguous()
+
+    @staticmethod
+    def _attention_into(q, k, v, write_lengths, scaling, target):
+        """Causal attention of each request's own tokens, written into ``target``
+        ([rows, heads, 128]); requests never attend to each other."""
+        start = 0
+        for length in write_lengths:
+            end = start + length
+            output = scaled_dot_product_attention(
+                q[start:end].transpose(0, 1).unsqueeze(0), k[start:end].transpose(0, 1).unsqueeze(0),
+                v[start:end].transpose(0, 1).unsqueeze(0), dropout_p=0.0, is_causal=True, scale=scaling)
+            target[start:end].copy_(output.squeeze(0).transpose(0, 1))
+            start = end
 
     def _forward_decode_static(self, q, k, v, layer, forward_batch, save_kv_cache, kwargs):
         """Graph warmup/capture body; replay re-executes exactly these kernels."""
