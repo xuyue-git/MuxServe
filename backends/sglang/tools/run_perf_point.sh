@@ -40,7 +40,10 @@
 # gateway_process=true), LEAN_EVENTS=1 (events passed on without deep copies: config
 # event_lean_copies=true), DRIVER_LEAN=1 (fewer, shorter driver lock holds: config
 # driver_lean_locking=true), OWNER_SWITCH_US=500 (owner interpreter switch interval:
-# config owner_switch_interval_us).
+# config owner_switch_interval_us). STEP_HISTORY=1 (ADBS learns the batch size from every
+# decode step, as the source: config policy_step_history=true). ADBS_LOG=1 (one
+# POLICY_ADJUST line per 8 s ADBS re-sizing in the launcher log: config
+# policy_log_adjustments=true).
 # Optional env: GPUS (default 1,2,3,4), MODELS_ROOT, REFERENCE (bench JSON to
 # compare output tokens against), KV_FRACTION (size the KV pool like original
 # MuxServe: gpu_memory_utilization x total GPU memory, instead of kv_bytes_per_rank),
@@ -165,6 +168,8 @@ GATEWAY_PROC="${GATEWAY_PROC:-}"
 LEAN_EVENTS="${LEAN_EVENTS:-}"
 DRIVER_LEAN="${DRIVER_LEAN:-}"
 OWNER_SWITCH_US="${OWNER_SWITCH_US:-}"
+STEP_HISTORY="${STEP_HISTORY:-}"
+ADBS_LOG="${ADBS_LOG:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -172,7 +177,7 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" "$STEP_JOIN" "$KV_PER_PAGE" "$STEP_PIPELINE" "$STEP_LEAVE" "$KV_GROW_PAGES" "$WAIT_COMMANDS" "$STAGE_IN_DONE" "$DRIVER_INTERVAL_MS" "$PREFILL_GRAPH_TOKENS" "$START_UNPARKED" "$HANDOFF_LOCAL" "$ARRIVAL_RATES" "$BREAK_SLIM" "$OVERLAP" "$KV_EARLY_FREE" "$GATEWAY_PROC" "$LEAN_EVENTS" "$DRIVER_LEAN" "$OWNER_SWITCH_US" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" "$STEP_JOIN" "$KV_PER_PAGE" "$STEP_PIPELINE" "$STEP_LEAVE" "$KV_GROW_PAGES" "$WAIT_COMMANDS" "$STAGE_IN_DONE" "$DRIVER_INTERVAL_MS" "$PREFILL_GRAPH_TOKENS" "$START_UNPARKED" "$HANDOFF_LOCAL" "$ARRIVAL_RATES" "$BREAK_SLIM" "$OVERLAP" "$KV_EARLY_FREE" "$GATEWAY_PROC" "$LEAN_EVENTS" "$DRIVER_LEAN" "$OWNER_SWITCH_US" "$STEP_HISTORY" "$ADBS_LOG" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
@@ -184,7 +189,7 @@ import json, sys
  step_join, kv_per_page, step_pipeline, step_leave, grow_pages,
  wait_commands, stage_in_done, driver_interval, graph_tokens, start_unparked,
  handoff_local, arrival_rates, break_slim, overlap, kv_early_free, gateway_proc, lean_events,
- driver_lean, owner_switch_us) = sys.argv[1:]
+ driver_lean, owner_switch_us, step_history, adbs_log) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -267,6 +272,10 @@ if driver_lean:
     config["driver_lean_locking"] = True
 if owner_switch_us:
     config["owner_switch_interval_us"] = int(owner_switch_us)
+if step_history:
+    config["policy_step_history"] = True
+if adbs_log:
+    config["policy_log_adjustments"] = True
 config.pop("policy_arrival_rates", None)
 if arrival_rates:
     config["policy_arrival_rates"] = [[item.split("=")[0], float(item.split("=")[1])]
@@ -343,7 +352,9 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "gateway_proc=%s" % config.get("gateway_process", False),
       "lean_events=%s" % config.get("event_lean_copies", False),
       "driver_lean=%s" % config.get("driver_lean_locking", False),
-      "switch_us=%s" % config.get("owner_switch_interval_us", 0))
+      "switch_us=%s" % config.get("owner_switch_interval_us", 0),
+      "step_history=%s" % config.get("policy_step_history", False),
+      "adbs_log=%s" % config.get("policy_log_adjustments", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

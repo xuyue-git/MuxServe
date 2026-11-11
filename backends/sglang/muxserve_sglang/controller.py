@@ -309,6 +309,7 @@ class MuxController:
             rates=deepcopy(arrival_rates), expected_lengths=deepcopy(expected_lengths),
             maximum_batch=config.max_model_inflight, clock=clock)
         self.policy = ADBS(**self._policy_parameters)
+        self.policy.log_adjustments = config.policy_log_adjustments
         self._tick_count = 0
         self._tick_duration_ms = 0.0
         # inline_start: allowed only while a scheduling driver owns grants
@@ -514,6 +515,7 @@ class MuxController:
             # initialization must not train the serving policy or inflate its
             # request/compute metrics. Startup evidence records its own work.
             self.policy = ADBS(**self._policy_parameters)
+            self.policy.log_adjustments = self.config.policy_log_adjustments
             self._tick_count = 0
             self._tick_duration_ms = 0.0
             self.recovery_cycles = self.recovery_suspensions = 0
@@ -2886,6 +2888,9 @@ class MuxController:
 
     def _apply_run_step(self, group: _Group, batch: _Batch, step: int, results) -> None:
         batch.run_applied = step
+        if self.config.policy_step_history:
+            # The source's ADBS learns each model's batch size from every decode step.
+            self.policy.record_step(group.model_id, len(batch.members(step)))
         for ref, result in zip(batch.members(step), results):
             request = self._request(group.model_id, ref.request_id)
             published = batch.run_published[ref.request_id]
@@ -3242,7 +3247,9 @@ class MuxController:
                                                 default=None),
                              reserved_blocks_by_rank=getattr(batch, "reserved_blocks", {}),
                              released_blocks_by_rank=released, failure_reason=reason)
-        self.policy.feedback(item)
+        # policy_step_history: a multi-step run already gave the policy each of its steps.
+        self.policy.feedback(item, record_history=not (self.config.policy_step_history
+                                                       and batch.plan.stage == "D" and batch.plan.steps > 1))
         batch.feedback_sent = True
 
     def _stop_request(self, request: _Request, reason: str) -> dict:

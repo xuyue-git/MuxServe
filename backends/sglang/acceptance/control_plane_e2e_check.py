@@ -455,6 +455,8 @@ def main():
     parser.add_argument("--lean-events", action="store_true", help="config event_lean_copies=true")
     parser.add_argument("--driver-lean", action="store_true", help="config driver_lean_locking=true")
     parser.add_argument("--switch-us", type=int, default=0, help="config owner_switch_interval_us")
+    parser.add_argument("--step-history", action="store_true", help="config policy_step_history=true")
+    parser.add_argument("--adbs-log", action="store_true", help="config policy_log_adjustments=true")
     parser.add_argument("--stage-in-done", action="store_true", help="config prefill_stage_in_gpu_done=true")
     parser.add_argument("--driver-interval-ms", type=int, default=0, help="config driver_min_interval_ms")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
@@ -511,7 +513,9 @@ def main():
                               kv_release_at_finish=args.kv_early_free,
                               gateway_process=args.gateway_proc, event_lean_copies=args.lean_events,
                               driver_lean_locking=args.driver_lean,
-                              owner_switch_interval_us=args.switch_us)
+                              owner_switch_interval_us=args.switch_us,
+                              policy_step_history=args.step_history,
+                              policy_log_adjustments=args.adbs_log)
     if args.switch_us:
         sys.setswitchinterval(args.switch_us / 1e6)  # as the launcher does in the owner
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)

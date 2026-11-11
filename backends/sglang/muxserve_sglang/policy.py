@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
+import json
 import time
 from . import REPOSITORY_ROOT, original_muxserve_path
 from .contracts import IntegrationError
@@ -158,8 +159,9 @@ class ADBS:
             for stage in ("P", "D")} for m in self.models}
         self.fragment, self.clock, self.last_adjustment = 0, clock, clock()
         self.cursors = {'P': 0, 'D': 0}
+        self.log_adjustments = False
 
-    def feedback(self, item: BatchFeedback) -> None:
+    def feedback(self, item: BatchFeedback, record_history: bool = True) -> None:
         self.feedback_history.append(item)
         totals = self.feedback_totals[item.model_id][item.stage][item.purpose]
         totals["batches"] += 1
@@ -176,8 +178,13 @@ class ADBS:
         totals["input_tokens"] += item.input_tokens
         totals["output_tokens"] += item.output_tokens
         # Source updates hist_num_seqs only on completed D batches (line1088).
-        if item.stage == 'D' and item.succeeded:
+        if item.stage == 'D' and item.succeeded and record_history:
             self.histories[item.model_id].append(item.admitted)
+
+    def record_step(self, model_id: str, batch_size: int) -> None:
+        """One decode step of ``batch_size`` requests: the source's hist_num_seqs gets
+        one entry per finished decode batch, and each of its decode batches is a step."""
+        self.histories[model_id].append(batch_size)
 
     def adjust(self, snapshot: PolicySnapshot, now=None) -> None:
         now = self.clock() if now is None else now
@@ -191,6 +198,12 @@ class ADBS:
             self.blocks_per_group, waiting, running, self.fragment)
         self.adjustments.append({'at': now, 'before': before, 'after': dict(self.limits),
             'reason': 'source_8s_block_redistribution', 'fragment': self.fragment})
+        if self.log_adjustments:
+            averages = {m: round(sum(h) / len(h), 2) if h else None for m, h in self.histories.items()}
+            print('POLICY_ADJUST ' + json.dumps({'t': round(now, 1), 'before': before,
+                                                 'after': dict(self.limits), 'avg_batch': averages,
+                                                 'samples': {m: len(h) for m, h in self.histories.items()},
+                                                 'waiting': waiting, 'running': running}), flush=True)
         self.last_adjustment = now
 
     def suggestions(self, snapshot: PolicySnapshot) -> tuple[BatchSuggestion, ...]:

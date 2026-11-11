@@ -20,6 +20,7 @@ from muxserve_sglang.contracts import IntegrationError
 from muxserve_sglang.events import EventReceiver, RuntimeOutbox
 from muxserve_sglang.gateway_proc import RemoteGatewayState
 
+import decode_run_check as drc  # module import: its TestCases are not collected here
 from decode_run_check import Sim
 
 
@@ -91,6 +92,46 @@ class LeanDriverChecks(unittest.TestCase):
         sim.controller.tick()
         self.assertTrue(request.pending_reason == "timeout" or request.state == "TIMED_OUT",
                         (request.pending_reason, request.state))
+
+
+class StepHistoryChecks(unittest.TestCase):
+    """policy_step_history: ADBS hears every decode-run step, as the source hears every
+    decode batch; without it a run is one entry (its members at the end)."""
+
+    step = drc.StepJoinChecks.step
+    batch = staticmethod(drc.StepJoinChecks.batch)
+
+    def run_two_steps(self, **flags):
+        sim = Sim(run_steps=2, **flags)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 2)
+        for step, token in ((1, 12), (2, 13)):
+            for rank in range(sim.tp):
+                self.step(sim, plan.batch_id, rank, step, {"r": token})
+        drc.StepJoinChecks.finish(self, sim, plan.batch_id, reservation, 2, {"r": 13})
+        sim.controller.tick()
+        return list(sim.controller.policy.histories["a"])
+
+    @staticmethod
+    def join_flags():
+        return dict(drc.StepJoinChecks.JOIN, decode_leader_reports=True, decode_step_leave=True)
+
+    def test_each_run_step_is_one_history_entry(self):
+        self.assertEqual(self.run_two_steps(policy_step_history=True, **self.join_flags()), [1, 1])
+
+    def test_without_the_switch_a_run_is_one_entry(self):
+        self.assertEqual(self.run_two_steps(**self.join_flags()), [1])
+
+    def test_adjustment_line_is_printed_only_with_the_switch(self):
+        import contextlib, io
+        for flag, expected in ((True, 1), (False, 0)):
+            sim = Sim(run_steps=2, policy_log_adjustments=flag)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                sim.clock.now += 9
+                sim.controller.tick()
+            self.assertEqual(out.getvalue().count("POLICY_ADJUST "), expected)
 
 
 class _Conn:

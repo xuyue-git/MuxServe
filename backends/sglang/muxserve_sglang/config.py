@@ -344,6 +344,14 @@ class DeploymentConfig:
     # 0 keeps Python's 5000. A thread that releases the owner lock otherwise keeps the
     # interpreter for up to 5 ms before the waiter it woke can run.
     owner_switch_interval_us: int = 0
+    # ADBS learns each model's average decode batch from every decode-run step, as the
+    # source appends hist_num_seqs on every decode batch (scheduler.py:1088), instead of
+    # one entry per run holding the members left at the run's end. With step join/leave
+    # those entries understate busy models, and the 8 s re-sizing moves their share away.
+    policy_step_history: bool = False
+    # Print one POLICY_ADJUST line per 8 s ADBS re-sizing (limits before/after, average
+    # batch, waiting and running), like the source's "Model ... util ... max_bs" lines.
+    policy_log_adjustments: bool = False
     # Decode runs keep running while a prefill runs: the prefill STARTs without
     # taking decode credits, no run parks for it, and new decode batches are not held
     # back; MPS shares the GPUs between them. Prefills still run one at a time, and
@@ -466,7 +474,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "decode_step_leave", "decode_wait_commands", "prefill_stage_in_gpu_done",
                  "prefill_start_unparked", "handoff_local_success", "prefill_break_slim",
                  "prefill_overlap_decode", "kv_release_at_finish", "gateway_process",
-                 "event_lean_copies", "driver_lean_locking"):
+                 "event_lean_copies", "driver_lean_locking", "policy_step_history",
+                 "policy_log_adjustments"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_kv_per_page and not config.decode_step_join:
