@@ -30,6 +30,9 @@
 # prefill starts without waiting for every run to park: config prefill_start_unparked=true;
 # needs PARK). HANDOFF_LOCAL=1 (a waiting D rank pops a handoff once it validated it, ACKs
 # ride in HANDOFF_READY: config handoff_local_success=true; needs WAIT_COMMANDS).
+# ARRIVAL_RATES=llama7b=2.0,llama13b=1.23,... (each model's arrival rate for the ADBS
+# starting request limits, as the original reads from its workload: config
+# policy_arrival_rates).
 # Optional env: GPUS (default 1,2,3,4), MODELS_ROOT, REFERENCE (bench JSON to
 # compare output tokens against), KV_FRACTION (size the KV pool like original
 # MuxServe: gpu_memory_utilization x total GPU memory, instead of kv_bytes_per_rank),
@@ -146,6 +149,7 @@ DRIVER_INTERVAL_MS="${DRIVER_INTERVAL_MS:-}"
 PREFILL_GRAPH_TOKENS="${PREFILL_GRAPH_TOKENS:-}"
 START_UNPARKED="${START_UNPARKED:-}"
 HANDOFF_LOCAL="${HANDOFF_LOCAL:-}"
+ARRIVAL_RATES="${ARRIVAL_RATES:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -153,7 +157,7 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" "$STEP_JOIN" "$KV_PER_PAGE" "$STEP_PIPELINE" "$STEP_LEAVE" "$KV_GROW_PAGES" "$WAIT_COMMANDS" "$STAGE_IN_DONE" "$DRIVER_INTERVAL_MS" "$PREFILL_GRAPH_TOKENS" "$START_UNPARKED" "$HANDOFF_LOCAL" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" "$STEP_JOIN" "$KV_PER_PAGE" "$STEP_PIPELINE" "$STEP_LEAVE" "$KV_GROW_PAGES" "$WAIT_COMMANDS" "$STAGE_IN_DONE" "$DRIVER_INTERVAL_MS" "$PREFILL_GRAPH_TOKENS" "$START_UNPARKED" "$HANDOFF_LOCAL" "$ARRIVAL_RATES" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
@@ -164,7 +168,7 @@ import json, sys
  inflight, run_merge, pair_hold_ms, max_new, timeout_ms, gateway, recovery_all_decode, kv_trim,
  step_join, kv_per_page, step_pipeline, step_leave, grow_pages,
  wait_commands, stage_in_done, driver_interval, graph_tokens, start_unparked,
- handoff_local) = sys.argv[1:]
+ handoff_local, arrival_rates) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -233,6 +237,10 @@ if start_unparked:
     config["prefill_start_unparked"] = True
 if handoff_local:
     config["handoff_local_success"] = True
+config.pop("policy_arrival_rates", None)
+if arrival_rates:
+    config["policy_arrival_rates"] = [[item.split("=")[0], float(item.split("=")[1])]
+                                      for item in arrival_rates.split(",")]
 if graph_tokens:
     config["prefill_graph_tokens"] = [int(t) for t in graph_tokens.split(",")]
 config.pop("prefill_pair_hold_ms", None)
@@ -297,7 +305,8 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "driver_interval_ms=%s" % config.get("driver_min_interval_ms", 0),
       "prefill_graph_tokens=%s" % ",".join(map(str, config.get("prefill_graph_tokens", []))),
       "start_unparked=%s" % config.get("prefill_start_unparked", False),
-      "handoff_local=%s" % config.get("handoff_local_success", False))
+      "handoff_local=%s" % config.get("handoff_local_success", False),
+      "arrival_rates=%s" % ",".join("%s=%g" % (m, r) for m, r in config.get("policy_arrival_rates", [])))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

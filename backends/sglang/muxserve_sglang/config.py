@@ -322,6 +322,11 @@ class DeploymentConfig:
     # same prefill batch. The pair then decodes and finishes together, as under
     # original MuxServe, whose scheduler takes everything waiting. 0 is off.
     prefill_pair_hold_ms: int = 0
+    # Each model's request arrival rate (req/s), as the original scheduler reads it
+    # from its workload (workload_infos["rates"]): ADBS sizes each model's starting
+    # request limit by rate x KV per token, exactly as init_max_num_seqs does. Pairs
+    # (model_id, rate) covering every model; empty keeps equal rates.
+    policy_arrival_rates: tuple = ()
 
     @property
     def pool_blocks_per_rank(self) -> int:
@@ -370,6 +375,12 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         if type(fraction) not in (int, float) or not 0 < fraction < 1:
             raise IntegrationError("INVALID_CONFIG", "kv_memory_fraction must be in (0, 1)")
     models = tuple(ModelDeployment(**item) for item in raw.pop("models"))
+    rates = raw.get("policy_arrival_rates")
+    if isinstance(rates, dict):
+        rates = list(rates.items())
+    if isinstance(rates, list):  # JSON: a list of [model_id, rate]; the config stays hashable
+        raw["policy_arrival_rates"] = tuple(sorted(tuple(item) if isinstance(item, list) else item
+                                                   for item in rates))
     if isinstance(raw.get("prefill_graph_tokens"), list):
         raw["prefill_graph_tokens"] = tuple(raw["prefill_graph_tokens"])  # JSON list; the config stays hashable
     config = DeploymentConfig(models=models, **raw)
@@ -397,6 +408,12 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "decode_run_park must be a boolean")
     if type(config.prefill_cuda_graph) is not bool:
         raise IntegrationError("INVALID_CONFIG", "prefill_cuda_graph must be a boolean")
+    rates = config.policy_arrival_rates
+    if rates and (not isinstance(rates, tuple)
+                  or not all(isinstance(item, tuple) and len(item) == 2 for item in rates)
+                  or sorted(model for model, _ in rates) != sorted(m.model_id for m in config.models)
+                  or any(type(rate) not in (int, float) or not 0 < rate < 1e6 for _, rate in rates)):
+        raise IntegrationError("INVALID_CONFIG", "policy_arrival_rates must give every model one positive rate")
     tokens = config.prefill_graph_tokens
     if (not isinstance(tokens, (tuple, list)) or len(tokens) > 12
             or any(type(t) is not int or not 16 <= t <= 8192 for t in tokens)

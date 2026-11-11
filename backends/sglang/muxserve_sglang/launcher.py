@@ -327,7 +327,10 @@ class Supervisor:
             pool_mode=self.config.kv_pool_mode,
             batch_history_limit=self.config.batch_history_limit,
             model_ids=tuple(model.model_id for model in self.config.models))
-        self.controller = MuxController(self.config, store, initializing=True)
+        rates = dict(getattr(self.config, "policy_arrival_rates", ()) or ()) or None
+        self.controller = MuxController(self.config, store, initializing=True, arrival_rates=rates)
+        print("POLICY_LIMITS " + json.dumps({"rates": rates, "limits": dict(self.controller.policy.limits)}),
+              flush=True)
         self.gpu = GPUStorage(store, {rank: rank for rank in range(self.config.tp_size)})
         self.rpc = StorageRPCServer(store, self.gpu, str(self.directory / "store.sock"), self.authkey,
             extra_methods=self.controller.rpc_methods(), owner_close=self._close_barrier,

@@ -66,6 +66,18 @@ class DecodeGraphConfigChecks(unittest.TestCase):
             with self.assertRaises(IntegrationError):
                 self.config(**bad)
 
+    def test_arrival_rates_cover_every_model(self):
+        self.assertEqual(self.config().policy_arrival_rates, ())
+        ids = [m.model_id for m in self.config().models]
+        good = self.config(policy_arrival_rates=[[m, 1.0 + i] for i, m in enumerate(ids)])
+        self.assertEqual(dict(good.policy_arrival_rates), {m: 1.0 + i for i, m in enumerate(ids)})
+        self.assertEqual(self.config(policy_arrival_rates={m: 2 for m in ids}).policy_arrival_rates,
+                         tuple(sorted((m, 2) for m in ids)))
+        for bad in ([[ids[0], 1.0]], [[m, 0] for m in ids], [[m, "1"] for m in ids],
+                    [[m, 1.0] for m in ids] + [["other", 1.0]]):
+            with self.assertRaises(IntegrationError):
+                self.config(policy_arrival_rates=bad)
+
     def test_prefill_graph_tokens_need_the_graph_and_increase(self):
         self.assertEqual(tuple(self.config().prefill_graph_tokens), ())
         good = self.config(prefill_cuda_graph=True, prefill_graph_tokens=[64, 128, 512, 2048])
