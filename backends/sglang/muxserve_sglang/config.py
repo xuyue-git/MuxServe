@@ -273,8 +273,9 @@ class DeploymentConfig:
     # for the run: no prefill waiting for credits, no prefill work for its D ranks, no
     # request to join, no page needed, nothing stopping). The leader then runs on and
     # sends that step's report while the next forward runs; any other boundary is
-    # decided as before. Anything new is acted on one step later. Requires
-    # decode_leader_reports.
+    # decided as before. Anything new is acted on one step later. While a prefill of any
+    # model prepares, no boundary is granted ahead, so runs park at their next boundary
+    # once it is ready. Requires decode_leader_reports.
     decode_step_pipeline: bool = False
     # A request that finishes (or is cancelled, suspended or times out) leaves a running
     # decode run at the next step boundary, as the original drops it from its running

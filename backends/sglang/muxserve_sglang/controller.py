@@ -2466,6 +2466,10 @@ class MuxController:
             return False
         if self._run_continues(group, batch, step, False) is not True:
             return False
+        if self._prefill_preparing():
+            # A prefill of any model will soon need every run to park: decide the next
+            # boundary then, rather than run one more granted step before parking.
+            return False
         if not self.config.decode_step_join:
             return True
         if (self._d_work_pending(group) or self._join_candidates(group, batch)
@@ -2474,6 +2478,10 @@ class MuxController:
         return not (self.config.decode_kv_per_page and any(
             batch.run_start_valid[ref.request_id] + step + 1 > batch.views[ref.request_id].capacity_tokens
             for ref in batch.members(step + 1)))
+
+    def _prefill_preparing(self) -> bool:
+        return any(b.plan.stage == "P" and b.status == "PREPARING"
+                   for g in self.groups.values() for b in g.batches.values())
 
     def _leavers(self, group: _Group, batch: _Batch) -> list:
         """decode_step_leave: members that end in this run (finished, stopping, expired)."""

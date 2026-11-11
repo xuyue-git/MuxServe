@@ -1038,6 +1038,20 @@ class StepPipelineChecks(unittest.TestCase):
         self.assertIs(aheads[11], False)
         self.assertEqual(reply["extend"][0]["capacity_tokens"], 32)
 
+    def test_another_models_prefill_in_preparation_withholds_the_grant(self):
+        sim = Sim(("a", "b"), run_steps=8, **self.FLAGS)
+        sim.submit("a", "r", max_new=12)
+        sim.prefill("a", "r", 11)
+        plan, _ = sim.prepare_decode("a", "r", 8)
+        self.assertIs(self.step(sim, plan.batch_id, 0, 1, {"r": 12})["ahead"], True)
+        sim.submit("b", "x", max_new=6)
+        out = sim.controller.request_output("b", "x")
+        sim.controller.prepare_batch(BatchPlan(sim.group("b"), "p-x", "b", "P", (RequestRef("x", out["attempt"], 0),)))
+        # Step 2 was granted before: it runs on; boundary 3 waits to be decided, so the
+        # run can park there as soon as the prefill is ready.
+        reply = self.step(sim, plan.batch_id, 0, 2, {"r": 13}, pregranted=True)
+        self.assertEqual((reply["continue"], reply["ahead"]), (True, False))
+
     def test_ungranted_or_follower_pregranted_reports_are_refused(self):
         sim, plan, _ = self.running()
         expect("REPORT_GAP", lambda: self.step(sim, plan.batch_id, 0, 1, {"r": 12}, pregranted=True))
