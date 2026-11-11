@@ -1427,7 +1427,14 @@ class MuxController:
             if not group.outbox.owner_can_complete(batch.holder):
                 raise IntegrationError("EVENT_BACKPRESSURE", "Start grant window unavailable")
             deferred = (self.config.decode_run_park and batch.plan.stage == "P"
-                        and batch.plan.batch_id not in self.credits.leases)
+                        and batch.plan.batch_id not in self.credits.leases
+                        and not self.config.prefill_overlap_decode)
+            if self.config.prefill_overlap_decode and batch.plan.stage == "P" and any(
+                    other is not batch and other.plan.stage == "P" and other.status == "RUNNING"
+                    for g in self.groups.values() for other in g.batches.values()):
+                # prefill_overlap_decode: decode runs share the GPUs with the prefill, but
+                # prefills still go one at a time, as each takes every SM part.
+                raise IntegrationError("NOT_READY", "Another prefill is running")
             if deferred:
                 # Running decode runs park at their next step boundary and
                 # release credits; the driver retries this START then.
@@ -2590,7 +2597,7 @@ class MuxController:
             return False
         if self._run_continues(group, batch, step, False) is not True:
             return False
-        if self._prefill_preparing():
+        if self._prefill_preparing() and not self.config.prefill_overlap_decode:
             # A prefill of any model will soon need every run to park: decide the next
             # boundary then, rather than run one more granted step before parking.
             return False
@@ -2899,6 +2906,8 @@ class MuxController:
         return self._prefill_awaiting_credits()
 
     def _prefill_awaiting_credits(self) -> bool:
+        if self.config.prefill_overlap_decode:
+            return False  # a prefill never waits for decode credits, so nothing parks for it
         for group in self.groups.values():
             for batch in group.batches.values():
                 if (batch.plan.stage == "P" and batch.status == "PREPARING"

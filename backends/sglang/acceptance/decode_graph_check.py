@@ -66,6 +66,12 @@ class DecodeGraphConfigChecks(unittest.TestCase):
             with self.assertRaises(IntegrationError):
                 self.config(**bad)
 
+    def test_overlap_needs_park(self):
+        self.assertFalse(self.config().prefill_overlap_decode)
+        self.assertTrue(self.config(decode_run_park=True, prefill_overlap_decode=True).prefill_overlap_decode)
+        with self.assertRaises(IntegrationError):
+            self.config(prefill_overlap_decode=True)
+
     def test_arrival_rates_cover_every_model(self):
         self.assertEqual(self.config().policy_arrival_rates, ())
         ids = [m.model_id for m in self.config().models]

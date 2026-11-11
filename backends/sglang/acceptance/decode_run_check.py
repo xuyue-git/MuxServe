@@ -1435,6 +1435,51 @@ class ParkOverlapChecks(unittest.TestCase):
             "HANDOFF_READY", {"requests": [item], "acks": [ack]}))
 
 
+class OverlapChecks(unittest.TestCase):
+    """prefill_overlap_decode: decode runs keep running through prefills."""
+
+    def running(self, models=("a", "b"), **flags):
+        sim = Sim(models, run_steps=8, park=True, prefill_overlap_decode=True, **flags)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        self.assertTrue(all(sim.step("a", plan, rank, 1, 12)["continue"] for rank in range(sim.tp)))
+        sim.submit("b", "x", max_new=4)
+        return sim, plan, reservation, sim.prefill_ready("b", "x")
+
+    def test_a_prefill_starts_and_the_run_goes_on(self):
+        sim, plan, _, (p_plan, p_out, p_reservation) = self.running()
+        self.assertFalse(sim.controller._prefill_awaiting_credits())
+        self.assertIs(sim.step("a", plan, 0, 2, 13)["continue"], True)  # no park for a READY prefill
+        sim.controller.start_batch(sim.group("b"), p_plan.batch_id)
+        p_batch = sim.controller.groups["b"].batches[p_plan.batch_id]
+        self.assertEqual(p_batch.status, "RUNNING")
+        self.assertNotIn(p_plan.batch_id, sim.controller.credits.leases)
+        self.assertIn(plan.batch_id, sim.controller.credits.leases)
+        self.assertIs(sim.step("a", plan, 1, 2, 13)["continue"], True)
+        for rank in range(sim.tp):  # and through the prefill's forward
+            self.assertIs(sim.step("a", plan, rank, 3, 14)["continue"], True)
+        self.assertIsNone(sim.controller.groups["a"].batches[plan.batch_id].parked_at)
+        sim.prefill_finish("b", "x", 21, p_plan, p_out, p_reservation)
+        self.assertEqual(sim.controller.requests[("b", "x")].output, [21])
+
+    def test_prefills_still_run_one_at_a_time(self):
+        sim, plan, _, (p_plan, _, _) = self.running(models=("a", "b", "c"))
+        sim.controller.start_batch(sim.group("b"), p_plan.batch_id)
+        sim.submit("c", "y", max_new=4)
+        c_plan, _, _ = sim.prefill_ready("c", "y")
+        expect("NOT_READY", lambda: sim.controller.start_batch(sim.group("c"), c_plan.batch_id))
+
+    def test_new_decode_batches_are_not_held_back(self):
+        sim = Sim(("a", "b", "c"), run_steps=8, park=True, prefill_overlap_decode=True)
+        sim.submit("c", "y", max_new=10)
+        sim.prefill("c", "y", 31)
+        sim.submit("b", "x", max_new=4)
+        sim.prefill_ready("b", "x")
+        plan, _ = sim.prepare_decode("c", "y", 8)  # without the switch: OUT_OF_CREDITS
+        self.assertIn(plan.batch_id, sim.controller.credits.leases)
+
+
 class LongPollChecks(unittest.TestCase):
     def setUp(self):
         self.sim = Sim()

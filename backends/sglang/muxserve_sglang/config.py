@@ -321,6 +321,12 @@ class DeploymentConfig:
     # ACKs ride in its HANDOFF_READY, which the owner accepts once that rank ACKed.
     # Requires decode_wait_commands.
     handoff_local_success: bool = False
+    # Decode runs keep running while a prefill runs: the prefill STARTs without
+    # taking decode credits, no run parks for it, and new decode batches are not held
+    # back; MPS shares the GPUs between them. Prefills still run one at a time, and
+    # the prefill's own model still meets it at a step boundary for its handoff.
+    # Requires decode_run_park (whose prefill/credit split it relaxes).
+    prefill_overlap_decode: bool = False
     # With two requests of a model in flight: a request that finds its model
     # idle waits this many ms, so a request arriving just after it joins the
     # same prefill batch. The pair then decodes and finishes together, as under
@@ -435,7 +441,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "decode_prepare_light", "decode_run_merge", "capacity_recovery_all_decode",
                  "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline",
                  "decode_step_leave", "decode_wait_commands", "prefill_stage_in_gpu_done",
-                 "prefill_start_unparked", "handoff_local_success", "prefill_break_slim"):
+                 "prefill_start_unparked", "handoff_local_success", "prefill_break_slim",
+                 "prefill_overlap_decode"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_kv_per_page and not config.decode_step_join:
@@ -450,6 +457,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
     if config.decode_wait_commands and not (config.decode_step_join and config.handoff_ack_in_poll):
         raise IntegrationError("INVALID_CONFIG", "decode_wait_commands requires decode_step_join and "
                                                  "handoff_ack_in_poll")
+    if config.prefill_overlap_decode and not config.decode_run_park:
+        raise IntegrationError("INVALID_CONFIG", "prefill_overlap_decode requires decode_run_park")
     if config.prefill_break_slim and not config.prefill_cuda_graph:
         raise IntegrationError("INVALID_CONFIG", "prefill_break_slim requires prefill_cuda_graph")
     if config.prefill_start_unparked and not config.decode_run_park:
