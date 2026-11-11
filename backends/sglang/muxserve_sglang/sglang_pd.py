@@ -290,6 +290,10 @@ class SharedHeadwiseKVReceiver(_Room, BaseKVReceiver):
             return KVPoll.WaitingForInput
         if not self.validated:
             return KVPoll.Transferring
+        if getattr(self.kv_mgr, "local_success", False):
+            # handoff_local_success, at a run's step boundary: the native pop's TP
+            # all-reduce waits until every rank validated its own mapping.
+            return KVPoll.Success
         return self._status("D")
 
 

@@ -54,6 +54,18 @@ class DecodeGraphConfigChecks(unittest.TestCase):
             with self.assertRaises(IntegrationError):
                 self.config(**bad)
 
+    def test_unparked_start_and_local_handoff_need_their_base_switches(self):
+        base = self.config()
+        self.assertFalse(base.prefill_start_unparked or base.handoff_local_success)
+        wait = dict(decode_step_join=True, handoff_ack_in_poll=True, broker_status_in_poll=True,
+                    decode_wait_commands=True)
+        good = self.config(decode_run_park=True, prefill_start_unparked=True, handoff_local_success=True, **wait)
+        self.assertTrue(good.prefill_start_unparked and good.handoff_local_success)
+        for bad in (dict(prefill_start_unparked=True), dict(handoff_local_success=True),
+                    dict(decode_run_park=True, prefill_start_unparked=1)):
+            with self.assertRaises(IntegrationError):
+                self.config(**bad)
+
     def test_prefill_graph_tokens_need_the_graph_and_increase(self):
         self.assertEqual(tuple(self.config().prefill_graph_tokens), ())
         good = self.config(prefill_cuda_graph=True, prefill_graph_tokens=[64, 128, 512, 2048])

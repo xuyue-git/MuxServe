@@ -616,15 +616,22 @@ class ControlledScheduler:
                     self.sync()
                     trace.ev("ho_sync", state.command["batch_id"])
                     state.handoff_done = True
+                    ready = {"requests": state.handoff["requests"]}
+                    if getattr(self.manager, "local_success", False):
+                        # handoff_local_success: this rank's ACKs for these rooms go with
+                        # its HANDOFF_READY instead of its next decode_resume.
+                        rooms = {item["bootstrap_room"] for item in state.handoff["requests"]}
+                        pending = self.manager.pending_acks
+                        ready["acks"] = tuple(a for a in pending if a[0] in rooms)
+                        pending[:] = [a for a in pending if a[0] not in rooms]
+                        trace.ev("ho_local", state.command["batch_id"], acks=len(ready["acks"]))
                     following = self.backlog[0] if self.backlog else {}
                     if (self._flag("handoff_report_with_ready") and following.get("kind") == "PREPARE"
                             and following.get("batch_stage") == "D"):
                         # Sent with that batch's READY (one RPC, not two).
-                        self.deferred_report = (state.command["batch_id"], "HANDOFF_READY",
-                                                {"requests": state.handoff["requests"]})
+                        self.deferred_report = (state.command["batch_id"], "HANDOFF_READY", ready)
                     else:
-                        self._report(state.command["batch_id"], "HANDOFF_READY",
-                                     {"requests": state.handoff["requests"]})
+                        self._report(state.command["batch_id"], "HANDOFF_READY", ready)
                     # D is not sent the P-only batch QUIESCE. This preparation
                     # owns no forward binding; retain Req, discard batch state.
                     del self.prepared[state.command["batch_id"]]
@@ -889,8 +896,13 @@ class ControlledScheduler:
                 self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
                 self.backlog.extend(reply["commands"])
             handoffs = tuple(reply.get("handoffs", ()))
-            self._accept_in_run(handoffs)
-            self._progress()
+            # handoff_local_success: a handoff named here pops once this rank validated it.
+            self.manager.local_success = self._flag("handoff_local_success")
+            try:
+                self._accept_in_run(handoffs)
+                self._progress()
+            finally:
+                self.manager.local_success = False
             self._absorb_reply_commands()
             acks = tuple(getattr(self.manager, "pending_acks", ()))
             after = self.backlog[-1]["command_seq"] if self.backlog else self.cursor

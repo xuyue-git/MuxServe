@@ -1333,6 +1333,108 @@ class OwnerHopChecks(unittest.TestCase):
         self.assertGreaterEqual(min(b - a for a, b in zip(passes, passes[1:])), 0.018)
 
 
+class ParkOverlapChecks(unittest.TestCase):
+    """prefill_start_unparked and handoff_local_success."""
+
+    def running(self, models=("a", "b"), **flags):
+        sim = Sim(models, run_steps=8, park=True, prefill_start_unparked=True, **flags)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        self.assertTrue(all(sim.step("a", plan, rank, 1, 12)["continue"] for rank in range(sim.tp)))
+        sim.submit("b", "x", max_new=4)
+        return sim, plan, sim.prefill_ready("b", "x")
+
+    def test_a_ready_prefill_starts_while_runs_still_hold_credits(self):
+        sim, plan, (p_plan, p_out, p_reservation) = self.running()
+        credits = sim.controller.credits
+        sim.controller.start_batch(sim.group("b"), p_plan.batch_id)
+        p_batch = sim.controller.groups["b"].batches[p_plan.batch_id]
+        self.assertEqual((p_batch.status, p_batch.early_start), ("RUNNING", True))
+        self.assertNotIn(p_plan.batch_id, credits.leases)
+        self.assertIn(plan.batch_id, credits.leases)
+        # The run still parks at its next boundary, exactly as for a waiting prefill.
+        self.assertTrue(sim.controller._prefill_awaiting_credits())
+        self.assertEqual(sim.step("a", plan, 0, 2, 13)["continue"], "PARK")
+        self.assertNotIn(p_plan.batch_id, credits.leases)
+        self.assertEqual(sim.step("a", plan, 1, 2, 13)["continue"], "PARK")
+        # Parked: its credits go to the running prefill, and the run stays parked.
+        self.assertNotIn(plan.batch_id, credits.leases)
+        self.assertIn(p_plan.batch_id, credits.leases)
+        self.assertEqual(sim.resume("a", plan, 0, 2), "PARK")
+        sim.prefill_finish("b", "x", 21, p_plan, p_out, p_reservation)
+        self.assertEqual(sim.resume("a", plan, 0, 2), True)
+        self.assertEqual(sim.resume("a", plan, 1, 2), True)
+        self.assertIn(plan.batch_id, credits.leases)
+        self.assertEqual(sim.controller.requests[("b", "x")].output, [21])
+
+    def test_a_prefill_that_ends_before_the_runs_park_never_takes_credits(self):
+        sim, plan, (p_plan, p_out, p_reservation) = self.running()
+        sim.controller.start_batch(sim.group("b"), p_plan.batch_id)
+        self.assertEqual(sim.step("a", plan, 0, 2, 13)["continue"], "PARK")
+        sim.prefill_finish("b", "x", 21, p_plan, p_out, p_reservation)
+        self.assertNotIn(p_plan.batch_id, sim.controller.credits.leases)
+        self.assertFalse(sim.controller._prefill_pending())
+        self.assertEqual(sim.step("a", plan, 1, 2, 13)["continue"], "PARK")  # the decided step
+        self.assertEqual(sim.resume("a", plan, 0, 2), True)
+        self.assertIn(plan.batch_id, sim.controller.credits.leases)
+
+    def test_only_one_prefill_starts_early(self):
+        sim, plan, (p_plan, _, _) = self.running(models=("a", "b", "c"))
+        sim.controller.start_batch(sim.group("b"), p_plan.batch_id)
+        sim.submit("c", "y", max_new=4)
+        c_plan, _, _ = sim.prefill_ready("c", "y")
+        expect("NOT_READY", lambda: sim.controller.start_batch(sim.group("c"), c_plan.batch_id))
+        self.assertEqual(sim.controller.groups["c"].batches[c_plan.batch_id].status, "PREPARING")
+
+    def test_without_the_switch_the_prefill_waits_for_the_park(self):
+        sim = Sim(("a", "b"), run_steps=8, park=True)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, _ = sim.prepare_decode("a", "r", 8)
+        sim.submit("b", "x", max_new=4)
+        p_plan, _, _ = sim.prefill_ready("b", "x")
+        expect("NOT_READY", lambda: sim.controller.start_batch(sim.group("b"), p_plan.batch_id))
+
+    def test_a_rank_reports_the_local_handoff_with_its_own_acks(self):
+        hops = OwnerHopChecks()
+        sim, plan, p_plan, p_reservation = hops.parked_with_handoff(handoff_local_success=True)
+        hops.prefill_done(sim, p_plan, p_reservation)
+        group = sim.controller.groups["a"]
+        items, acks = {}, {}
+        for rank in range(sim.tp):
+            reply = hops.resume(sim, plan, rank)
+            item = next(c for c in reply["commands"] if c["kind"] == "HANDOFF")["requests"][0]
+            items[rank] = item
+            acks[rank] = (item["bootstrap_room"], item["allocation_id"], item["version"],
+                          item["valid_tokens"], item["rank_block_table"])
+        room = items[0]["bootstrap_room"]
+        # A report needs this rank's ACK, not every rank's.
+        expect("HANDOFF_NOT_READY", lambda: sim.controller.rank_report(
+            sim.group("a"), "D", 0, sim.pid("a", "D", 0), str(sim.seq[("a", "D", 0)] + 1), p_plan.batch_id,
+            "HANDOFF_READY", {"requests": [items[0]]}))
+        sim.report("a", "D", 0, p_plan.batch_id, "HANDOFF_READY", {"requests": [items[0]], "acks": [acks[0]]})
+        self.assertEqual(group.broker[room]["acked"], {0})
+        self.assertEqual(group.batches[p_plan.batch_id].handoff, {0})
+        self.assertEqual(hops.resume(sim, plan, 0, handoffs_seen=(p_plan.batch_id,))["continue"], "PARK")
+        sim.report("a", "D", 1, p_plan.batch_id, "HANDOFF_READY", {"requests": [items[1]], "acks": [acks[1]]})
+        self.assertEqual(group.broker[room]["acked"], set(range(sim.tp)))
+        reply = hops.resume(sim, plan, 0, handoffs_seen=(p_plan.batch_id,))
+        self.assertIs(reply["continue"], True)
+        self.assertEqual([item["request_id"] for item in reply["join"]], ["q"])
+
+    def test_without_the_switch_acks_in_a_report_are_refused(self):
+        hops = OwnerHopChecks()
+        sim, plan, p_plan, p_reservation = hops.parked_with_handoff()
+        hops.prefill_done(sim, p_plan, p_reservation)
+        item = next(c for c in hops.resume(sim, plan, 0)["commands"] if c["kind"] == "HANDOFF")["requests"][0]
+        ack = (item["bootstrap_room"], item["allocation_id"], item["version"], item["valid_tokens"],
+               item["rank_block_table"])
+        expect("INVALID_REPORT", lambda: sim.controller.rank_report(
+            sim.group("a"), "D", 0, sim.pid("a", "D", 0), str(sim.seq[("a", "D", 0)] + 1), p_plan.batch_id,
+            "HANDOFF_READY", {"requests": [item], "acks": [ack]}))
+
+
 class LongPollChecks(unittest.TestCase):
     def setUp(self):
         self.sim = Sim()

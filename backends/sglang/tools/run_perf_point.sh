@@ -26,7 +26,10 @@
 # WAIT_COMMANDS=1 (a D rank waiting at a run boundary takes commands and ACKs through
 # decode_resume: config decode_wait_commands=true). STAGE_IN_DONE=1 (P stages KV metadata
 # inside GPU_DONE: config prefill_stage_in_gpu_done=true). DRIVER_INTERVAL_MS=N (driver
-# passes at most every N ms: config driver_min_interval_ms=N).
+# passes at most every N ms: config driver_min_interval_ms=N). START_UNPARKED=1 (a READY
+# prefill starts without waiting for every run to park: config prefill_start_unparked=true;
+# needs PARK). HANDOFF_LOCAL=1 (a waiting D rank pops a handoff once it validated it, ACKs
+# ride in HANDOFF_READY: config handoff_local_success=true; needs WAIT_COMMANDS).
 # Optional env: GPUS (default 1,2,3,4), MODELS_ROOT, REFERENCE (bench JSON to
 # compare output tokens against), KV_FRACTION (size the KV pool like original
 # MuxServe: gpu_memory_utilization x total GPU memory, instead of kv_bytes_per_rank),
@@ -141,6 +144,8 @@ WAIT_COMMANDS="${WAIT_COMMANDS:-}"
 STAGE_IN_DONE="${STAGE_IN_DONE:-}"
 DRIVER_INTERVAL_MS="${DRIVER_INTERVAL_MS:-}"
 PREFILL_GRAPH_TOKENS="${PREFILL_GRAPH_TOKENS:-}"
+START_UNPARKED="${START_UNPARKED:-}"
+HANDOFF_LOCAL="${HANDOFF_LOCAL:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -148,7 +153,7 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" "$STEP_JOIN" "$KV_PER_PAGE" "$STEP_PIPELINE" "$STEP_LEAVE" "$KV_GROW_PAGES" "$WAIT_COMMANDS" "$STAGE_IN_DONE" "$DRIVER_INTERVAL_MS" "$PREFILL_GRAPH_TOKENS" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" "$STEP_JOIN" "$KV_PER_PAGE" "$STEP_PIPELINE" "$STEP_LEAVE" "$KV_GROW_PAGES" "$WAIT_COMMANDS" "$STAGE_IN_DONE" "$DRIVER_INTERVAL_MS" "$PREFILL_GRAPH_TOKENS" "$START_UNPARKED" "$HANDOFF_LOCAL" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
@@ -158,7 +163,8 @@ import json, sys
  targeted_wake, rpc_inline, decode_leader, prepare_after_ack, prepare_light,
  inflight, run_merge, pair_hold_ms, max_new, timeout_ms, gateway, recovery_all_decode, kv_trim,
  step_join, kv_per_page, step_pipeline, step_leave, grow_pages,
- wait_commands, stage_in_done, driver_interval, graph_tokens) = sys.argv[1:]
+ wait_commands, stage_in_done, driver_interval, graph_tokens, start_unparked,
+ handoff_local) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -223,6 +229,10 @@ if stage_in_done:
 if driver_interval:
     config["driver_min_interval_ms"] = int(driver_interval)
 config.pop("prefill_graph_tokens", None)
+if start_unparked:
+    config["prefill_start_unparked"] = True
+if handoff_local:
+    config["handoff_local_success"] = True
 if graph_tokens:
     config["prefill_graph_tokens"] = [int(t) for t in graph_tokens.split(",")]
 config.pop("prefill_pair_hold_ms", None)
@@ -285,7 +295,9 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "wait_commands=%s" % config.get("decode_wait_commands", False),
       "stage_in_done=%s" % config.get("prefill_stage_in_gpu_done", False),
       "driver_interval_ms=%s" % config.get("driver_min_interval_ms", 0),
-      "prefill_graph_tokens=%s" % ",".join(map(str, config.get("prefill_graph_tokens", []))))
+      "prefill_graph_tokens=%s" % ",".join(map(str, config.get("prefill_graph_tokens", []))),
+      "start_unparked=%s" % config.get("prefill_start_unparked", False),
+      "handoff_local=%s" % config.get("handoff_local_success", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

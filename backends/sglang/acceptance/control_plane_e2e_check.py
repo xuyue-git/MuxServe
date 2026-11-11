@@ -42,7 +42,7 @@ def token_for(output_count: int) -> int:
 def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False,
               register_ready=False, ack_in_poll=False, combined=False, start_reply=False,
               leader_reports=False, step_join=False, pipeline=False, barrier=None, leave=False,
-              wait_commands=False, stage_in_done=False):
+              wait_commands=False, stage_in_done=False, handoff_local=False):
     """final_step: config final_step_in_gpu_done (a locally final run step is
     reported inside GPU_DONE). HANDOFF native_metadata and long-poll
     bootstrap_ready are used whenever the owner provides them. step_join: config
@@ -61,7 +61,7 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
         box = StepBox(os.path.join(os.path.dirname(address), "stepbox-" + model))
     st = SimpleNamespace(report_seq=0, deferred=None, pending_acks=[], reply_commands=(), cursor=0,
                          epoch=None, backlog=[], prepared={}, waiting_bootstrap={}, waiting_handoff=None,
-                         bootstrap_ready=None, broker_status=None, drained=False)
+                         bootstrap_ready=None, broker_status=None, drained=False, local=False)
 
     def report(batch_id, kind, payload):
         if st.deferred is not None:
@@ -284,6 +284,18 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
             if ready:
                 del st.waiting_bootstrap[batch_id]
                 report(batch_id, "READY", {"reservation_id": command["reservation_id"]})
+        if st.waiting_handoff is not None and st.local:
+            # handoff_local_success: the native pop's TP all-reduce (here the model's
+            # barrier) waits for every rank's own validation; ACKs ride in the report.
+            waiting = st.waiting_handoff
+            barrier.wait(60)
+            rooms = {i["bootstrap_room"] for i in waiting["requests"]}
+            acks = tuple(a for a in st.pending_acks if a[0] in rooms)
+            st.pending_acks[:] = [a for a in st.pending_acks if a[0] not in rooms]
+            report(waiting["batch_id"], "HANDOFF_READY", {"requests": waiting["requests"], "acks": acks})
+            from muxserve_sglang import trace as rank_trace
+            rank_trace.ev("ho_local", waiting["batch_id"])
+            st.waiting_handoff = None
         if st.waiting_handoff is not None:
             waiting = st.waiting_handoff
             if all((st.broker_status or {}).get(i["bootstrap_room"]) == "SUCCESS"
@@ -322,8 +334,12 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
         while decision["continue"] in ("PARK", "SYNC"):
             take(decision)
             handoffs = tuple(decision.get("handoffs", ()))
-            accept_in_run(handoffs)
-            progress()
+            st.local = handoff_local
+            try:
+                accept_in_run(handoffs)
+                progress()
+            finally:
+                st.local = False
             acks = tuple(st.pending_acks)
             after = st.backlog[-1]["command_seq"] if st.backlog else st.cursor
             decision = call("decode_resume", rank, pid, batch_id, step, 100, after, st.epoch, handoffs,
@@ -431,6 +447,8 @@ def main():
     parser.add_argument("--step-leave", action="store_true", help="config decode_step_leave=true")
     parser.add_argument("--kv-grow-pages", type=int, default=1, help="config decode_kv_grow_pages")
     parser.add_argument("--wait-commands", action="store_true", help="config decode_wait_commands=true")
+    parser.add_argument("--start-unparked", action="store_true", help="config prefill_start_unparked=true")
+    parser.add_argument("--handoff-local", action="store_true", help="config handoff_local_success=true")
     parser.add_argument("--stage-in-done", action="store_true", help="config prefill_stage_in_gpu_done=true")
     parser.add_argument("--driver-interval-ms", type=int, default=0, help="config driver_min_interval_ms")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
@@ -480,7 +498,9 @@ def main():
                               decode_kv_grow_pages=args.kv_grow_pages,
                               decode_wait_commands=args.wait_commands,
                               prefill_stage_in_gpu_done=args.stage_in_done,
-                              driver_min_interval_ms=args.driver_interval_ms)
+                              driver_min_interval_ms=args.driver_interval_ms,
+                              prefill_start_unparked=args.start_unparked,
+                              handoff_local_success=args.handoff_local)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -533,7 +553,8 @@ def main():
                                                          args.step_pipeline,
                                                          barriers[m] if stage == "D" else None,
                                                          args.step_leave, args.wait_commands,
-                                                         args.stage_in_done), daemon=True)
+                                                         args.stage_in_done, args.handoff_local),
+                                   daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()

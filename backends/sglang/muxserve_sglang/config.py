@@ -306,6 +306,17 @@ class DeploymentConfig:
     # finds each request's batch through one index instead of a scan per request.
     # 0 keeps a pass on every wake.
     driver_min_interval_ms: int = 0
+    # A READY prefill STARTs at once instead of after every decode run parked: the runs
+    # still park at their next step boundary (their last step overlaps the prefill's
+    # forward) and the prefill takes its credits as soon as they are free. No other
+    # prefill starts meanwhile. Requires decode_run_park.
+    prefill_start_unparked: bool = False
+    # A D rank waiting at a run's step boundary enters a named handoff's native pop as
+    # soon as it validated its own mapping (the pop's TP all-reduce waits for every
+    # rank's validation), instead of after the owner saw every rank's broker ACK. Its
+    # ACKs ride in its HANDOFF_READY, which the owner accepts once that rank ACKed.
+    # Requires decode_wait_commands.
+    handoff_local_success: bool = False
     # With two requests of a model in flight: a request that finds its model
     # idle waits this many ms, so a request arriving just after it joins the
     # same prefill batch. The pair then decodes and finishes together, as under
@@ -402,7 +413,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "rpc_inline_fast_methods", "decode_leader_reports", "handoff_prepare_after_ack",
                  "decode_prepare_light", "decode_run_merge", "capacity_recovery_all_decode",
                  "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline",
-                 "decode_step_leave", "decode_wait_commands", "prefill_stage_in_gpu_done"):
+                 "decode_step_leave", "decode_wait_commands", "prefill_stage_in_gpu_done",
+                 "prefill_start_unparked", "handoff_local_success"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_kv_per_page and not config.decode_step_join:
@@ -417,6 +429,10 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
     if config.decode_wait_commands and not (config.decode_step_join and config.handoff_ack_in_poll):
         raise IntegrationError("INVALID_CONFIG", "decode_wait_commands requires decode_step_join and "
                                                  "handoff_ack_in_poll")
+    if config.prefill_start_unparked and not config.decode_run_park:
+        raise IntegrationError("INVALID_CONFIG", "prefill_start_unparked requires decode_run_park")
+    if config.handoff_local_success and not config.decode_wait_commands:
+        raise IntegrationError("INVALID_CONFIG", "handoff_local_success requires decode_wait_commands")
     if type(config.driver_min_interval_ms) is not int or not 0 <= config.driver_min_interval_ms <= 50:
         raise IntegrationError("INVALID_CONFIG", "driver_min_interval_ms must be an integer 0..50")
     if type(config.decode_kv_grow_pages) is not int or not 1 <= config.decode_kv_grow_pages <= 8:

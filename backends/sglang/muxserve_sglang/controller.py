@@ -166,6 +166,8 @@ class _Batch:
     # decode_step_pipeline: step boundaries the owner already granted as a plain
     # continue; the leader reports those steps after running on.
     run_go: set = field(default_factory=set)
+    # prefill_start_unparked: STARTed before its credits were free (it takes them later).
+    early_start: bool = False
 
     def members(self, step: int) -> tuple:
         """The requests that take part in decode run step ``step``, in rank order."""
@@ -389,7 +391,24 @@ class MuxController:
     def _release_credits(self, batch_id: str) -> None:
         """Caller holds the lock. Parked decode runs re-check on every release."""
         self.credits.release(batch_id)
+        if self.config.prefill_start_unparked:
+            self._lease_early_prefill()
         self._park_cv.notify_all()
+
+    def _early_prefill(self) -> "_Batch | None":
+        """prefill_start_unparked: the prefill running without its credits yet, if any."""
+        for group in self.groups.values():
+            for batch in group.batches.values():
+                if (batch.plan.stage == "P" and batch.status == "RUNNING" and batch.early_start
+                        and batch.plan.batch_id not in self.credits.leases):
+                    return batch
+        return None
+
+    def _lease_early_prefill(self) -> None:
+        """Caller holds the lock. Credits just freed go to the prefill already running."""
+        batch = self._early_prefill()
+        if batch is not None and self.credits.acquire(batch.plan.batch_id, batch.plan.model_id, "P", 10):
+            trace.ev("early_lease", batch.plan.batch_id, m=batch.plan.model_id)
 
     def _notify(self, group: _Group | None = None) -> None:
         """Caller holds the lock. Wake the driver; with a group, wake its waiting ranks."""
@@ -1413,10 +1432,16 @@ class MuxController:
                 # Running decode runs park at their next step boundary and
                 # release credits; the driver retries this START then.
                 if not self.credits.acquire(batch.plan.batch_id, batch.plan.model_id, "P", 10):
-                    raise IntegrationError("NOT_READY", "Prefill waits for decode runs to park")
+                    # prefill_start_unparked: start now; the runs park at their next
+                    # boundary and the credits follow (one such prefill at a time).
+                    if not (self.config.prefill_start_unparked and self._early_prefill() is None
+                            and not any(lease[0][1] == "P" for lease in self.credits.leases.values())):
+                        raise IntegrationError("NOT_READY", "Prefill waits for decode runs to park")
+                    batch.early_start = True
             try:
                 self.store.start_kv_batch(batch.reservation.reservation_id)
             except IntegrationError as exc:
+                batch.early_start = False
                 if deferred:
                     self._release_credits(batch.plan.batch_id)
                 if exc.code in ("RPC_TIMEOUT", "RPC_UNAVAILABLE", "BATCH_FENCED"):
@@ -1432,7 +1457,8 @@ class MuxController:
                                "batch_stage": batch.plan.stage, "purpose": batch.plan.purpose,
                                "grant_id": batch.reservation.reservation_id,
                                "_command_owner": batch.holder})
-            trace.ev("start", batch_id, m=batch.plan.model_id, s=batch.plan.stage)
+            trace.ev("start", batch_id, m=batch.plan.model_id, s=batch.plan.stage,
+                     **({"early": 1} if batch.early_start else {}))
             return self._batch_view(batch)
 
     @staticmethod
@@ -1668,7 +1694,7 @@ class MuxController:
             elif kind == "HANDOFF_READY":
                 if stage != "D" or batch.plan.stage != "P" or batch.status != "HANDOFF":
                     raise IntegrationError("STALE_REPORT", "D handoff is not pending")
-                self._handoff_ready(group, batch, rank, payload)
+                self._handoff_ready(group, batch, rank, payload, pid)
             elif kind == "QUIESCED":
                 self._quiesced(group, batch, key, payload)
             else:
@@ -2879,7 +2905,9 @@ class MuxController:
                         and batch.ready == batch.participants
                         and batch.plan.batch_id not in self.credits.leases):
                     return True
-        return False
+        # prefill_start_unparked: a prefill that started before its credits were free
+        # keeps the runs parking until its forward ends, exactly as if it waited.
+        return self.config.prefill_start_unparked and self._early_prefill() is not None
 
     def _prefill_eligible(self) -> bool:
         for model in self.config.models:
@@ -2921,16 +2949,30 @@ class MuxController:
                 "rank": rank, "requests": items,
                 "handoff_deadline": batch.gpu_completed_at + self.config.prepare_timeout_ms / 1000}
 
-    def _handoff_ready(self, group: _Group, batch: _Batch, rank: int, payload: dict) -> None:
+    def _handoff_ready(self, group: _Group, batch: _Batch, rank: int, payload: dict, pid: int) -> None:
+        acks = ()
+        if self.config.handoff_local_success and "acks" in payload:
+            # handoff_local_success: this rank's broker ACKs, applied before its report.
+            payload = dict(payload)
+            acks = payload.pop("acks")
+            if not isinstance(acks, (tuple, list)) or not all(
+                    isinstance(a, (tuple, list)) and len(a) == 5 for a in acks):
+                raise IntegrationError("INVALID_REPORT", "Malformed HANDOFF_READY ACKs")
         if set(payload) != {"requests"} or not isinstance(payload["requests"], (tuple, list)):
             raise IntegrationError("INVALID_REPORT", "HANDOFF_READY request list required")
         expected = self._handoff_payload(group, batch, rank)["requests"]
         if payload["requests"] != expected:
             self._fence(group, batch, "handoff_mismatch")
             raise IntegrationError("IDENTITY_CONFLICT", "D validated mapping differs")
+        for room, allocation_id, version, valid_tokens, table in acks:
+            self.broker_ack(group.group_id, room, rank, pid, allocation_id, version, valid_tokens, table)
         for item in expected:
             entry = group.broker[item["bootstrap_room"]]
-            if entry["acked"] != set(group.ranks):
+            # handoff_local_success: the native pop's all-reduce already proved every
+            # rank validated; the handoff completes only once every rank reported (and
+            # so ACKed). Otherwise every ACK precedes any rank's native success.
+            if (rank not in entry["acked"] if self.config.handoff_local_success
+                    else entry["acked"] != set(group.ranks)):
                 raise IntegrationError("HANDOFF_NOT_READY", "All D broker ACKs precede native success")
         batch.handoff.add(rank)
         if len(batch.handoff) == len(group.ranks):
