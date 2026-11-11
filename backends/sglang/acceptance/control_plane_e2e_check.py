@@ -41,7 +41,7 @@ def token_for(output_count: int) -> int:
 
 def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False,
               register_ready=False, ack_in_poll=False, combined=False, start_reply=False,
-              leader_reports=False, step_join=False, pipeline=False, barrier=None):
+              leader_reports=False, step_join=False, pipeline=False, barrier=None, leave=False):
     """final_step: config final_step_in_gpu_done (a locally final run step is
     reported inside GPU_DONE). HANDOFF native_metadata and long-poll
     bootstrap_ready are used whenever the owner provides them. step_join: config
@@ -119,29 +119,30 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
             if steps == 1:
                 break
             finished = any(m["base"] + step >= m["max_new"] for m in members)
+            ending = all(m["base"] + step >= m["max_new"] for m in members) if leave else finished
             if box is not None:
                 digest = zlib.crc32(",".join(str(item["token_id"]) for item in results).encode(), digest)
             if in_flight is not None:
                 ahead = in_flight.result().get("ahead") is True
                 in_flight = None
-            if final_step and (finished or step >= steps):
-                final = {"step": step, "results": results, "finished": finished}
+            if final_step and (ending or step >= steps):
+                final = {"step": step, "results": results, "finished": ending}
                 break
-            continuing = not (finished or step >= steps)
-            if (reports is not None and continuing and ahead
+            continuing = not (ending or step >= steps)
+            if (reports is not None and continuing and ahead and not finished
                     and all(m["start"] + step + 1 <= m["cap"] for m in members)):
                 in_flight = reports.submit(call, "decode_step", rank, pid, command["batch_id"], step,
-                                           results, finished, True)
+                                           results, ending, True)
                 decision, ahead = {"continue": True}, False
                 box.publish(tag, step, True)
             elif box is not None and continuing and rank != 0 and box.wait(tag, step, 30):
                 decision = {"continue": True}
             else:
-                decision = call("decode_step", rank, pid, command["batch_id"], step, results, finished)
+                decision = call("decode_step", rank, pid, command["batch_id"], step, results, ending)
                 ahead = decision.get("ahead") is True
                 if box is not None and continuing and rank == 0:
-                    box.publish(tag, step, decision["continue"] is True
-                                and not decision.get("join") and not decision.get("extend"))
+                    box.publish(tag, step, decision["continue"] is True and not decision.get("join")
+                                and not decision.get("extend") and not decision.get("leave"))
             if step_join:
                 while decision["continue"] in ("PARK", "SYNC"):
                     handoffs = tuple(decision.get("handoffs", ()))
@@ -151,12 +152,18 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                                     after, st.epoch, handoffs)
             while decision["continue"] == "PARK":
                 decision = call("decode_resume", rank, pid, command["batch_id"], step, 100)
-            if finished or step >= steps or decision["continue"] is not True:
+            if ending or step >= steps or decision["continue"] is not True:
                 break
+            gone = set(decision.get("leave", ()))
+            if gone:
+                assert gone <= {m["request_id"] for m in members}
+                members = [m for m in members if m["request_id"] not in gone]
+                prep["ordered_request_ids"] = tuple(m["request_id"] for m in members)
             for item in decision.get("extend", ()):
                 member = next(m for m in members if m["request_id"] == item["request_id"])
-                assert item["view"]["capacity_tokens"] > member["cap"] and set(item["view"]["block_tables"]) == {rank}
-                member["cap"] = item["view"]["capacity_tokens"]
+                assert (item["capacity_tokens"] > member["cap"] and item["first_page"] == member["cap"] // 16
+                        and item["first_page"] + item["pages"].pages == item["capacity_tokens"] // 16)
+                member["cap"] = item["capacity_tokens"]
             for item in decision.get("join", ()):
                 assert all(m["request_id"] != item["request_id"] for m in members)
                 assert set(item["view"]["block_tables"]) == {rank}
@@ -164,6 +171,8 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
                                 "base": len(item["output_token_ids"]) - step, "start": item["start_valid"],
                                 "max_new": item["max_new_tokens"], "cap": item["view"]["capacity_tokens"]})
                 prep["ordered_request_ids"] = tuple(prep["ordered_request_ids"]) + (item["request_id"],)
+            if gone:
+                serve_in_run(())  # the leavers' cleanup, queued with this decision
             step += 1
         payload = {"reservation_id": prep["reservation_id"], "results": results,
                    "duration_ms": (time.monotonic() - start) * 1000,
@@ -375,6 +384,8 @@ def main():
     parser.add_argument("--step-join", action="store_true", help="config decode_step_join=true")
     parser.add_argument("--kv-per-page", action="store_true", help="config decode_kv_per_page=true")
     parser.add_argument("--step-pipeline", action="store_true", help="config decode_step_pipeline=true")
+    parser.add_argument("--step-leave", action="store_true", help="config decode_step_leave=true")
+    parser.add_argument("--kv-grow-pages", type=int, default=1, help="config decode_kv_grow_pages")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -418,7 +429,8 @@ def main():
                               capacity_recovery_all_decode=args.recovery_all_decode, max_new_tokens=args.max_new,
                               decode_kv_trim=args.kv_trim, decode_step_join=args.step_join,
                               decode_kv_per_page=args.kv_per_page,
-                              decode_step_pipeline=args.step_pipeline)
+                              decode_step_pipeline=args.step_pipeline, decode_step_leave=args.step_leave,
+                              decode_kv_grow_pages=args.kv_grow_pages)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -467,7 +479,8 @@ def main():
                                                          args.combined_report, args.start_in_reply,
                                                          args.decode_leader, args.step_join,
                                                          args.step_pipeline,
-                                                         barriers[m] if stage == "D" else None), daemon=True)
+                                                         barriers[m] if stage == "D" else None,
+                                                         args.step_leave), daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()

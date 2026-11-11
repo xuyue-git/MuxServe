@@ -763,10 +763,11 @@ class StepJoinChecks(unittest.TestCase):
         batch = self.batch(sim, batch_id)
         results = [{"request_id": ref.request_id, "attempt": ref.attempt, "token_id": tokens[ref.request_id],
                     "valid_tokens": batch.run_start_valid[ref.request_id] + steps} for ref in batch.members(steps)]
+        extra = {"token_digest": 0} if sim.config.decode_leader_reports else {}
         for rank in range(sim.tp):
             sim.report("a", "D", rank, batch_id, "GPU_DONE", {
                 "reservation_id": reservation, "duration_ms": 2.0, "gpu_forward_ms": 1.0,
-                "steps": steps, "results": results})
+                "steps": steps, "results": results, **extra})
         ids = tuple(ref.request_id for ref in batch.plan.requests)
         for stage in ("P", "D"):
             for rank in range(sim.tp):
@@ -896,8 +897,8 @@ class StepJoinChecks(unittest.TestCase):
         for rank in range(sim.tp):
             reply = self.step(sim, plan.batch_id, rank, 13, {"r": token})
             (item,) = reply["extend"]
-            self.assertEqual((item["request_id"], item["view"]["capacity_tokens"]), ("r", 32))
-            self.assertEqual(set(item["view"]["block_tables"]), {rank})
+            self.assertEqual((item["request_id"], item["capacity_tokens"], item["first_page"]), ("r", 32, 1))
+            self.assertEqual(item["pages"].pages, 1)  # only the new page
         token += 1
         for step in range(14, 29):
             for rank in range(sim.tp):
@@ -1035,7 +1036,7 @@ class StepPipelineChecks(unittest.TestCase):
         # Boundary 13 (step 14 writes position 16) needs a page: decided, not granted.
         self.assertEqual(aheads[:11], [True] * 11)
         self.assertIs(aheads[11], False)
-        self.assertEqual(reply["extend"][0]["view"]["capacity_tokens"], 32)
+        self.assertEqual(reply["extend"][0]["capacity_tokens"], 32)
 
     def test_ungranted_or_follower_pregranted_reports_are_refused(self):
         sim, plan, _ = self.running()
@@ -1046,6 +1047,150 @@ class StepPipelineChecks(unittest.TestCase):
         sim2, plan2, _ = self.running(decode_step_pipeline=False)
         self.assertNotIn("ahead", self.step(sim2, plan2.batch_id, 0, 1, {"r": 12}))
         expect("INVALID_ARGUMENT", lambda: self.step(sim2, plan2.batch_id, 0, 2, {"r": 13}, pregranted=True))
+
+
+class StepLeaveChecks(unittest.TestCase):
+    """decode_step_leave and decode_kv_grow_pages: members leave a running run;
+    pages come in chunks, to every member about to need one."""
+
+    FLAGS = dict(park=True, max_model_inflight=2, decode_run_merge=True, decode_step_join=True,
+                 decode_leader_reports=True, decode_step_leave=True)
+    step = StepJoinChecks.step
+    finish = StepJoinChecks.finish
+
+    @staticmethod
+    def batch(sim, batch_id):
+        return sim.controller.groups["a"].batches[batch_id]
+
+    def joined_pair(self, q_new=3, q_input=(1, 2, 3), r_new=10, **flags):
+        """r runs alone for 8 steps; q (already decodable) joins at its first boundary."""
+        sim = Sim(run_steps=8, **{**self.FLAGS, **flags})
+        sim.submit("a", "r", max_new=r_new)
+        sim.submit("a", "q", max_new=q_new, input_ids=q_input)
+        sim.prefill("a", "r", 11)
+        sim.prefill("a", "q", 21)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        for rank in range(sim.tp):
+            self.assertEqual([i["request_id"] for i in self.step(sim, plan.batch_id, rank, 1, {"r": 12})["join"]],
+                             ["q"])
+        return sim, plan, reservation
+
+    def test_a_finished_member_leaves_and_the_run_goes_on(self):
+        sim, plan, reservation = self.joined_pair()
+        for rank in range(sim.tp):
+            self.assertIs(self.step(sim, plan.batch_id, rank, 2, {"r": 13, "q": 22})["continue"], True)
+        q = sim.controller.requests[("a", "q")]
+        for rank in range(sim.tp):  # q reaches its length limit; r goes on
+            reply = self.step(sim, plan.batch_id, rank, 3, {"r": 14, "q": 23})
+            self.assertEqual((reply["continue"], reply["leave"]), (True, ("q",)))
+        batch = self.batch(sim, plan.batch_id)
+        self.assertEqual([ref.request_id for ref in batch.members(3)], ["r", "q"])
+        self.assertEqual([ref.request_id for ref in batch.members(4)], ["r"])
+        allocation = sim.store.snapshot()["allocations"][q.allocation_id]
+        self.assertEqual((allocation["active_batch"], allocation["valid_tokens"]), (None, 5))
+        self.assertEqual(q.state, "CLEANUP_PENDING")
+        self.assertTrue(sim.commands("a", "D", 0, "CLEANUP"))
+        sim.cleanup("a", "q")  # released while r's run keeps going
+        self.assertEqual((q.state, q.output), ("FINISHED", [21, 22, 23]))
+        self.assertNotIn(q.allocation_id, sim.store.snapshot()["allocations"])
+        sim.store.assert_integrity()
+        token = 15
+        for step in range(4, 9):
+            for rank in range(sim.tp):
+                self.assertIs(self.step(sim, plan.batch_id, rank, step, {"r": token})["continue"], step < 8)
+            token += 1
+        self.finish(sim, plan.batch_id, reservation, 8, {"r": token - 1})
+        r = sim.controller.requests[("a", "r")]
+        self.assertEqual((r.output, r.valid_tokens, r.state), (list(range(11, 20)), 11, "DECODING"))
+        sim.store.assert_integrity()
+
+    def test_a_run_is_sized_by_its_longest_member_and_the_shorter_one_leaves(self):
+        sim = Sim(run_steps=8, **self.FLAGS)
+        sim.submit("a", "r", max_new=10)
+        sim.submit("a", "q", max_new=3)
+        sim.prefill("a", "r", 11)
+        sim.prefill("a", "q", 21)
+        driver = ControllerDriver(sim.controller, lambda event: None)
+        outputs = [sim.controller.request_output("a", name) for name in ("r", "q")]
+        self.assertEqual(driver._run_steps(SimpleNamespace(model_id="a", stage="D", purpose="GENERATE"), outputs), 8)
+        plan = BatchPlan(sim.group("a"), "d-both", "a", "D", tuple(
+            RequestRef(o["request_id"], o["attempt"], o["output_count"]) for o in outputs), steps=8)
+        reservation = sim.controller.prepare_batch(plan)["reservation_id"]
+        batch = self.batch(sim, "d-both")
+        self.assertEqual(batch.run_event_budget, {"r": 9, "q": 3})  # q can publish 2 more tokens (+1)
+        self.assertEqual(batch.views["q"].capacity_tokens, 16)  # its own budget, not 8 steps
+        sim._ready_all("a", "d-both", reservation)
+        sim.controller.start_batch(sim.group("a"), "d-both")
+        for step, tokens in ((1, {"r": 12, "q": 22}), (2, {"r": 13, "q": 23})):
+            replies = [self.step(sim, "d-both", rank, step, tokens) for rank in range(sim.tp)]
+        self.assertEqual(replies[0]["leave"], ("q",))  # q reached its 3 tokens at step 2
+        sim.cleanup("a", "q")
+        self.assertEqual(sim.controller.requests[("a", "q")].state, "FINISHED")
+        sim.store.assert_integrity()
+
+    def test_a_cancelled_member_leaves_without_its_later_tokens(self):
+        sim, plan, reservation = self.joined_pair(q_new=8)
+        sim.controller.cancel_request("a", "q")
+        for rank in range(sim.tp):
+            reply = self.step(sim, plan.batch_id, rank, 2, {"r": 13, "q": 22})
+            self.assertEqual(reply["leave"], ("q",))
+        sim.cleanup("a", "q")
+        q = sim.controller.requests[("a", "q")]
+        self.assertEqual((q.state, q.output), ("CANCELLED", [21]))
+        sim.store.assert_integrity()
+
+    def test_a_run_whose_every_member_ended_ends_as_before(self):
+        sim = Sim(run_steps=8, **self.FLAGS)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        sim.controller.cancel_request("a", "r")
+        for rank in range(sim.tp):
+            self.assertIs(self.step(sim, plan.batch_id, rank, 1, {"r": 12})["continue"], False)
+        self.finish(sim, plan.batch_id, reservation, 1, {"r": 12})
+        sim.store.assert_integrity()
+
+    def test_pages_come_in_chunks_to_every_member_about_to_need_one(self):
+        sim, plan, _ = self.joined_pair(q_new=40, q_input=tuple(range(1, 15)), r_new=40,
+                                        decode_kv_per_page=True, decode_kv_grow_pages=4)
+        batch = self.batch(sim, plan.batch_id)
+        self.assertEqual((batch.views["r"].capacity_tokens, batch.views["q"].capacity_tokens), (16, 16))
+        tokens = {"r": 13, "q": 22}
+        for step in (2,):
+            for rank in range(sim.tp):
+                self.assertIs(self.step(sim, plan.batch_id, rank, step, tokens)["continue"], True)
+        # Boundary 3: q (14 prompt tokens) needs position 16; r (3 + 3) is within a page
+        # of its end, so it is topped up too: 4 pages each, as far as each can use them
+        # (q: 53 tokens -> 64; r: 42 -> 48).
+        for rank in range(sim.tp):
+            reply = self.step(sim, plan.batch_id, rank, 3, tokens)
+            grown = {item["request_id"]: (item["first_page"], item["capacity_tokens"], item["pages"].pages)
+                     for item in reply["extend"]}
+            self.assertEqual(grown, {"q": (1, 64, 3), "r": (1, 48, 2)})
+        sim.store.assert_integrity()
+
+    def test_chunked_growth_falls_back_to_the_pages_needed_now(self):
+        sim = Sim(run_steps=40, decode_kv_per_page=True, decode_kv_grow_pages=4, **self.FLAGS)
+        sim.submit("a", "r", max_new=40)
+        sim.prefill("a", "r", 11)
+        plan, _ = sim.prepare_decode("a", "r", 30)
+        token = 12
+        for step in range(1, 13):
+            self.assertIs(self.step(sim, plan.batch_id, 0, step, {"r": token})["continue"], True)
+            token += 1
+        real = sim.controller._grow_reservation
+        calls = []
+
+        def tight(group, batch, targets):
+            calls.append([t.target_tokens for t in targets])
+            if len(calls) == 1:
+                raise IntegrationError("OUT_OF_CAPACITY", "only one page left")
+            return real(group, batch, targets)
+
+        with mock.patch.object(sim.controller, "_grow_reservation", side_effect=tight):
+            reply = self.step(sim, plan.batch_id, 0, 13, {"r": token})
+        self.assertEqual(calls, [[42], [17]])  # 4 pages (as far as r can use), then the one needed
+        self.assertEqual(reply["extend"][0]["capacity_tokens"], 32)
 
 
 class LongPollChecks(unittest.TestCase):

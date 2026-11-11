@@ -396,6 +396,36 @@ class HeadwiseStore:
                 allocation.version += 1
             return _copy_metadata(tuple(self._view(a) for a, _, _ in proposed))
 
+    def detach_kv_batch(self, reservation_id: str, allocation_id: str, valid_tokens: int,
+                        trim_to_valid: bool = False) -> KVView:
+        """Commit one allocation of a running reservation on its own and take it out of the
+        reservation (a request leaving a running decode run). The caller states that every
+        rank's GPU work writing its first ``valid_tokens`` positions has completed and none
+        writes it again in this reservation. The batch holder leaves it; its other holders
+        stay. Finish, rollback and fencing of the rest of the reservation no longer see it."""
+        with self._lock:
+            batch = self._batch(reservation_id)
+            allocation = self._allocation(allocation_id)
+            if (batch.state != "RUNNING" or allocation_id not in batch.old_capacity
+                    or allocation.active != reservation_id):
+                raise IntegrationError("INVALID_STATE", "Only a member of a running reservation can leave")
+            if (type(valid_tokens) is not int or valid_tokens < allocation.valid
+                    or valid_tokens > allocation.capacity or valid_tokens > self._max_context):
+                raise IntegrationError("INVALID_ARGUMENT", "Invalid committed KV length")
+            if len(batch.old_capacity) == 1:
+                raise IntegrationError("INVALID_STATE", "The last member finishes with the reservation")
+            allocation.valid = valid_tokens
+            if trim_to_valid:
+                self._trim(allocation)
+            allocation.version += 1
+            allocation.active = None
+            del batch.old_capacity[allocation_id]
+            batch.introduced_holders.discard(allocation_id)
+            allocation.holders.discard(batch.holder)
+            view = self._view(allocation)
+            self._collect(allocation)
+            return _copy_metadata(view)
+
     def finish_kv_batch(self, reservation_id: str, outcome: str,
                         valid_lengths: dict[str, int], completed_ranks: Sequence[int],
                         trim_to_valid: bool = False) -> tuple[KVView, ...]:

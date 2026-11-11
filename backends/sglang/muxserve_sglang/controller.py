@@ -154,11 +154,13 @@ class _Batch:
     participants: frozenset = frozenset()
     # prefill_early_token: the prefill's tokens were published at commit.
     tokens_published: bool = False
-    # decode_step_join: the plan as prepared (``plan`` gains joined requests), the
-    # first run step of each joined request, and per waiting step boundary the
-    # prefill handoffs its D ranks run there and when that boundary began to wait.
+    # decode_step_join: the plan as prepared (``plan`` holds the current members),
+    # the members from each step on whenever they changed, each member's reserved
+    # event slots, and per waiting step boundary the prefill handoffs its D ranks
+    # run there and when that boundary began to wait.
     prepared_plan: BatchPlan | None = None
-    run_join_step: dict[str, int] = field(default_factory=dict)
+    run_epochs: list = field(default_factory=list)
+    run_event_budget: dict[str, int] = field(default_factory=dict)
     run_sync: dict[int, set] = field(default_factory=dict)
     sync_since: dict[int, float] = field(default_factory=dict)
     # decode_step_pipeline: step boundaries the owner already granted as a plain
@@ -166,10 +168,13 @@ class _Batch:
     run_go: set = field(default_factory=set)
 
     def members(self, step: int) -> tuple:
-        """The requests that take part in decode run step ``step``."""
-        if not self.run_join_step:
-            return self.plan.requests
-        return tuple(ref for ref in self.plan.requests if self.run_join_step.get(ref.request_id, 1) <= step)
+        """The requests that take part in decode run step ``step``, in rank order."""
+        current = self.plan.requests
+        for first, refs in self.run_epochs:
+            if first > step:
+                break
+            current = refs
+        return current
 
 
 def _packed_view(batch: _Batch, request_id: str, committed: bool = False) -> dict[int, PackedBlocks]:
@@ -1171,13 +1176,15 @@ class MuxController:
                 if plan.stage == "P":
                     target = len(request.spec.input_ids) + (len(request.output) - 1 if plan.purpose == "REBUILD" else 0)
                 else:
-                    if plan.steps > request.spec.max_new_tokens - len(request.output):
+                    left = request.spec.max_new_tokens - len(request.output)
+                    # decode_step_leave: a member that reaches its budget earlier leaves the run.
+                    if left < 1 or (plan.steps > left and not self.config.decode_step_leave):
                         raise IntegrationError("STALE_ATTEMPT", "Decode run exceeds the remaining output budget")
                     # A run reserves capacity for all of its steps up front;
                     # every step then appends one token inside that mapping.
                     # decode_kv_per_page: only the first step's page; later
                     # pages are added at the step boundary that needs them.
-                    target = request.valid_tokens + (1 if self.config.decode_kv_per_page else plan.steps)
+                    target = request.valid_tokens + (1 if self.config.decode_kv_per_page else min(plan.steps, left))
                 targets.append(KVTarget(request.identity, target, request.allocation_id))
                 requests.append(request)
             if len({r.spec.request_id for r in requests}) != len(requests):
@@ -1204,7 +1211,7 @@ class MuxController:
             reservation = None
             reserve_called = False
             try:
-                group.outbox.reserve(owner, (plan.steps + 1) * len(requests) + 2)
+                group.outbox.reserve(owner, sum(self._run_events(plan, request) for request in requests) + 2)
                 self._reserve_commands(group, owner, 4, participants)
                 free_before = self.store.rank_usage()
                 reserve_called = True
@@ -1222,6 +1229,8 @@ class MuxController:
                     batch.prepared_plan = batch.plan
                 if plan.steps > 1:
                     for request in requests:
+                        if self.config.decode_step_join:
+                            batch.run_event_budget[request.spec.request_id] = self._run_events(plan, request)
                         batch.run_start_valid[request.spec.request_id] = request.valid_tokens
                         batch.run_start_output[request.spec.request_id] = len(request.output)
                         batch.run_published[request.spec.request_id] = 0
@@ -1270,6 +1279,13 @@ class MuxController:
                      purpose=plan.purpose, steps=plan.steps,
                      reqs=[ref.request_id for ref in plan.requests])
             return self._batch_view(batch)
+
+    def _run_events(self, plan: BatchPlan, request: _Request) -> int:
+        """Event slots one member of a batch reserves: a token per step it can run."""
+        steps = plan.steps
+        if plan.stage == "D" and steps > 1 and self.config.decode_step_leave:
+            steps = min(steps, request.spec.max_new_tokens - len(request.output))
+        return steps + 1
 
     @staticmethod
     def _d_holder(request: _Request) -> str:
@@ -1883,7 +1899,7 @@ class MuxController:
         results = payload["results"]
         members = batch.members(steps_done)
         if (not isinstance(results, (tuple, list)) or len(results) != len(members)
-                or len(members) != len(batch.plan.requests)):
+                or not {ref.request_id for ref in batch.plan.requests} <= {ref.request_id for ref in members}):
             raise IntegrationError("INVALID_REPORT", "GPU results must preserve selected order")
         normalized = {}
         for ref, result in zip(members, results):
@@ -1932,8 +1948,8 @@ class MuxController:
                 self._fence(group, batch, "decode_run_incomplete_step")
                 raise IntegrationError("INVALID_REPORT", "Every rank must report the final run step")
             batch.run_steps_done = payload["steps"]
-            batch.selected_input_tokens = sum(batch.run_steps_done - batch.run_join_step.get(ref.request_id, 1) + 1
-                                              for ref in batch.plan.requests)
+            batch.selected_input_tokens = (sum(len(batch.members(s)) for s in range(1, batch.run_steps_done + 1))
+                                           if batch.run_epochs else batch.run_steps_done * len(batch.plan.requests))
         valid = {batch.views[ref.request_id].allocation_id: results[ref.request_id]["valid_tokens"]
                  for ref in batch.plan.requests}
         if batch.plan.stage == "P" and batch.status == "RUNNING":
@@ -2045,7 +2061,8 @@ class MuxController:
                 return
             refs.append(RequestRef(ref.request_id, ref.attempt, len(request.output)))
             remaining.append(request.spec.max_new_tokens - len(request.output))
-        steps = max(1, min([self.config.decode_run_steps] + remaining))
+        steps = max(1, min(self.config.decode_run_steps,
+                           max(remaining) if self.config.decode_step_leave else min(remaining)))
         plan = BatchPlan(group.group_id, uuid4().hex, group.model_id, "D", tuple(refs),
                          purpose="GENERATE", prepare_timeout_ms=self.config.prepare_timeout_ms,
                          steps=steps)
@@ -2302,9 +2319,19 @@ class MuxController:
                                    "view": self._rank_view(item["view"], rank)}
                                   for item in decision["join"])
         if decision["extend"]:
-            reply["extend"] = tuple({"request_id": request_id, "view": self._rank_view(view, rank)}
-                                    for request_id, view in decision["extend"])
+            reply["extend"] = tuple(self._new_pages(request_id, first, view, rank)
+                                    for request_id, first, view in decision["extend"])
+        if decision.get("leave"):
+            reply["leave"] = tuple(decision["leave"])
         return reply
+
+    @staticmethod
+    def _new_pages(request_id: str, first: int, view: Any, rank: int) -> dict:
+        """One rank's pages ``first`` .. end of a grown mapping (the rank keeps the rest)."""
+        table = PackedBlocks.pack(view.block_tables[rank])
+        added = table.array()[:, :, first:]
+        return {"request_id": request_id, "first_page": first, "capacity_tokens": view.capacity_tokens,
+                "pages": PackedBlocks(table.layers, table.heads, added.shape[2], added.tobytes())}
 
     @staticmethod
     def _handoff_open(group: _Group, batch_id: str) -> bool:
@@ -2441,16 +2468,29 @@ class MuxController:
             return False
         if not self.config.decode_step_join:
             return True
-        if self._d_work_pending(group) or self._join_candidates(group, batch):
+        if (self._d_work_pending(group) or self._join_candidates(group, batch)
+                or (self.config.decode_step_leave and self._leavers(group, batch))):
             return False
         return not (self.config.decode_kv_per_page and any(
             batch.run_start_valid[ref.request_id] + step + 1 > batch.views[ref.request_id].capacity_tokens
             for ref in batch.members(step + 1)))
 
-    def _join_candidates(self, group: _Group, batch: _Batch) -> list:
+    def _leavers(self, group: _Group, batch: _Batch) -> list:
+        """decode_step_leave: members that end in this run (finished, stopping, expired)."""
+        now = self.clock()
+        leaving = []
+        for ref in batch.plan.requests:
+            request = self._request(group.model_id, ref.request_id)
+            if (request.attempt != ref.attempt or request.pending_reason or request.finish_reason
+                    or now >= request.deadline):
+                leaving.append(ref)
+        return leaving
+
+    def _join_candidates(self, group: _Group, batch: _Batch, staying: int | None = None) -> list:
         """This model's requests that may join the run now, oldest first, up to the limit."""
         model = group.model_id
-        room = min(self.config.max_model_inflight, self.policy.limits[model]) - len(batch.plan.requests)
+        room = (min(self.config.max_model_inflight, self.policy.limits[model])
+                - (len(batch.plan.requests) if staying is None else staying))
         if room <= 0 or self._decode_only_for(model) is not None:
             return []
         now = self.clock()
@@ -2481,43 +2521,102 @@ class MuxController:
             batch.packed.pop(view.identity.request_id, None)
         return views
 
+    def _set_members(self, batch: _Batch, first_step: int, refs) -> None:
+        """Members from run step ``first_step`` on (joins, leaves); earlier steps keep theirs."""
+        if not batch.run_epochs:
+            batch.run_epochs.append((1, batch.plan.requests))
+        batch.run_epochs.append((first_step, tuple(refs)))
+        batch.plan = replace(batch.plan, requests=tuple(refs))
+
+    def _grow_pages(self, group: _Group, batch: _Batch, step: int, staying) -> list | None:
+        """decode_kv_per_page: KV for run step ``step + 1``. When a member needs a page,
+        it and every member about to need one get decode_kv_grow_pages pages (only what
+        the request can still use); if those cannot be had, only the pages needed now.
+        Returns (request, first new page, view) per grown member, or None: no page."""
+        size = 16
+        chunk = self.config.decode_kv_grow_pages
+        due, soon = [], []
+        for ref in staying:
+            view = batch.views[ref.request_id]
+            need = batch.run_start_valid[ref.request_id] + step + 1
+            if need > view.capacity_tokens:
+                due.append((ref, need))
+            elif need + size > view.capacity_tokens:
+                soon.append((ref, need))
+        if not due:
+            return []
+        old = {ref.request_id: batch.views[ref.request_id].capacity_tokens // size for ref, _ in due + soon}
+
+        def targets(rows, full):
+            result = []
+            for ref, need in rows:
+                request = self._request(group.model_id, ref.request_id)
+                view = batch.views[ref.request_id]
+                limit = min(len(request.spec.input_ids) + request.spec.max_new_tokens - 1,
+                            self.config.max_context_tokens)
+                tokens = max(need, min(((need - 1) // size + chunk) * size, limit)) if full else need
+                result.append(KVTarget(view.identity, tokens, view.allocation_id))
+            return result
+
+        for rows, full in ((due + soon, True), (due, False)):
+            try:
+                views = self._grow_reservation(group, batch, targets(rows, full))
+            except IntegrationError as exc:
+                if exc.code != "OUT_OF_CAPACITY":
+                    raise
+                continue
+            return [(view.identity.request_id, old[view.identity.request_id], view) for view in views
+                    if view.capacity_tokens // size > old[view.identity.request_id]]
+        trace.ev("page_fail", batch.plan.batch_id, m=group.model_id, step=step, n=len(due))
+        return None
+
+    def _leave(self, group: _Group, batch: _Batch, ref, step: int) -> None:
+        """decode_step_leave: ``ref`` ran its last step ``step`` in this run. Commit its KV
+        on its own, return its unused event slots and hand it to the ordinary cleanup."""
+        request = self._request(group.model_id, ref.request_id)
+        view = self.store.detach_kv_batch(batch.reservation.reservation_id, batch.views[ref.request_id].allocation_id,
+                                          batch.run_start_valid[ref.request_id] + step,
+                                          trim_to_valid=self.config.decode_kv_trim)
+        unused = batch.run_event_budget.get(ref.request_id, 0) - batch.run_published.get(ref.request_id, 0)
+        if unused > 0:
+            group.outbox.grow(batch.holder, -unused)
+        if request.attempt != ref.attempt:
+            return
+        request.allocation_id, request.valid_tokens, request.version = (
+            view.allocation_id, view.valid_tokens, view.version)
+        if self.clock() >= request.deadline and request.pending_reason is None and not request.finish_reason:
+            request.pending_reason = "timeout"
+        request.state = "CLEANUP_PENDING"
+
     def _grow_run(self, group: _Group, batch: _Batch, step: int):
-        """Run step + 1 (decode_step_join): with decode_kv_per_page first add the
-        KV page any member needs for it (none to be had ends the run), then take
-        in this model's newly decodable requests, oldest first, up to the batch
-        limit. True, or the joins and new pages every rank applies first."""
+        """Run step + 1 (decode_step_join). In order, so a refusal changes nothing the
+        ranks must see: with decode_kv_per_page the pages members staying need (none to
+        be had ends the run); this model's newly decodable requests join, oldest first,
+        up to the batch limit (an event window too small ends the run); with
+        decode_step_leave members that ended leave. True, or what every rank applies."""
         model = group.model_id
-        extend = []
+        extend, joined = [], []
+        leaving = self._leavers(group, batch) if self.config.decode_step_leave else []
+        names = {ref.request_id for ref in leaving}
+        staying = [ref for ref in batch.plan.requests if ref.request_id not in names]
+        if not staying:
+            return False  # Every member ended: the run ends as before.
         try:
             if self.config.decode_kv_per_page:
-                targets = []
-                for ref in batch.members(step + 1):
-                    view = batch.views[ref.request_id]
-                    need = batch.run_start_valid[ref.request_id] + step + 1
-                    if need > view.capacity_tokens:
-                        targets.append(KVTarget(view.identity, need, view.allocation_id))
-                if targets:
-                    try:
-                        views = self._grow_reservation(group, batch, targets)
-                    except IntegrationError as exc:
-                        if exc.code != "OUT_OF_CAPACITY":
-                            raise
-                        trace.ev("page_fail", batch.plan.batch_id, m=model, step=step, n=len(targets))
-                        return False
-                    extend = [(view.identity.request_id, view) for view in views]
-            joined = []
-            picked = self._join_candidates(group, batch)
+                extend = self._grow_pages(group, batch, step, staying)
+                if extend is None:
+                    return False
+            picked = self._join_candidates(group, batch, len(staying))
             if picked:
                 left = batch.plan.steps - step
                 budget = {r.spec.request_id: min(left, r.spec.max_new_tokens - len(r.output)) for r in picked}
-                if picked:
-                    try:
-                        group.outbox.grow(batch.holder, sum(budget.values()))
-                    except IntegrationError as exc:
-                        if exc.code != "EVENT_BACKPRESSURE":
-                            raise
-                        trace.ev("join_fail", batch.plan.batch_id, m=model, step=step, code=exc.code)
-                        return False  # End: the next run is sized to the event window.
+                try:
+                    group.outbox.grow(batch.holder, sum(budget.values()))
+                except IntegrationError as exc:
+                    if exc.code != "EVENT_BACKPRESSURE":
+                        raise
+                    trace.ev("join_fail", batch.plan.batch_id, m=model, step=step, code=exc.code)
+                    return False  # End: the next run is sized to the event window.
                 views = ()
                 while picked:
                     targets = [KVTarget(r.identity, r.valid_tokens + (
@@ -2536,27 +2635,38 @@ class MuxController:
                     batch.run_start_valid[request_id] = request.valid_tokens - step
                     batch.run_start_output[request_id] = len(request.output)
                     batch.run_published[request_id] = 0
-                    batch.run_join_step[request_id] = step + 1
+                    batch.run_event_budget[request_id] = budget[request_id]
                     request.state = "RUNNING"
                     joined.append({"request_id": request_id, "attempt": request.attempt,
                                    "start_valid": request.valid_tokens - step,
                                    "output_token_ids": tuple(request.output),
                                    "max_new_tokens": request.spec.max_new_tokens, "view": view})
-                if joined:
-                    batch.plan = replace(batch.plan, requests=batch.plan.requests + tuple(
-                        RequestRef(item["request_id"], item["attempt"], len(item["output_token_ids"]))
-                        for item in joined))
-                    trace.ev("join", batch.plan.batch_id, m=model, step=step,
-                             reqs=[item["request_id"] for item in joined], size=len(batch.plan.requests))
+            for ref in leaving:
+                self._leave(group, batch, ref, step)
+            if joined or leaving:
+                self._set_members(batch, step + 1, tuple(staying) + tuple(
+                    RequestRef(item["request_id"], item["attempt"], len(item["output_token_ids"]))
+                    for item in joined))
+            if joined:
+                trace.ev("join", batch.plan.batch_id, m=model, step=step,
+                         reqs=[item["request_id"] for item in joined], size=len(batch.plan.requests))
+            if leaving:
+                trace.ev("leave", batch.plan.batch_id, m=model, step=step,
+                         reqs=[ref.request_id for ref in leaving], size=len(batch.plan.requests))
+                for ref in leaving:
+                    request = self._request(model, ref.request_id)
+                    if request.attempt == ref.attempt and request.state == "CLEANUP_PENDING":
+                        self._begin_cleanup(request)
         except IntegrationError as exc:
             # The store refused a running reservation it owns: ownership is uncertain.
             self._fence(group, batch, "run_growth:" + exc.code)
             return False
         if extend:
             trace.ev("page", batch.plan.batch_id, m=model, step=step, n=len(extend))
-        if not joined and not extend:
+        if not joined and not extend and not leaving:
             return True
-        return {"join": tuple(joined), "extend": tuple(extend)}
+        return {"join": tuple(joined), "extend": tuple(extend),
+                "leave": tuple(ref.request_id for ref in leaving)}
 
     def _apply_run_step(self, group: _Group, batch: _Batch, step: int, results) -> None:
         batch.run_applied = step
@@ -2591,12 +2701,13 @@ class MuxController:
         if (finished or step >= batch.plan.steps or batch.status != "RUNNING"
                 or group.fenced or group.draining or self.protected_failure is not None):
             return False
-        now = self.clock()
-        for ref in batch.plan.requests:
-            request = self._request(group.model_id, ref.request_id)
-            if (request.attempt != ref.attempt or request.pending_reason or request.finish_reason
-                    or now >= request.deadline):
-                return False
+        if not self.config.decode_step_leave:  # decode_step_leave: such members leave instead
+            now = self.clock()
+            for ref in batch.plan.requests:
+                request = self._request(group.model_id, ref.request_id)
+                if (request.attempt != ref.attempt or request.pending_reason or request.finish_reason
+                        or now >= request.deadline):
+                    return False
         protected = self._decode_only_for(group.model_id)
         if protected is not None and {(group.model_id, ref.request_id)
                                       for ref in batch.plan.requests} != {protected}:

@@ -34,7 +34,7 @@ from sglang.srt.utils import DynamicGradMode
 
 from . import trace
 from .step_profile import StepProfiler
-from .contracts import IntegrationError, KVView, RequestIdentity
+from .contracts import IntegrationError, KVView, PackedBlocks, RequestIdentity
 from .ipc import CommandSnapshot, copy_message
 
 
@@ -69,9 +69,11 @@ class Prepared:
     handoff_done: bool = False
     decode_rollback: list = field(default_factory=list)
     # decode_step_join: this rank's KV view of every run member (own table
-    # only) and the rows that joined or grew since the last step's binding.
+    # only), the views of members that joined or grew (by request) and whether
+    # members joined, left or grew since the last step's binding.
     run_views: list = field(default_factory=list)
     run_changes: dict = field(default_factory=dict)
+    run_regrow: bool = False
 
 
 class ControlledScheduler:
@@ -725,6 +727,7 @@ class ControlledScheduler:
             from concurrent.futures import ThreadPoolExecutor
             self._report_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="step-report")
         in_flight, ahead = None, False
+        leave = self._flag("decode_step_leave")
         while True:
             forward_started = time.perf_counter()
             previous_output_counts = [len(req.output_ids) for req in state.reqs]
@@ -757,6 +760,9 @@ class ControlledScheduler:
                         "token_id": req.output_ids[-1], "valid_tokens": valid + step}
                        for req, item, valid in zip(state.reqs, state.command["requests"], start_valid)]
             finished = any(req.finished() for req in state.reqs)
+            # decode_step_leave: a finished member leaves at this boundary; only a run
+            # whose every member finished ends here.
+            ending = all(req.finished() for req in state.reqs) if leave else finished
             if leader_only:
                 digest = zlib.crc32(",".join(str(item["token_id"]) for item in results).encode(), digest)
             if in_flight is not None:
@@ -764,17 +770,17 @@ class ControlledScheduler:
                 # may simply continue (and raises the report's failure, if any).
                 ahead = in_flight.result().get("ahead") is True
                 in_flight = None
-            if (finished or step >= steps) and getattr(getattr(self.ctx, "config", None), "final_step_in_gpu_done", False):
+            if (ending or step >= steps) and getattr(getattr(self.ctx, "config", None), "final_step_in_gpu_done", False):
                 # The owner's decision for a locally final step is always to
                 # stop: report the step inside GPU_DONE (one RPC, not two).
-                final_step = {"step": step, "results": results, "finished": finished}
+                final_step = {"step": step, "results": results, "finished": ending}
                 break
-            continuing = not (finished or step >= steps)
-            if (pipeline and continuing and ahead and all(
+            continuing = not (ending or step >= steps)
+            if (pipeline and continuing and ahead and not finished and all(
                     view.capacity_tokens >= valid + step + 1 for view, valid in zip(state.run_views, start_valid))):
                 # Granted ahead: run on now, report this step while the next one runs.
                 in_flight = self._report_pool.submit(self.rpc, "decode_step", self.rank, self.pid,
-                                                     command["batch_id"], step, results, finished, True)
+                                                     command["batch_id"], step, results, ending, True)
                 reply, ahead = {"continue": True}, False
                 self.step_box.publish(tag, step, True)
             elif (leader_only and continuing and self.rank != 0
@@ -782,12 +788,12 @@ class ControlledScheduler:
                 reply = {"continue": True}
             else:
                 reply = self.rpc("decode_step", self.rank, self.pid, command["batch_id"], step,
-                                 results, finished)
+                                 results, ending)
                 ahead = reply.get("ahead") is True
                 if leader_only and continuing and self.rank == 0:
                     # Joins and new pages reach every rank through its own report.
-                    self.step_box.publish(tag, step, reply.get("continue") is True
-                                          and not reply.get("join") and not reply.get("extend"))
+                    self.step_box.publish(tag, step, reply.get("continue") is True and not reply.get("join")
+                                          and not reply.get("extend") and not reply.get("leave"))
             if join:
                 while reply.get("continue") in ("PARK", "SYNC"):
                     # Waiting at the boundary (GPU idle, synchronized above):
@@ -801,7 +807,7 @@ class ControlledScheduler:
                 # Parked for a waiting prefill: the GPU is idle (synchronized
                 # above) and every native/KV state stays as it is.
                 reply = self.rpc("decode_resume", self.rank, self.pid, command["batch_id"], step, 100)
-            if finished or step >= steps or reply.get("continue") is not True:
+            if ending or step >= steps or reply.get("continue") is not True:
                 break
             prepared_at = time.perf_counter()
             if join:
@@ -813,6 +819,8 @@ class ControlledScheduler:
         payload = {"reservation_id": state.command["reservation_id"], "results": results,
                    "gpu_forward_ms": gpu_forward_ms, "duration_ms": (time.monotonic() - start) * 1000,
                    "steps": step}
+        if in_flight is not None:  # never: every exit waits for it first
+            in_flight.result()
         if leader_only:
             payload["token_digest"] = digest
         if final_step is not None:
@@ -833,11 +841,12 @@ class ControlledScheduler:
         set_schedule_time_batch(state.batch)
         rows = [req.kv.req_pool_idx for req in state.reqs]
         targets = [valid + step for valid in start_valid]
-        if state.run_changes:
-            # Members joined or mappings grew (decode_step_join): only the new
-            # blocks are validated and uploaded.
-            self.pool.grow_decode(rows, targets, [state.run_changes.get(index) for index in range(len(rows))])
-            state.run_changes = {}
+        if state.run_regrow:
+            # Members joined, left or grew (decode_step_join): only the blocks they
+            # touch are validated and uploaded.
+            self.pool.grow_decode(rows, targets, [state.run_changes.get(item["request_id"])
+                                                  for item in state.command["requests"]])
+            state.run_changes, state.run_regrow = {}, False
         else:
             self.pool.advance_decode(rows, targets)
         require(tuple(state.batch.req_pool_indices_cpu.tolist()) == tuple(rows)
@@ -878,17 +887,38 @@ class ControlledScheduler:
         self._absorb_reply_commands()
 
     def _apply_growth(self, state, start_valid, reply, step):
-        """The joins and new KV pages the owner decided at this boundary, identical on
-        every rank: a joined request decodes from the next step on exactly as in a
-        fresh decode PREPARE; the next step's binding takes the new rows and pages."""
+        """What the owner decided at this boundary, identical on every rank: members that
+        leave, new pages (only the pages after the ones this rank holds), joined requests
+        that decode from the next step on exactly as in a fresh decode PREPARE. The next
+        step's binding takes these changes."""
+        leave = set(reply.get("leave", ()))
+        if leave:
+            ids = [item["request_id"] for item in state.command["requests"]]
+            require(leave <= set(ids), "A leaving request is not in the run")
+            keep = [index for index, request_id in enumerate(ids) if request_id not in leave]
+            state.reqs = [state.reqs[index] for index in keep]
+            state.command["requests"] = [state.command["requests"][index] for index in keep]
+            start_valid[:] = [start_valid[index] for index in keep]
+            state.run_views = [state.run_views[index] for index in keep]
+            state.command["ordered_request_ids"] = tuple(item["request_id"] for item in state.command["requests"])
+            for request_id in leave:
+                state.run_changes.pop(request_id, None)
+            state.run_regrow = True
         ids = [item["request_id"] for item in state.command["requests"]]
         for item in reply.get("extend", ()):
             index = ids.index(item["request_id"])
-            view = self._own_view(item["view"])
-            require(view.allocation_id == state.run_views[index].allocation_id
-                    and view.capacity_tokens > state.run_views[index].capacity_tokens,
-                    "Run KV growth differs from its member")
-            state.run_views[index] = state.run_changes[index] = view
+            old = state.run_views[index]
+            own = old.block_tables[self.rank]
+            table = own.array() if isinstance(own, PackedBlocks) else np.asarray(own, dtype=np.int32)
+            pages = item["pages"]
+            require(item["first_page"] == table.shape[2] and pages.layers == table.shape[0]
+                    and pages.heads == table.shape[1]
+                    and table.shape[2] + pages.pages == (item["capacity_tokens"] + 15) // 16
+                    and item["capacity_tokens"] > old.capacity_tokens, "Run KV growth differs from its member")
+            grown = np.concatenate([table, pages.array()], axis=2)
+            state.run_views[index] = state.run_changes[item["request_id"]] = replace(
+                old, capacity_tokens=item["capacity_tokens"], block_tables={self.rank: grown})
+            state.run_regrow = True
         for item in reply.get("join", ()):
             identity = (item["request_id"], item["attempt"])
             req = self.requests.get(identity)
@@ -907,9 +937,14 @@ class ControlledScheduler:
                                               "target_valid_tokens": item["start_valid"] + 1})
             state.command["ordered_request_ids"] = tuple(state.command["ordered_request_ids"]) + (identity[0],)
             start_valid.append(item["start_valid"])
-            state.run_changes[len(state.run_views)] = view
             state.run_views.append(view)
+            state.run_changes[identity[0]] = view
             ids.append(identity[0])
+            state.run_regrow = True
+        if leave:
+            # Their cleanup was queued with this decision: release them here (no
+            # collective), so their KV returns to the pool without waiting for the run.
+            self._service_in_run(())
 
     def _validate_finish(self, req):
         # Native precedence is EOS/stop token before length (same as owner).

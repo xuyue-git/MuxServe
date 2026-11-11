@@ -269,16 +269,18 @@ class HeadwiseTokenToKVPool(KVCache):
 
     def grow_decode(self, req_pool_indices: Sequence[int], target_lengths: Sequence[int],
                     views: Sequence[KVView | None]) -> None:
-        """decode_step_join: the next step of a granted decode run whose members joined or
-        got pages at this boundary. ``views`` has one entry per row: None keeps the row's
-        frozen mapping; otherwise this rank's view of that request, either a joined row
-        (appended after the existing rows, its target exactly one token past its committed
-        KV) or an existing row whose mapping kept its pages and grew by whole pages.
+        """decode_step_join: the next step of a granted decode run whose members joined,
+        left or got pages at this boundary. ``req_pool_indices`` lists the rows that stay,
+        in their previous order, then the joined rows. ``views`` has one entry per row:
+        None keeps the row's frozen mapping; otherwise this rank's view of that request,
+        either a joined row (its target exactly one token past its committed KV) or a
+        staying row whose mapping kept its pages and grew by whole pages.
 
         Only the new blocks are validated (in the imported pool, not mapped by any row,
-        including the same row), against a per-run map of mapped blocks, so a growth costs
-        as much as the blocks it adds. Every row still advances by exactly one token
-        inside its mapping, and changed rows are re-uploaded to a decode graph alone.
+        including the same row), against a per-run map of mapped blocks that also drops
+        the blocks of rows that left, so a change costs as much as the blocks it touches.
+        Every row still advances by exactly one token inside its mapping; rows that moved
+        or changed are re-uploaded to a decode graph alone.
         """
         bound = self.bound_forward
         _require(bound.mode == "DECODE" and bound.batch is not None,
@@ -286,21 +288,30 @@ class HeadwiseTokenToKVPool(KVCache):
         rows = _cpu_ints(req_pool_indices, "bound request rows")
         targets = _cpu_ints(target_lengths, "bound target lengths")
         views = list(views)
-        old = len(bound.req_pool_indices)
-        _require(len(rows) == len(targets) == len(views) and rows[:old] == bound.req_pool_indices
+        position = {row: index for index, row in enumerate(bound.req_pool_indices)}
+        kept = 0
+        while kept < len(rows) and rows[kept] in position:
+            kept += 1
+        order = [position[row] for row in rows[:kept]]
+        _require(len(rows) == len(targets) == len(views) and len(rows) > 0
                  and len(set(rows)) == len(rows) and all(row >= 0 for row in rows)
-                 and all(view is not None for view in views[old:]),
-                 "Decode run rows may only be appended", "FORWARD_MISMATCH")
-        np_tables = list(bound.np_tables if bound.np_tables is not None else
-                         [np.asarray(table, dtype=np.int64) for table in bound.tables])
+                 and order == sorted(order) and all(view is not None for view in views[kept:]),
+                 "Decode run rows may only leave or be appended", "FORWARD_MISMATCH")
+        previous = list(bound.np_tables if bound.np_tables is not None else
+                        [np.asarray(table, dtype=np.int64) for table in bound.tables])
         if bound.used_blocks is None:
             mapped = np.zeros(self.physical_block_count, dtype=bool)
-            for table in np_tables:
+            for table in previous:
                 mapped[table.reshape(-1)] = True
         else:
             mapped = bound.used_blocks.copy()
-        capacities = list(bound.capacities)
-        changed = []
+        for index in set(range(len(previous))) - set(order):
+            mapped[previous[index].reshape(-1)] = False  # the row left the run
+        np_tables = [previous[index] for index in order]
+        capacities = [bound.capacities[index] for index in order]
+        prior_targets = [bound.target_lengths[index] for index in order]
+        changed = {new for new, old in enumerate(order) if new != old}
+        changed |= {order.index(old) for old in bound.graph_dirty if old in order}
         for index, view in enumerate(views):
             if view is None:
                 continue
@@ -312,7 +323,7 @@ class HeadwiseTokenToKVPool(KVCache):
             table = (own.array() if isinstance(own, PackedBlocks) else np.asarray(own)).astype(np.int64)
             _require(table.shape == (self.layer_num, self.head_num, (view.capacity_tokens + 15) // 16),
                      "Incomplete physical page mapping")
-            if index < old:
+            if index < kept:
                 prior = np_tables[index]
                 _require(view.capacity_tokens > capacities[index]
                          and np.array_equal(table[:, :, :prior.shape[2]], prior),
@@ -331,15 +342,15 @@ class HeadwiseTokenToKVPool(KVCache):
             _require(np.unique(added).size == added.size and not mapped[added].any(),
                      "Aliased physical blocks across requests/layers/heads")
             mapped[added] = True
-            changed.append(index)
-        _require(all(new == prior + 1 for new, prior in zip(targets, bound.target_lengths))
+            changed.add(index)
+        _require(all(new == prior + 1 for new, prior in zip(targets, prior_targets))
                  and all(0 < target <= min(capacity, 2048) for target, capacity in zip(targets, capacities)),
                  "Decode run must append one token inside its mapping", "FORWARD_MISMATCH")
         self._bound = BoundForward("DECODE", rows, targets, (1,) * len(rows),
                                    tuple(target - 1 for target in targets), tuple(np_tables),
                                    capacities=tuple(capacities), np_tables=np_tables,
                                    graph_tables=bound.graph_tables, used_blocks=mapped,
-                                   graph_dirty=tuple(sorted(set(bound.graph_dirty) | set(changed))))
+                                   graph_dirty=tuple(sorted(changed)))
 
     def clear_forward(self) -> None:
         """Caller must hold the grant until all-rank GPU completion before clearing."""

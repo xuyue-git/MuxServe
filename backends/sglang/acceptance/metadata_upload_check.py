@@ -457,6 +457,23 @@ class StepJoinGrowthChecks(unittest.TestCase):
         self.assertEqual(len(self.step(3)), 1)
         self.assertTrue(numpy.array_equal(pool.graph.tables.array[:, :3], self.expected_graph(3)))
 
+    def test_a_leaving_row_frees_its_blocks_and_moved_rows_are_reuploaded(self):
+        pool = self.pool
+        self.step(2)
+        pool.grow_decode([1], [31], [None])  # row 0 left the run
+        bound = pool.bound_forward
+        self.assertEqual((bound.req_pool_indices, bound.target_lengths, bound.capacities), ((1,), (31,), (32,)))
+        self.assertEqual(len(self.step(1)), 1)  # row 1 moved to position 0
+        self.assertTrue(numpy.array_equal(pool.graph.tables.array[:, :1], self.expected_graph(1)))
+        # The leaver's blocks may be handed to a joining request now.
+        reused = KVView('a-new', RequestIdentity('m', 'r-new'), 32, 20, 16,
+                        {1: deepcopy(self.views[0].block_tables[1])})
+        pool.grow_decode([1, 9], [32, 21], [None, reused])
+        self.assertEqual(len(self.step(2)), 1)
+        self.assertTrue(numpy.array_equal(pool.graph.tables.array[:, :2], self.expected_graph(2)))
+        with self.assertRaises(IntegrationError):  # rows that stay keep their order
+            pool.grow_decode([9, 1], [22, 33], [None, None])
+
     def test_growth_rejects_aliases_changed_pages_removed_rows_and_skipped_tokens(self):
         pool = self.pool
         self.step(2)
@@ -473,7 +490,6 @@ class StepJoinGrowthChecks(unittest.TestCase):
                 ('duplicate', ([0, 1, 7], [18, 31, 21], [None, None, twice])),
                 ('moved', ([0, 1], [18, 31], [moved, None])),
                 ('outside', ([0, 1, 7], [18, 31, 21], [None, None, outside])),
-                ('removed', ([0], [18], [None])),
                 ('reordered', ([1, 0], [31, 18], [None, None])),
                 ('joined without view', ([0, 1, 7], [18, 31, 21], [None, None, None])),
                 ('skipped token', ([0, 1], [19, 31], [self.grown(0, 1, 15000), None])),

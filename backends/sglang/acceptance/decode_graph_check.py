@@ -59,7 +59,13 @@ class DecodeGraphConfigChecks(unittest.TestCase):
         self.assertFalse(config.decode_step_join or config.decode_kv_per_page)
         both = self.config(decode_step_join=True, decode_kv_per_page=True)
         self.assertTrue(both.decode_step_join and both.decode_kv_per_page)
-        for bad in (dict(decode_kv_per_page=True), dict(decode_step_join=1)):
+        leave = self.config(decode_step_join=True, decode_leader_reports=True, decode_step_leave=True,
+                            decode_kv_grow_pages=4)
+        self.assertTrue(leave.decode_step_leave and leave.decode_kv_grow_pages == 4)
+        for bad in (dict(decode_kv_per_page=True), dict(decode_step_join=1),
+                    dict(decode_step_join=True, decode_step_leave=True),
+                    dict(decode_kv_grow_pages=9), dict(decode_kv_grow_pages=True),
+                    dict(decode_step_pipeline=True)):
             with self.assertRaises(IntegrationError):
                 self.config(**bad)
 

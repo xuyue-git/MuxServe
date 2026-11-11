@@ -156,6 +156,9 @@ class ControllerDriver:
             # fit would fail with EVENT_BACKPRESSURE on every retry.
             group = self.controller.groups.get(proposal.model_id)
             window = group.outbox.maximum_pending if group is not None else None
+        if getattr(self.config, "decode_step_leave", False) and remaining:
+            # Members that reach their budget earlier leave the run; the longest decides.
+            remaining = [max(remaining)]
         if window is not None and outputs:
             remaining.append((window - 3) // len(outputs) - 1)
         return max(1, min([limit] + remaining))

@@ -276,6 +276,16 @@ class DeploymentConfig:
     # decided as before. Anything new is acted on one step later. Requires
     # decode_leader_reports.
     decode_step_pipeline: bool = False
+    # A request that finishes (or is cancelled, suspended or times out) leaves a running
+    # decode run at the next step boundary, as the original drops it from its running
+    # batch: its KV is committed on its own and the rest of the run goes on, instead of
+    # the whole run ending and being prepared again. Requires decode_step_join and
+    # decode_leader_reports.
+    decode_step_leave: bool = False
+    # decode_kv_per_page: pages a request gets each time it needs more KV (1..8). A
+    # boundary that grows one request also tops up every other member about to need a
+    # page, so fewer boundaries need the owner's decision.
+    decode_kv_grow_pages: int = 1
     # With two requests of a model in flight: a request that finds its model
     # idle waits this many ms, so a request arriving just after it joins the
     # same prefill batch. The pair then decodes and finishes together, as under
@@ -363,13 +373,21 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "handoff_report_with_ready", "start_in_report_reply", "targeted_wake",
                  "rpc_inline_fast_methods", "decode_leader_reports", "handoff_prepare_after_ack",
                  "decode_prepare_light", "decode_run_merge", "capacity_recovery_all_decode",
-                 "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline"):
+                 "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline",
+                 "decode_step_leave"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
     if config.decode_kv_per_page and not config.decode_step_join:
         raise IntegrationError("INVALID_CONFIG", "decode_kv_per_page requires decode_step_join")
     if config.decode_step_pipeline and not config.decode_leader_reports:
         raise IntegrationError("INVALID_CONFIG", "decode_step_pipeline requires decode_leader_reports")
+    if config.decode_step_leave and not (config.decode_step_join and config.decode_leader_reports):
+        # The leader's step report publishes the step before the owner decides on it, so
+        # the decision sees which members that very step finished.
+        raise IntegrationError("INVALID_CONFIG", "decode_step_leave requires decode_step_join and "
+                                                 "decode_leader_reports")
+    if type(config.decode_kv_grow_pages) is not int or not 1 <= config.decode_kv_grow_pages <= 8:
+        raise IntegrationError("INVALID_CONFIG", "decode_kv_grow_pages must be an integer 1..8")
     if type(config.prefill_pair_hold_ms) is not int or not 0 <= config.prefill_pair_hold_ms <= 50:
         raise IntegrationError("INVALID_CONFIG", "prefill_pair_hold_ms must be an integer 0..50")
     if config.prefill_pair_hold_ms and not (config.inline_prepare and config.decode_run_merge
