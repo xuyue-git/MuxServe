@@ -737,6 +737,229 @@ class DecodeRunChecks(unittest.TestCase):
             sim.group("a"), 0, sim.pid("a", "D", 0), batch.plan.batch_id, 1, [], False))
 
 
+class StepJoinChecks(unittest.TestCase):
+    """decode_step_join / decode_kv_per_page: a run takes prefill work, joined
+    requests and new KV pages at its step boundaries."""
+
+    # Prefills prepare beside a running decode only with decode_run_park.
+    JOIN = dict(park=True, max_model_inflight=2, decode_run_merge=True, decode_step_join=True)
+
+    @staticmethod
+    def batch(sim, batch_id):
+        return sim.controller.groups["a"].batches[batch_id]
+
+    def step(self, sim, batch_id, rank, step, tokens, finished=False):
+        batch = self.batch(sim, batch_id)
+        results = [{"request_id": ref.request_id, "attempt": ref.attempt, "token_id": tokens[ref.request_id],
+                    "valid_tokens": batch.run_start_valid[ref.request_id] + step} for ref in batch.members(step)]
+        return sim.controller.decode_step(sim.group("a"), rank, sim.pid("a", "D", rank), batch_id, step,
+                                          results, finished)
+
+    def resume(self, sim, batch_id, rank, step, **kwargs):
+        return sim.controller.decode_resume(sim.group("a"), rank, sim.pid("a", "D", rank), batch_id, step,
+                                            0, **kwargs)
+
+    def finish(self, sim, batch_id, reservation, steps, tokens):
+        batch = self.batch(sim, batch_id)
+        results = [{"request_id": ref.request_id, "attempt": ref.attempt, "token_id": tokens[ref.request_id],
+                    "valid_tokens": batch.run_start_valid[ref.request_id] + steps} for ref in batch.members(steps)]
+        for rank in range(sim.tp):
+            sim.report("a", "D", rank, batch_id, "GPU_DONE", {
+                "reservation_id": reservation, "duration_ms": 2.0, "gpu_forward_ms": 1.0,
+                "steps": steps, "results": results})
+        ids = tuple(ref.request_id for ref in batch.plan.requests)
+        for stage in ("P", "D"):
+            for rank in range(sim.tp):
+                sim.report("a", stage, rank, batch_id, "QUIESCED", {"reservation_id": reservation, "request_ids": ids})
+
+    def test_a_handed_off_request_joins_the_running_run(self):
+        sim = Sim(run_steps=8, **self.JOIN)
+        sim.submit("a", "r", max_new=10)
+        sim.submit("a", "q", max_new=3)
+        sim.prefill("a", "r", 11)
+        sim.prefill("a", "q", 21)
+        plan, reservation = sim.prepare_decode("a", "r", 8)  # q waits to decode, outside the run
+        q = sim.controller.requests[("a", "q")]
+        replies = [self.step(sim, plan.batch_id, rank, 1, {"r": 12}) for rank in range(sim.tp)]
+        for rank, reply in enumerate(replies):
+            self.assertIs(reply["continue"], True)
+            (item,) = reply["join"]
+            self.assertEqual((item["request_id"], item["start_valid"], item["output_token_ids"]),
+                             ("q", q.valid_tokens - 1, (21,)))
+            self.assertEqual(set(item["view"]["block_tables"]), {rank})  # only this rank's table
+        self.assertEqual([ref.request_id for ref in self.batch(sim, plan.batch_id).plan.requests], ["r", "q"])
+        self.assertEqual(q.state, "RUNNING")
+        for rank in range(sim.tp):
+            self.assertIs(self.step(sim, plan.batch_id, rank, 2, {"r": 13, "q": 22})["continue"], True)
+        for rank in range(sim.tp):  # q reaches its length limit at step 3
+            self.assertIs(self.step(sim, plan.batch_id, rank, 3, {"r": 14, "q": 23}, True)["continue"], False)
+        self.finish(sim, plan.batch_id, reservation, 3, {"r": 14, "q": 23})
+        r = sim.controller.requests[("a", "r")]
+        self.assertEqual((r.output, r.valid_tokens, r.state), ([11, 12, 13, 14], 6, "DECODING"))
+        self.assertEqual((q.output, q.finish_reason), ([21, 22, 23], "length"))
+        self.assertEqual(sim.tokens("a")[-5:], [12, 13, 22, 14, 23])
+        sim.store.assert_integrity()
+        holders = {v["identity"].request_id: v["holders"] for v in sim.store.snapshot()["allocations"].values()}
+        self.assertTrue(all(not h.startswith("batch:") for hs in holders.values() for h in hs))
+
+    def test_a_run_waits_at_a_boundary_for_its_models_prefill_preparation(self):
+        sim = Sim(run_steps=8, **self.JOIN)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        sim.submit("a", "q", max_new=6)
+        out = sim.controller.request_output("a", "q")
+        p_plan = BatchPlan(sim.group("a"), "p-q", "a", "P", (RequestRef("q", out["attempt"], 0),))
+        p_reservation = sim.controller.prepare_batch(p_plan)["reservation_id"]
+        # Without the switch the run would end here (merge); now it waits.
+        for rank in range(sim.tp):
+            reply = self.step(sim, plan.batch_id, rank, 1, {"r": 12})
+            self.assertEqual((reply["continue"], reply["handoffs"]), ("SYNC", ()))
+        self.assertEqual(self.resume(sim, plan.batch_id, 0, 1)["continue"], "SYNC")
+        for rank in range(sim.tp):
+            sim.report("a", "D", rank, "p-q", "READY", {"reservation_id": p_reservation})
+        self.assertIs(self.resume(sim, plan.batch_id, 0, 1)["continue"], True)
+        self.assertIs(self.resume(sim, plan.batch_id, 1, 1)["continue"], True)  # replayed
+
+    def test_a_parked_run_runs_the_handoff_then_takes_the_request(self):
+        sim = Sim(run_steps=8, **self.JOIN)
+        sim.submit("a", "r", max_new=10)
+        sim.prefill("a", "r", 11)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        sim.submit("a", "q", max_new=6)
+        p_plan, p_out, p_reservation = sim.prefill_ready("a", "q")
+        for rank in range(sim.tp):
+            self.assertEqual(self.step(sim, plan.batch_id, rank, 1, {"r": 12})["continue"], "PARK")
+        sim.controller.start_batch(sim.group("a"), p_plan.batch_id)
+        group = sim.controller.groups["a"]
+        for rank in range(sim.tp):
+            item = next(c for c in sim.commands("a", "P", rank, "PREPARE")
+                        if c["batch_id"] == p_plan.batch_id)["requests"][0]
+            view = item["reservation_view"]
+            sim.controller.broker_stage(sim.group("a"), item["bootstrap_room"], rank, sim.pid("a", "P", rank), {
+                "bootstrap_room": item["bootstrap_room"], "allocation_id": view["allocation_id"],
+                "reserved_version": view["version"], "target_valid_tokens": 3, "rank": rank,
+                "native_payload": {"x": 1}})
+        for rank in range(sim.tp):
+            sim.report("a", "P", rank, p_plan.batch_id, "GPU_DONE", {
+                "reservation_id": p_reservation, "duration_ms": 1.0, "gpu_forward_ms": 1.0,
+                "results": [{"request_id": "q", "attempt": 0, "token_id": 21, "valid_tokens": 3}]})
+        # Credits are free again, but the handoff runs at this boundary first.
+        reply = self.resume(sim, plan.batch_id, 0, 1)
+        self.assertEqual((reply["continue"], reply["handoffs"]), ("PARK", (p_plan.batch_id,)))
+        epoch = group.epoch
+        reply = sim.controller.decode_resume(sim.group("a"), 0, sim.pid("a", "D", 0), plan.batch_id, 1, 0,
+                                             None, epoch, (p_plan.batch_id,))
+        self.assertEqual(reply["continue"], "PARK")
+        for rank in range(sim.tp):
+            item = sim.commands("a", "D", rank, "HANDOFF")[-1]["requests"][0]
+            sim.controller.broker_ack(sim.group("a"), item["bootstrap_room"], rank, sim.pid("a", "D", rank),
+                                      item["allocation_id"], item["version"], item["valid_tokens"],
+                                      item["rank_block_table"])
+        self.assertNotEqual(group.epoch, epoch)  # a waiting rank wakes to read the broker state
+        for rank in range(sim.tp - 1):
+            item = sim.commands("a", "D", rank, "HANDOFF")[-1]["requests"][0]
+            sim.report("a", "D", rank, p_plan.batch_id, "HANDOFF_READY", {"requests": [item]})
+        self.assertEqual(self.resume(sim, plan.batch_id, 0, 1)["continue"], "PARK")  # one rank still handing off
+        item = sim.commands("a", "D", sim.tp - 1, "HANDOFF")[-1]["requests"][0]
+        sim.report("a", "D", sim.tp - 1, p_plan.batch_id, "HANDOFF_READY", {"requests": [item]})
+        reply = self.resume(sim, plan.batch_id, 0, 1)  # P ranks still quiesce: q may join already
+        self.assertIs(reply["continue"], True)
+        self.assertEqual([item["request_id"] for item in reply["join"]], ["q"])
+        self.assertEqual(self.resume(sim, plan.batch_id, 1, 1)["join"][0]["request_id"], "q")
+        for rank in range(sim.tp):
+            sim.report("a", "P", rank, p_plan.batch_id, "QUIESCED",
+                       {"reservation_id": p_reservation, "request_ids": ("q",)})
+        for rank in range(sim.tp):
+            self.assertIs(self.step(sim, plan.batch_id, rank, 2, {"r": 13, "q": 22})["continue"], True)
+        sim.controller.cancel_request("a", "q")
+        for rank in range(sim.tp):
+            self.assertIs(self.step(sim, plan.batch_id, rank, 3, {"r": 14, "q": 23})["continue"], False)
+        self.finish(sim, plan.batch_id, reservation, 3, {"r": 14, "q": 23})
+        self.assertEqual(sim.controller.requests[("a", "q")].output, [21, 22])  # nothing after the cancel
+        sim.store.assert_integrity()
+        self.assertTrue(all(not any(refs) for refs in sim.controller.credits.refs.values()))
+
+    def test_per_page_kv_grows_one_page_at_its_boundary(self):
+        sim = Sim(run_steps=40, decode_kv_per_page=True, **self.JOIN)
+        sim.submit("a", "r", max_new=40)
+        sim.prefill("a", "r", 11)  # 3 prompt tokens committed
+        plan, reservation = sim.prepare_decode("a", "r", 30)
+        batch = self.batch(sim, plan.batch_id)
+        self.assertEqual(batch.views["r"].capacity_tokens, 16)  # one page, not 3 + 30
+        token = 12
+        for step in range(1, 13):
+            for rank in range(sim.tp):
+                self.assertIs(self.step(sim, plan.batch_id, rank, step, {"r": token})["continue"], True)
+            token += 1
+        # Step 13 needs position 16 (17 tokens): the decision adds one page.
+        for rank in range(sim.tp):
+            reply = self.step(sim, plan.batch_id, rank, 13, {"r": token})
+            (item,) = reply["extend"]
+            self.assertEqual((item["request_id"], item["view"]["capacity_tokens"]), ("r", 32))
+            self.assertEqual(set(item["view"]["block_tables"]), {rank})
+        token += 1
+        for step in range(14, 29):
+            for rank in range(sim.tp):
+                self.assertIs(self.step(sim, plan.batch_id, rank, step, {"r": token})["continue"], True)
+            token += 1
+        # No page left: the run ends at this boundary instead.
+        with mock.patch.object(sim.store, "extend_kv_batch", side_effect=IntegrationError("OUT_OF_CAPACITY", "full")):
+            for rank in range(sim.tp):
+                self.assertIs(self.step(sim, plan.batch_id, rank, 29, {"r": token})["continue"], False)
+        self.finish(sim, plan.batch_id, reservation, 29, {"r": token})
+        r = sim.controller.requests[("a", "r")]
+        self.assertEqual((len(r.output), r.valid_tokens, r.state), (30, 32, "DECODING"))
+        sim.store.assert_integrity()
+
+    def test_a_join_that_does_not_fit_the_event_window_ends_the_run(self):
+        sim = Sim(run_steps=8, **self.JOIN)
+        sim.submit("a", "r", max_new=10)
+        sim.submit("a", "q", max_new=6)
+        sim.prefill("a", "r", 11)
+        sim.prefill("a", "q", 21)
+        plan, reservation = sim.prepare_decode("a", "r", 8)
+        group = sim.controller.groups["a"]
+        with mock.patch.object(group.outbox, "grow", side_effect=IntegrationError("EVENT_BACKPRESSURE", "full")):
+            self.assertIs(self.step(sim, plan.batch_id, 0, 1, {"r": 12})["continue"], False)
+        self.assertEqual(sim.controller.requests[("a", "q")].state, "DECODING")
+        self.assertEqual([ref.request_id for ref in self.batch(sim, plan.batch_id).plan.requests], ["r"])
+
+    def test_store_growth_joins_and_rolls_back_like_the_first_reservation(self):
+        for outcome in ("SUCCESS", "FAILURE"):
+            store = HeadwiseStore({0: 4096, 1: 4096})
+            from muxserve_sglang.contracts import KVTarget, ModelLayout, RequestIdentity
+            store.register_model(ModelLayout("a", 2, 1, (0, 1)))
+            r, q = RequestIdentity("a", "r"), RequestIdentity("a", "q")
+            q_view = store.reserve_kv("p", [KVTarget(q, 5)], "P").views[0]
+            store.start_kv_batch(store.reserve_kv("p", [KVTarget(q, 5)], "P").reservation_id)
+            store.finish_kv_batch(store._batch_ids["p"], "SUCCESS", {q_view.allocation_id: 5}, (0, 1))
+            store.bind_kv(q_view.allocation_id, "D:q")
+            store.release_kv(q_view.allocation_id, "P")
+            reservation = store.reserve_kv("d", [KVTarget(r, 4)], "batch")
+            r_id = reservation.views[0].allocation_id
+            free = store.rank_usage()[0]["free_blocks"]
+            expect("INVALID_STATE", lambda: store.extend_kv_batch(reservation.reservation_id,
+                                                                  [KVTarget(q, 6, q_view.allocation_id)]))
+            store.start_kv_batch(reservation.reservation_id)
+            views = store.extend_kv_batch(reservation.reservation_id,
+                                          [KVTarget(q, 6, q_view.allocation_id), KVTarget(r, 17, r_id)])
+            self.assertEqual([v.capacity_tokens for v in views], [16, 32])
+            self.assertEqual(store.rank_usage()[0]["free_blocks"], free - 2)  # one page of r (2 layers)
+            expect("ALLOCATION_BUSY", lambda: store.reserve_kv("x", [KVTarget(q, 7, q_view.allocation_id)], "y"))
+            store.assert_integrity()
+            valid = {r_id: 17, q_view.allocation_id: 6} if outcome == "SUCCESS" else {}
+            store.finish_kv_batch(reservation.reservation_id, outcome, valid, (0, 1))
+            for aid in (r_id, q_view.allocation_id):
+                store.release_kv(aid, "batch")  # as the controller's batch finish does
+            allocations = store.snapshot()["allocations"]
+            self.assertEqual(allocations[q_view.allocation_id]["holders"], ["D:q"])  # the batch holder left
+            self.assertEqual(allocations[q_view.allocation_id]["valid_tokens"], 6 if outcome == "SUCCESS" else 5)
+            self.assertNotIn(r_id, allocations)  # only the batch held r
+            self.assertEqual(allocations[q_view.allocation_id]["active_batch"], None)
+            store.assert_integrity()
+
+
 class LongPollChecks(unittest.TestCase):
     def setUp(self):
         self.sim = Sim()

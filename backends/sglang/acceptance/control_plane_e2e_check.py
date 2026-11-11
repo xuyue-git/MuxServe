@@ -41,10 +41,12 @@ def token_for(output_count: int) -> int:
 
 def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False,
               register_ready=False, ack_in_poll=False, combined=False, start_reply=False,
-              leader_reports=False):
+              leader_reports=False, step_join=False):
     """final_step: config final_step_in_gpu_done (a locally final run step is
     reported inside GPU_DONE). HANDOFF native_metadata and long-poll
-    bootstrap_ready are used whenever the owner provides them."""
+    bootstrap_ready are used whenever the owner provides them. step_join: config
+    decode_step_join (a D run serves prefill commands at its step boundaries and
+    takes joined requests and new KV pages; every step must fit its mapping)."""
     prefill_s, decode_s = timing or (PREFILL_S, DECODE_S)
     from muxserve_sglang.ipc import StorageRPCClient
     rpc = StorageRPCClient(address, key, 30)
@@ -52,197 +54,250 @@ def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=Non
     call = lambda name, *args: rpc.call("controller_" + name, group, *args)
     call("register_rank", stage, rank, pid, {"vocab_size": 32000, "eos_token_ids": (2,),
                                              "native_pd": True, "headwise_kv": True})
-    report_seq = 0
     box = None
     if leader_reports:
         from muxserve_sglang.step_box import StepBox
         box = StepBox(os.path.join(os.path.dirname(address), "stepbox-" + model))
-    deferred, pending_acks, reply_commands = None, [], ()
+    st = SimpleNamespace(report_seq=0, deferred=None, pending_acks=[], reply_commands=(), cursor=0,
+                         epoch=None, backlog=[], prepared={}, waiting_bootstrap={}, waiting_handoff=None,
+                         bootstrap_ready=None, broker_status=None, drained=False)
+
     def report(batch_id, kind, payload):
-        nonlocal report_seq, deferred, reply_commands
-        if deferred is not None:
-            pair = ((str(report_seq + 1), *deferred), (str(report_seq + 2), batch_id, kind, payload))
-            deferred = None
+        if st.deferred is not None:
+            pair = ((str(st.report_seq + 1), *st.deferred), (str(st.report_seq + 2), batch_id, kind, payload))
+            st.deferred = None
             reply = call("rank_reports", stage, rank, pid, pair)
-            report_seq += 2
+            st.report_seq += 2
         else:
-            reply = call("rank_report", stage, rank, pid, str(report_seq + 1), batch_id, kind, payload)
-            report_seq += 1
+            reply = call("rank_report", stage, rank, pid, str(st.report_seq + 1), batch_id, kind, payload)
+            st.report_seq += 1
         assert reply["accepted"], reply
-        reply_commands = reply.get("commands", ())
+        st.reply_commands = reply.get("commands", ())
+
     def absorb():
-        nonlocal reply_commands
-        for held in reply_commands:
-            if held["command_seq"] == (backlog[-1]["command_seq"] if backlog else cursor) + 1:
-                backlog.append(held)
-        reply_commands = ()
-    cursor, epoch, wait_ms, backlog = 0, None, 0, []
-    skip_poll = False
-    prepared, waiting_bootstrap, waiting_handoff = {}, {}, None
-    bootstrap_ready = None
-    broker_status = None
-    drained = False
-    while not drained and not stop.is_set():
-        if not skip_poll:
-            after = backlog[-1]["command_seq"] if backlog else cursor
-            acks = tuple(pending_acks)
-            reply = call("poll_commands_wait", stage, rank, pid, after, cursor or None, wait_ms, epoch,
-                         *((acks,) if acks else ()))
-            del pending_acks[:len(acks)]
-            epoch = reply["epoch"]
-            if "bootstrap_ready" in reply:
-                bootstrap_ready = {tuple(room) for room in reply["bootstrap_ready"]}
-            if "broker_status" in reply:
-                broker_status = dict(reply["broker_status"])
-            backlog.extend(reply["commands"])
-        skip_poll = False
-        accepted = 0
-        while backlog and waiting_handoff is None:
-            command = backlog.pop(0)
-            assert command["command_seq"] == cursor + 1
-            kind = command["kind"]
-            if kind == "PREPARE":
-                prepared[command["batch_id"]] = command
-                if command["batch_stage"] == "P" and stage == "P":
-                    waiting_bootstrap[command["batch_id"]] = command
-                else:
-                    ready_payload = {"reservation_id": command["reservation_id"]}
-                    if command["batch_stage"] == "P":  # D destination registration
-                        destinations = []
-                        for slot, item in enumerate(command["requests"]):
-                            view = item["reservation_view"]
-                            if register_ready:
-                                destinations.append({"room": item["bootstrap_room"],
-                                    "request_id": item["request_id"], "attempt": item["attempt"],
-                                    "allocation_id": view["allocation_id"], "reserved_version": view["version"],
-                                    "target_valid_tokens": item["target_valid_tokens"],
-                                    "rank_block_table": item["rank_block_table"], "metadata_slot": slot,
-                                    "logical_token_count": item["target_valid_tokens"]})
-                            else:
-                                call("broker_register_destination", item["bootstrap_room"], rank, pid, model,
-                                     item["request_id"], item["attempt"], view["allocation_id"], view["version"],
-                                     item["target_valid_tokens"], item["rank_block_table"], slot,
-                                     item["target_valid_tokens"])
-                        if register_ready:
-                            ready_payload["destinations"] = tuple(destinations)
-                    report(command["batch_id"], "READY", ready_payload)
-            elif kind == "START":
-                prep = prepared[command["batch_id"]]
-                start = time.monotonic()
-                if prep["batch_stage"] == "P":
-                    for item in prep["requests"]:
-                        view = item["reservation_view"]
-                        call("broker_stage", item["bootstrap_room"], rank, pid, {
-                            "bootstrap_room": item["bootstrap_room"], "allocation_id": view["allocation_id"],
-                            "reserved_version": view["version"], "target_valid_tokens": item["target_valid_tokens"],
-                            "rank": rank, "native_payload": {}})
-                    time.sleep(prefill_s)
-                    results = [{"request_id": i["request_id"], "attempt": i["attempt"],
-                                "token_id": None if prep.get("purpose") == "REBUILD" else token_for(len(i["output_token_ids"])),
-                                "valid_tokens": i["target_valid_tokens"]} for i in prep["requests"]]
-                    payload = {"reservation_id": prep["reservation_id"], "results": results,
-                               "duration_ms": (time.monotonic() - start) * 1000, "gpu_forward_ms": prefill_s * 1000}
-                else:
-                    steps = prep.get("run_steps", 1)
-                    step = 1
-                    final = None
-                    digest = 0
-                    tag = zlib.crc32(command["batch_id"].encode())
-                    while True:
-                        time.sleep(decode_s)
-                        results = [{"request_id": i["request_id"], "attempt": i["attempt"],
-                                    "token_id": token_for(len(i["output_token_ids"]) + step - 1),
-                                    "valid_tokens": i["target_valid_tokens"] - 1 + step} for i in prep["requests"]]
-                        if steps == 1:
-                            break
-                        finished = any(len(i["output_token_ids"]) + step >= i["max_new_tokens"]
-                                       for i in prep["requests"])
-                        if box is not None:
-                            digest = zlib.crc32(",".join(str(item["token_id"]) for item in results).encode(), digest)
-                        if final_step and (finished or step >= steps):
-                            final = {"step": step, "results": results, "finished": finished}
-                            break
-                        continuing = not (finished or step >= steps)
-                        if box is not None and continuing and rank != 0 and box.wait(tag, step, 30):
-                            decision = {"continue": True}
-                        else:
-                            decision = call("decode_step", rank, pid, command["batch_id"], step, results, finished)
-                            if box is not None and continuing and rank == 0:
-                                box.publish(tag, step, decision["continue"] is True)
-                        while decision["continue"] == "PARK":
-                            decision = call("decode_resume", rank, pid, command["batch_id"], step, 100)
-                        if finished or step >= steps or decision["continue"] is not True:
-                            break
-                        step += 1
-                    payload = {"reservation_id": prep["reservation_id"], "results": results,
-                               "duration_ms": (time.monotonic() - start) * 1000,
-                               "gpu_forward_ms": decode_s * 1000 * step}
-                    if steps > 1:
-                        payload["steps"] = step
-                    if box is not None and steps > 1:
-                        payload["token_digest"] = digest
-                    if final is not None:
-                        payload["final_step"] = final
-                report(command["batch_id"], "GPU_DONE", payload)
-            elif kind == "HANDOFF":
-                for item in command["requests"]:
-                    if "native_metadata" not in item:
-                        call("broker_lookup", item["bootstrap_room"], rank, pid, model, item["request_id"],
-                             item["attempt"], item["allocation_id"], item["version"], item["valid_tokens"])
-                    if ack_in_poll:
-                        pending_acks.append((item["bootstrap_room"], item["allocation_id"], item["version"],
-                                             item["valid_tokens"], item["rank_block_table"]))
-                    else:
-                        call("broker_ack", item["bootstrap_room"], rank, pid, item["allocation_id"],
-                             item["version"], item["valid_tokens"], item["rank_block_table"])
-                waiting_handoff = command
-            elif kind in ("QUIESCE", "REVOKE"):
-                prep = prepared.pop(command["batch_id"])
-                report(command["batch_id"], "QUIESCED", {"reservation_id": command["reservation_id"],
-                                                         "request_ids": tuple(prep["ordered_request_ids"])})
-            elif kind == "CLEANUP":
-                report(command["cleanup_id"], "QUIESCED", {"cleanup_id": command["cleanup_id"],
-                       "request_id": command["request_id"], "attempt": command["attempt"]})
-            elif kind == "DRAIN":
-                drained = True
-            cursor = command["command_seq"]
-            absorb()
-            accepted += 1
-            if drained or waiting_handoff is not None:
+        for held in st.reply_commands:
+            if held["command_seq"] == (st.backlog[-1]["command_seq"] if st.backlog else st.cursor) + 1:
+                st.backlog.append(held)
+        st.reply_commands = ()
+
+    def poll(wait_ms):
+        after = st.backlog[-1]["command_seq"] if st.backlog else st.cursor
+        acks = tuple(st.pending_acks)
+        reply = call("poll_commands_wait", stage, rank, pid, after, st.cursor or None, wait_ms, st.epoch,
+                     *((acks,) if acks else ()))
+        del st.pending_acks[:len(acks)]
+        st.epoch = reply["epoch"]
+        if "bootstrap_ready" in reply:
+            st.bootstrap_ready = {tuple(room) for room in reply["bootstrap_ready"]}
+        if "broker_status" in reply:
+            st.broker_status = dict(reply["broker_status"])
+        st.backlog.extend(reply["commands"])
+
+    def run_decode(command, prep):
+        steps = prep.get("run_steps", 1)
+        start = time.monotonic()
+        members = [{"request_id": i["request_id"], "attempt": i["attempt"], "base": len(i["output_token_ids"]),
+                    "start": i["target_valid_tokens"] - 1, "max_new": i["max_new_tokens"],
+                    "cap": i["reservation_view"]["capacity_tokens"]} for i in prep["requests"]]
+        step = 1
+        final = None
+        digest = 0
+        tag = zlib.crc32(command["batch_id"].encode())
+        while True:
+            assert all(m["start"] + step <= m["cap"] for m in members), "decode step outside its KV mapping"
+            time.sleep(decode_s)
+            results = [{"request_id": m["request_id"], "attempt": m["attempt"],
+                        "token_id": token_for(m["base"] + step - 1),
+                        "valid_tokens": m["start"] + step} for m in members]
+            if steps == 1:
                 break
-        # progress: P bootstrap readiness and D handoff completion
-        for batch_id, command in tuple(waiting_bootstrap.items()):
+            finished = any(m["base"] + step >= m["max_new"] for m in members)
+            if box is not None:
+                digest = zlib.crc32(",".join(str(item["token_id"]) for item in results).encode(), digest)
+            if final_step and (finished or step >= steps):
+                final = {"step": step, "results": results, "finished": finished}
+                break
+            continuing = not (finished or step >= steps)
+            if box is not None and continuing and rank != 0 and box.wait(tag, step, 30):
+                decision = {"continue": True}
+            else:
+                decision = call("decode_step", rank, pid, command["batch_id"], step, results, finished)
+                if box is not None and continuing and rank == 0:
+                    box.publish(tag, step, decision["continue"] is True
+                                and not decision.get("join") and not decision.get("extend"))
+            if step_join:
+                while decision["continue"] in ("PARK", "SYNC"):
+                    handoffs = tuple(decision.get("handoffs", ()))
+                    serve_in_run(handoffs)
+                    after = st.backlog[-1]["command_seq"] if st.backlog else st.cursor
+                    decision = call("decode_resume", rank, pid, command["batch_id"], step, 100,
+                                    after, st.epoch, handoffs)
+            while decision["continue"] == "PARK":
+                decision = call("decode_resume", rank, pid, command["batch_id"], step, 100)
+            if finished or step >= steps or decision["continue"] is not True:
+                break
+            for item in decision.get("extend", ()):
+                member = next(m for m in members if m["request_id"] == item["request_id"])
+                assert item["view"]["capacity_tokens"] > member["cap"] and set(item["view"]["block_tables"]) == {rank}
+                member["cap"] = item["view"]["capacity_tokens"]
+            for item in decision.get("join", ()):
+                assert all(m["request_id"] != item["request_id"] for m in members)
+                assert set(item["view"]["block_tables"]) == {rank}
+                members.append({"request_id": item["request_id"], "attempt": item["attempt"],
+                                "base": len(item["output_token_ids"]) - step, "start": item["start_valid"],
+                                "max_new": item["max_new_tokens"], "cap": item["view"]["capacity_tokens"]})
+                prep["ordered_request_ids"] = tuple(prep["ordered_request_ids"]) + (item["request_id"],)
+            step += 1
+        payload = {"reservation_id": prep["reservation_id"], "results": results,
+                   "duration_ms": (time.monotonic() - start) * 1000,
+                   "gpu_forward_ms": decode_s * 1000 * step}
+        if steps > 1:
+            payload["steps"] = step
+        if box is not None and steps > 1:
+            payload["token_digest"] = digest
+        if final is not None:
+            payload["final_step"] = final
+        return payload
+
+    def handle(command):
+        assert command["command_seq"] == st.cursor + 1
+        kind = command["kind"]
+        if kind == "START" and step_join:
+            st.cursor = command["command_seq"]  # a run takes later commands itself
+        if kind == "PREPARE":
+            st.prepared[command["batch_id"]] = command
+            if command["batch_stage"] == "P" and stage == "P":
+                st.waiting_bootstrap[command["batch_id"]] = command
+            else:
+                ready_payload = {"reservation_id": command["reservation_id"]}
+                if command["batch_stage"] == "P":  # D destination registration
+                    destinations = []
+                    for slot, item in enumerate(command["requests"]):
+                        view = item["reservation_view"]
+                        if register_ready:
+                            destinations.append({"room": item["bootstrap_room"],
+                                "request_id": item["request_id"], "attempt": item["attempt"],
+                                "allocation_id": view["allocation_id"], "reserved_version": view["version"],
+                                "target_valid_tokens": item["target_valid_tokens"],
+                                "rank_block_table": item["rank_block_table"], "metadata_slot": slot,
+                                "logical_token_count": item["target_valid_tokens"]})
+                        else:
+                            call("broker_register_destination", item["bootstrap_room"], rank, pid, model,
+                                 item["request_id"], item["attempt"], view["allocation_id"], view["version"],
+                                 item["target_valid_tokens"], item["rank_block_table"], slot,
+                                 item["target_valid_tokens"])
+                    if register_ready:
+                        ready_payload["destinations"] = tuple(destinations)
+                report(command["batch_id"], "READY", ready_payload)
+        elif kind == "START":
+            prep = st.prepared[command["batch_id"]]
+            start = time.monotonic()
+            if prep["batch_stage"] == "P":
+                for item in prep["requests"]:
+                    view = item["reservation_view"]
+                    call("broker_stage", item["bootstrap_room"], rank, pid, {
+                        "bootstrap_room": item["bootstrap_room"], "allocation_id": view["allocation_id"],
+                        "reserved_version": view["version"], "target_valid_tokens": item["target_valid_tokens"],
+                        "rank": rank, "native_payload": {}})
+                time.sleep(prefill_s)
+                results = [{"request_id": i["request_id"], "attempt": i["attempt"],
+                            "token_id": None if prep.get("purpose") == "REBUILD" else token_for(len(i["output_token_ids"])),
+                            "valid_tokens": i["target_valid_tokens"]} for i in prep["requests"]]
+                payload = {"reservation_id": prep["reservation_id"], "results": results,
+                           "duration_ms": (time.monotonic() - start) * 1000, "gpu_forward_ms": prefill_s * 1000}
+            else:
+                payload = run_decode(command, prep)
+            report(command["batch_id"], "GPU_DONE", payload)
+        elif kind == "HANDOFF":
+            for item in command["requests"]:
+                if "native_metadata" not in item:
+                    call("broker_lookup", item["bootstrap_room"], rank, pid, model, item["request_id"],
+                         item["attempt"], item["allocation_id"], item["version"], item["valid_tokens"])
+                if ack_in_poll:
+                    st.pending_acks.append((item["bootstrap_room"], item["allocation_id"], item["version"],
+                                            item["valid_tokens"], item["rank_block_table"]))
+                else:
+                    call("broker_ack", item["bootstrap_room"], rank, pid, item["allocation_id"],
+                         item["version"], item["valid_tokens"], item["rank_block_table"])
+            st.waiting_handoff = command
+        elif kind in ("QUIESCE", "REVOKE"):
+            prep = st.prepared.pop(command["batch_id"])
+            report(command["batch_id"], "QUIESCED", {"reservation_id": command["reservation_id"],
+                                                     "request_ids": tuple(prep["ordered_request_ids"])})
+        elif kind == "CLEANUP":
+            report(command["cleanup_id"], "QUIESCED", {"cleanup_id": command["cleanup_id"],
+                   "request_id": command["request_id"], "attempt": command["attempt"]})
+        elif kind == "DRAIN":
+            st.drained = True
+        st.cursor = max(st.cursor, command["command_seq"])
+        absorb()
+
+    def progress():
+        # P bootstrap readiness and D handoff completion
+        for batch_id, command in tuple(st.waiting_bootstrap.items()):
             ready = True
             for item in command["requests"]:
                 view = item["reservation_view"]
-                if bootstrap_ready is not None:
+                if st.bootstrap_ready is not None:
                     status = "READY" if (item["bootstrap_room"], view["allocation_id"], view["version"],
-                                         item["target_valid_tokens"]) in bootstrap_ready else "PENDING"
+                                         item["target_valid_tokens"]) in st.bootstrap_ready else "PENDING"
                 else:
                     status = call("broker_bootstrap", item["bootstrap_room"], rank, pid, view["allocation_id"],
                                   view["version"], item["target_valid_tokens"])["status"]
                 ready = ready and status == "READY"
             if ready:
-                del waiting_bootstrap[batch_id]
+                del st.waiting_bootstrap[batch_id]
                 report(batch_id, "READY", {"reservation_id": command["reservation_id"]})
-        if waiting_handoff is not None:
-            if all((broker_status or {}).get(i["bootstrap_room"]) == "SUCCESS"
-                   if broker_status is not None and i["bootstrap_room"] in broker_status else
+        if st.waiting_handoff is not None:
+            waiting = st.waiting_handoff
+            if all((st.broker_status or {}).get(i["bootstrap_room"]) == "SUCCESS"
+                   if st.broker_status is not None and i["bootstrap_room"] in st.broker_status else
                    call("broker_poll", i["bootstrap_room"], rank, pid, "D")["status"] == "SUCCESS"
-                   for i in waiting_handoff["requests"]):
-                if combined and backlog and backlog[0]["kind"] == "PREPARE" and backlog[0]["batch_stage"] == "D":
-                    deferred = (waiting_handoff["batch_id"], "HANDOFF_READY",
-                                {"requests": waiting_handoff["requests"]})
+                   for i in waiting["requests"]):
+                if (combined and st.backlog and st.backlog[0]["kind"] == "PREPARE"
+                        and st.backlog[0]["batch_stage"] == "D"):
+                    st.deferred = (waiting["batch_id"], "HANDOFF_READY", {"requests": waiting["requests"]})
                 else:
-                    report(waiting_handoff["batch_id"], "HANDOFF_READY",
-                           {"requests": waiting_handoff["requests"]})
-                waiting_handoff = None
+                    report(waiting["batch_id"], "HANDOFF_READY", {"requests": waiting["requests"]})
+                st.waiting_handoff = None
         absorb()
-        skip_poll = (combined or start_reply) and bool(backlog) and waiting_handoff is None
-        wait_ms = 20 if pending_acks else 0 if accepted or (backlog and waiting_handoff is None) else (
-            20 if (waiting_bootstrap or waiting_handoff is not None or prepared) else 200)
-    if drained:
-        call("poll_commands", stage, rank, pid, cursor, cursor)
+
+    def serve_in_run(handoffs):
+        """Exactly the commands a real D rank takes at a run's step boundary."""
+        for _ in range(2):  # the second poll delivers the ACKs a HANDOFF produced
+            poll(0)
+            while st.backlog and st.waiting_handoff is None:
+                command = st.backlog[0]
+                kind = command["kind"]
+                prep = st.prepared.get(command.get("batch_id"))
+                if not ((kind == "PREPARE" and command["batch_stage"] == "P")
+                        or (kind == "REVOKE" and prep is not None and prep["batch_stage"] == "P")
+                        or kind == "CLEANUP"
+                        or (kind == "HANDOFF" and command["batch_id"] in handoffs)):
+                    break
+                st.backlog.pop(0)
+                handle(command)
+            if not st.pending_acks:
+                break
+        progress()
+
+    wait_ms, skip_poll = 0, False
+    while not st.drained and not stop.is_set():
+        if not skip_poll:
+            poll(wait_ms)
+        skip_poll = False
+        accepted = 0
+        while st.backlog and st.waiting_handoff is None:
+            handle(st.backlog.pop(0))
+            accepted += 1
+            if st.drained or st.waiting_handoff is not None:
+                break
+        progress()
+        skip_poll = (combined or start_reply) and bool(st.backlog) and st.waiting_handoff is None
+        wait_ms = 20 if st.pending_acks else 0 if accepted or (st.backlog and st.waiting_handoff is None) else (
+            20 if (st.waiting_bootstrap or st.waiting_handoff is not None or st.prepared) else 200)
+    if st.drained:
+        call("poll_commands", stage, rank, pid, st.cursor, st.cursor)
     rpc.close()
 
 
@@ -300,6 +355,8 @@ def main():
     parser.add_argument("--recovery-all-decode", action="store_true", help="config capacity_recovery_all_decode=true")
     parser.add_argument("--max-new", type=int, default=256, help="config max_new_tokens")
     parser.add_argument("--kv-trim", action="store_true", help="config decode_kv_trim=true")
+    parser.add_argument("--step-join", action="store_true", help="config decode_step_join=true")
+    parser.add_argument("--kv-per-page", action="store_true", help="config decode_kv_per_page=true")
     parser.add_argument("--prefill-ms", help="per-model simulated prefill ms, e.g. 90,105,140")
     parser.add_argument("--decode-ms", help="per-model simulated decode step ms, e.g. 13,17,30")
     args = parser.parse_args()
@@ -341,7 +398,8 @@ def main():
                               max_model_inflight=args.inflight, decode_run_merge=args.run_merge,
                               prefill_pair_hold_ms=args.pair_hold_ms,
                               capacity_recovery_all_decode=args.recovery_all_decode, max_new_tokens=args.max_new,
-                              decode_kv_trim=args.kv_trim)
+                              decode_kv_trim=args.kv_trim, decode_step_join=args.step_join,
+                              decode_kv_per_page=args.kv_per_page)
     store = HeadwiseStore({r: args.pool_blocks for r in range(TP)}, model_ids=MODELS)
     controller = MuxController(config, store)
     directory = tempfile.mkdtemp(prefix="mx-e2e-")
@@ -387,7 +445,7 @@ def main():
                                                          0, stop, timing[m], args.final_step,
                                                          args.register_ready, args.ack_in_poll,
                                                          args.combined_report, args.start_in_reply,
-                                                         args.decode_leader), daemon=True)
+                                                         args.decode_leader, args.step_join), daemon=True)
                  for m in MODELS for stage in ("P", "D") for rank in range(TP)]
     for process in processes:
         process.start()

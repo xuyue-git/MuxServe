@@ -325,6 +325,77 @@ class HeadwiseStore:
                 raise IntegrationError("INVALID_STATE", "Only a prepared reservation can start")
             batch.state = "RUNNING"
 
+    def extend_kv_batch(self, reservation_id: str, targets: Sequence[KVTarget]) -> tuple[KVView, ...]:
+        """Grow a running reservation, all or nothing: a target whose allocation is
+        already in it gets its mapping grown to cover the target; an idle allocation
+        (another request joining a running decode run) is added to it first, exactly as
+        reserve_kv would have added it. Finish, rollback and fencing then treat every
+        added allocation like one reserved at the start. Returns the targets' views."""
+        targets = tuple(targets)
+        if not targets or any(not isinstance(t, KVTarget) or not isinstance(t.allocation_id, str)
+                              for t in targets):
+            raise IntegrationError("INVALID_ARGUMENT", "KVTargets of existing allocations required")
+        with self._lock:
+            self._ensure_open()
+            batch = self._batch(reservation_id)
+            if batch.state != "RUNNING":
+                raise IntegrationError("INVALID_STATE", "Only a running reservation can grow")
+            proposed: list[tuple[_Allocation, int, bool]] = []
+            needs = {r: 0 for r in self._pool}
+            needs_by_model = {mid: {r: 0 for r in self._pool} for mid in self._model_ids}
+            for target in targets:
+                allocation = self._allocation(target.allocation_id)
+                if allocation.identity != target.identity or any(
+                        a is allocation for a, _, _ in proposed):
+                    raise IntegrationError("IDENTITY_CONFLICT", "Allocation identity differs or repeats")
+                joining = allocation.allocation_id not in batch.old_capacity
+                if joining:
+                    key = (allocation.identity.model_id, allocation.identity.request_id)
+                    if allocation.identity.attempt < self._latest_attempt.get(key, -1):
+                        raise IntegrationError("STALE_ATTEMPT", "Request attempt has been superseded")
+                    if allocation.active is not None:
+                        raise IntegrationError("ALLOCATION_BUSY", "Allocation has an active or fenced batch")
+                elif allocation.active != reservation_id:
+                    raise IntegrationError("INVARIANT_VIOLATION", "Reservation allocation mismatch")
+                tokens, layout = target.target_tokens, allocation.layout
+                if (type(tokens) is not int or tokens <= 0 or tokens > self._max_context
+                        or tokens < allocation.valid):
+                    raise IntegrationError("INVALID_ARGUMENT", "Target exceeds context or committed length")
+                capacity = max(allocation.capacity, ((tokens + layout.block_size - 1)
+                    // layout.block_size) * layout.block_size)
+                groups = (capacity - allocation.capacity) // layout.block_size
+                for rank in layout.ranks:
+                    needs[rank] += groups * layout.blocks_per_token_group
+                    if self._pool_mode == "static":
+                        needs_by_model[allocation.identity.model_id][rank] += groups * layout.blocks_per_token_group
+                proposed.append((allocation, capacity, joining))
+            if any(needs[r] > self._free_count(r) for r in needs):
+                raise IntegrationError("OUT_OF_CAPACITY", "Atomic all-rank KV growth failed")
+            if self._pool_mode == "static" and any(
+                    needs_by_model[mid][rank] > len(self._model_free[mid][rank])
+                    for mid in self._model_ids for rank in self._pool):
+                raise IntegrationError("OUT_OF_CAPACITY", "Static model KV partition is exhausted")
+            for allocation, capacity, joining in proposed:
+                aid = allocation.allocation_id
+                if joining:
+                    batch.old_capacity[aid] = allocation.capacity
+                    batch.ranks.update(allocation.arrays)
+                    allocation.active = reservation_id
+                    if batch.holder not in allocation.holders:
+                        batch.introduced_holders.add(aid)
+                    allocation.holders.add(batch.holder)
+                groups = (capacity - allocation.capacity) // allocation.layout.block_size
+                if groups:
+                    first = allocation.pages
+                    layers, heads = allocation.layout.num_layers, allocation.layout.kv_heads_per_rank
+                    for rank, table in allocation.arrays.items():
+                        chosen = self._free_source(allocation, rank).take(groups * layers * heads)
+                        table[:, :, first:first + groups] = chosen.reshape(layers, heads, groups)
+                    allocation.epoch += 1
+                allocation.capacity = capacity
+                allocation.version += 1
+            return _copy_metadata(tuple(self._view(a) for a, _, _ in proposed))
+
     def finish_kv_batch(self, reservation_id: str, outcome: str,
                         valid_lengths: dict[str, int], completed_ranks: Sequence[int],
                         trim_to_valid: bool = False) -> tuple[KVView, ...]:

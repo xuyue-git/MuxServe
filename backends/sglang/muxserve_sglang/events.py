@@ -37,6 +37,16 @@ class RuntimeOutbox:
                 raise IntegrationError("EVENT_BACKPRESSURE", "No guaranteed completion slots")
             self.reserved[owner] = count
 
+    def grow(self, owner: str, count: int) -> None:
+        """Add ``count`` slots to an existing reservation (a request joining a running
+        decode run); a negative count returns slots that will not be used."""
+        with self.lock:
+            if type(count) is not int or owner not in self.reserved:
+                raise IntegrationError("INVALID_ARGUMENT", "Invalid event reservation growth")
+            if count > 0 and len(self.pending) + sum(self.reserved.values()) + count > self.maximum_pending:
+                raise IntegrationError("EVENT_BACKPRESSURE", "No guaranteed completion slots")
+            self.reserved[owner] = max(0, self.reserved[owner] + count)
+
     def release(self, owner: str) -> None:
         with self.lock:
             self.reserved.pop(owner, None)

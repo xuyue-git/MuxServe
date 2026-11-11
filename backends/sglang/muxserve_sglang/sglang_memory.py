@@ -63,6 +63,11 @@ class BoundForward:
     # Set once this run's padded tables were uploaded into the decode graph's
     # static table buffer; advance_decode carries it to later run steps.
     graph_tables: object | None = None
+    # decode_step_join: physical blocks mapped by any row (bool per pool block,
+    # built at a run's first growth) and graph rows whose tables changed since
+    # the last replay upload.
+    used_blocks: object | None = None
+    graph_dirty: tuple = ()
 
     @property
     def total_written(self) -> int:
@@ -259,7 +264,82 @@ class HeadwiseTokenToKVPool(KVCache):
         self._bound = BoundForward("DECODE", rows, targets, (1,) * len(rows), bound.target_lengths,
                                    bound.tables, capacities=bound.capacities,
                                    np_tables=bound.np_tables, table_buffer=bound.table_buffer,
-                                   graph_tables=bound.graph_tables)
+                                   graph_tables=bound.graph_tables, used_blocks=bound.used_blocks,
+                                   graph_dirty=bound.graph_dirty)
+
+    def grow_decode(self, req_pool_indices: Sequence[int], target_lengths: Sequence[int],
+                    views: Sequence[KVView | None]) -> None:
+        """decode_step_join: the next step of a granted decode run whose members joined or
+        got pages at this boundary. ``views`` has one entry per row: None keeps the row's
+        frozen mapping; otherwise this rank's view of that request, either a joined row
+        (appended after the existing rows, its target exactly one token past its committed
+        KV) or an existing row whose mapping kept its pages and grew by whole pages.
+
+        Only the new blocks are validated (in the imported pool, not mapped by any row,
+        including the same row), against a per-run map of mapped blocks, so a growth costs
+        as much as the blocks it adds. Every row still advances by exactly one token
+        inside its mapping, and changed rows are re-uploaded to a decode graph alone.
+        """
+        bound = self.bound_forward
+        _require(bound.mode == "DECODE" and bound.batch is not None,
+                 "Only an executed decode binding can grow", "FORWARD_MISMATCH")
+        rows = _cpu_ints(req_pool_indices, "bound request rows")
+        targets = _cpu_ints(target_lengths, "bound target lengths")
+        views = list(views)
+        old = len(bound.req_pool_indices)
+        _require(len(rows) == len(targets) == len(views) and rows[:old] == bound.req_pool_indices
+                 and len(set(rows)) == len(rows) and all(row >= 0 for row in rows)
+                 and all(view is not None for view in views[old:]),
+                 "Decode run rows may only be appended", "FORWARD_MISMATCH")
+        np_tables = list(bound.np_tables if bound.np_tables is not None else
+                         [np.asarray(table, dtype=np.int64) for table in bound.tables])
+        if bound.used_blocks is None:
+            mapped = np.zeros(self.physical_block_count, dtype=bool)
+            for table in np_tables:
+                mapped[table.reshape(-1)] = True
+        else:
+            mapped = bound.used_blocks.copy()
+        capacities = list(bound.capacities)
+        changed = []
+        for index, view in enumerate(views):
+            if view is None:
+                continue
+            _require(view.identity.model_id == self.layout.model_id and bool(view.allocation_id)
+                     and type(view.capacity_tokens) is int and type(view.valid_tokens) is int
+                     and 0 <= view.valid_tokens <= view.capacity_tokens and view.block_size == 16
+                     and set(view.block_tables) == {self.rank}, "Invalid grown decode view")
+            own = view.block_tables[self.rank]
+            table = (own.array() if isinstance(own, PackedBlocks) else np.asarray(own)).astype(np.int64)
+            _require(table.shape == (self.layer_num, self.head_num, (view.capacity_tokens + 15) // 16),
+                     "Incomplete physical page mapping")
+            if index < old:
+                prior = np_tables[index]
+                _require(view.capacity_tokens > capacities[index]
+                         and np.array_equal(table[:, :, :prior.shape[2]], prior),
+                         "A grown mapping must keep its pages", "FORWARD_MISMATCH")
+                added = table[:, :, prior.shape[2]:].reshape(-1)
+                np_tables[index], capacities[index] = table, view.capacity_tokens
+            else:
+                _require(targets[index] == view.valid_tokens + 1,
+                         "A joined row must append exactly one token", "FORWARD_MISMATCH")
+                added = table.reshape(-1)
+                np_tables.append(table)
+                capacities.append(view.capacity_tokens)
+            _require(added.size > 0 and int(added.min()) >= 0
+                     and int(added.max()) < self.physical_block_count,
+                     "Physical block index outside imported pool")
+            _require(np.unique(added).size == added.size and not mapped[added].any(),
+                     "Aliased physical blocks across requests/layers/heads")
+            mapped[added] = True
+            changed.append(index)
+        _require(all(new == prior + 1 for new, prior in zip(targets, bound.target_lengths))
+                 and all(0 < target <= min(capacity, 2048) for target, capacity in zip(targets, capacities)),
+                 "Decode run must append one token inside its mapping", "FORWARD_MISMATCH")
+        self._bound = BoundForward("DECODE", rows, targets, (1,) * len(rows),
+                                   tuple(target - 1 for target in targets), tuple(np_tables),
+                                   capacities=tuple(capacities), np_tables=np_tables,
+                                   graph_tables=bound.graph_tables, used_blocks=mapped,
+                                   graph_dirty=tuple(sorted(set(bound.graph_dirty) | set(changed))))
 
     def clear_forward(self) -> None:
         """Caller must hold the grant until all-rank GPU completion before clearing."""
@@ -416,6 +496,17 @@ class HeadwiseTokenToKVPool(KVCache):
         if upload:
             graph.tables[:, :bs].copy_(torch.from_numpy(tables))
             bound.graph_tables = graph.tables
+        elif bound.graph_dirty:
+            # decode_step_join: only rows that joined or grew since the last upload.
+            selected = slice(self.start_layer, self.end_layer + 1)
+            for row in bound.graph_dirty:
+                table = bound.np_tables[row][selected]
+                _require(table.shape[2] <= GRAPH_PAGES,
+                         "Decode graph page table exceeds the captured capacity", "FORWARD_MISMATCH")
+                padded = np.zeros((table.shape[0], self.head_num, GRAPH_PAGES), dtype=np.int32)
+                padded[:, :, :table.shape[2]] = table
+                graph.tables[:, row].copy_(torch.from_numpy(padded))
+        bound.graph_dirty = ()
         graph.slots[:, :bs].copy_(torch.from_numpy(slots))
         graph.context_lens[:bs].copy_(torch.from_numpy(lengths))
 

@@ -54,6 +54,15 @@ class DecodeGraphConfigChecks(unittest.TestCase):
             with self.assertRaises(IntegrationError):
                 self.config(**bad)
 
+    def test_step_join_flags_default_off_and_per_page_needs_join(self):
+        config = self.config()
+        self.assertFalse(config.decode_step_join or config.decode_kv_per_page)
+        both = self.config(decode_step_join=True, decode_kv_per_page=True)
+        self.assertTrue(both.decode_step_join and both.decode_kv_per_page)
+        for bad in (dict(decode_kv_per_page=True), dict(decode_step_join=1)):
+            with self.assertRaises(IntegrationError):
+                self.config(**bad)
+
     def test_park_flag_defaults_off_and_must_be_boolean(self):
         self.assertFalse(self.config().decode_run_park)
         self.assertTrue(self.config(decode_run_park=True).decode_run_park)

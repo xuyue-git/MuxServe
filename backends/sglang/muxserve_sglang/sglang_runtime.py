@@ -68,6 +68,10 @@ class Prepared:
     handoff: dict | None = None
     handoff_done: bool = False
     decode_rollback: list = field(default_factory=list)
+    # decode_step_join: this rank's KV view of every run member (own table
+    # only) and the rows that joined or grew since the last step's binding.
+    run_views: list = field(default_factory=list)
+    run_changes: dict = field(default_factory=dict)
 
 
 class ControlledScheduler:
@@ -87,6 +91,7 @@ class ControlledScheduler:
         self.backlog = []  # commands fetched but not yet accepted
         self.reply_commands = ()  # start_in_report_reply
         self.step_box = None  # decode_leader_reports
+        self._poll_epoch = None  # last broker epoch a command long-poll returned
         self.drained = False
         require(self.pool.headwise_shared and not scheduler.enable_overlap
                 and scheduler.spec_algorithm.is_none() and self.runner.ps.pp_size == 1
@@ -192,7 +197,6 @@ class ControlledScheduler:
             # when this group's broker state changes (epoch), so neither idle
             # ranks nor pending handoffs spin on the owner.
             backlog = self.backlog
-            epoch = None
             wait_ms = 0
             # Held commands (a decode PREPARE behind its HANDOFF, a START from
             # a report reply) run at once: nothing a poll returns gates them.
@@ -201,17 +205,7 @@ class ControlledScheduler:
             while not self.drained:
                 if not skip_poll:
                     after = backlog[-1]["command_seq"] if backlog else self.cursor
-                    acks = tuple(getattr(self.manager, "pending_acks", ()))
-                    reply = self.rpc("poll_commands_wait", self.ctx.stage, self.rank, self.pid,
-                                     after, self.cursor or None, wait_ms, epoch, *((acks,) if acks else ()))
-                    if acks:
-                        del self.manager.pending_acks[:len(acks)]
-                    epoch = reply["epoch"]
-                    if "bootstrap_ready" in reply:
-                        self.manager.bootstrap_ready = frozenset(tuple(room) for room in reply["bootstrap_ready"])
-                    if "broker_status" in reply:
-                        self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
-                    backlog.extend(reply["commands"])
+                    self._poll(after, wait_ms)
                 skip_poll = False
                 accepted = 0
                 while backlog:
@@ -265,6 +259,20 @@ class ControlledScheduler:
                 pass
             raise
 
+    def _poll(self, after, wait_ms):
+        """One command long-poll: carries pending broker ACKs, refreshes broker state."""
+        acks = tuple(getattr(self.manager, "pending_acks", ()))
+        reply = self.rpc("poll_commands_wait", self.ctx.stage, self.rank, self.pid,
+                         after, self.cursor or None, wait_ms, self._poll_epoch, *((acks,) if acks else ()))
+        if acks:
+            del self.manager.pending_acks[:len(acks)]
+        self._poll_epoch = reply["epoch"]
+        if "bootstrap_ready" in reply:
+            self.manager.bootstrap_ready = frozenset(tuple(room) for room in reply["bootstrap_ready"])
+        if "broker_status" in reply:
+            self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
+        self.backlog.extend(reply["commands"])
+
     def _accept(self, command):
         require(command["group_id"] == self.ctx.group_id
                 and command["model_id"] == self.ctx.model.model_id
@@ -283,6 +291,9 @@ class ControlledScheduler:
         if kind == "PREPARE":
             self._prepare(command)
         elif kind == "START":
+            if self._flag("decode_step_join"):
+                # A decode run takes later commands at its step boundaries.
+                self.cursor = seq
             self._start(command)
         elif kind == "HANDOFF":
             state = self.prepared[command["batch_id"]]
@@ -314,7 +325,8 @@ class ControlledScheduler:
             self.drained = True
         else:
             raise IntegrationError("UNKNOWN_COMMAND", f"Unsupported controlled command: {kind}")
-        self.cursor = seq
+        # A decode run (decode_step_join) may have taken later commands already.
+        self.cursor = max(self.cursor, seq)
         while len(self.commands) > 1024:
             self.commands.popitem(last=False)
 
@@ -700,6 +712,10 @@ class ControlledScheduler:
             from .step_box import StepBox
             self.step_box = StepBox(os.path.join(str(self.ctx.runtime_dir),
                                                  "stepbox-%08x" % zlib.crc32(self.ctx.group_id.encode())))
+        join = self._flag("decode_step_join")
+        if join:
+            state.run_views = [self._own_view(item["reservation_view"]) for item in state.command["requests"]]
+            state.command["requests"] = list(state.command["requests"])
         while True:
             previous_output_counts = [len(req.output_ids) for req in state.reqs]
             self.s.cur_batch_for_debug = state.batch
@@ -741,13 +757,26 @@ class ControlledScheduler:
                 reply = self.rpc("decode_step", self.rank, self.pid, command["batch_id"], step,
                                  results, finished)
                 if leader_only and continuing and self.rank == 0:
-                    self.step_box.publish(tag, step, reply.get("continue") is True)
+                    # Joins and new pages reach every rank through its own report.
+                    self.step_box.publish(tag, step, reply.get("continue") is True
+                                          and not reply.get("join") and not reply.get("extend"))
+            if join:
+                while reply.get("continue") in ("PARK", "SYNC"):
+                    # Waiting at the boundary (GPU idle, synchronized above):
+                    # serve this model's prefill commands, then ask again.
+                    handoffs = tuple(reply.get("handoffs", ()))
+                    self._service_in_run(handoffs)
+                    after = self.backlog[-1]["command_seq"] if self.backlog else self.cursor
+                    reply = self.rpc("decode_resume", self.rank, self.pid, command["batch_id"], step, 100,
+                                     after, self._poll_epoch, handoffs)
             while reply.get("continue") == "PARK":
                 # Parked for a waiting prefill: the GPU is idle (synchronized
                 # above) and every native/KV state stays as it is.
                 reply = self.rpc("decode_resume", self.rank, self.pid, command["batch_id"], step, 100)
             if finished or step >= steps or reply.get("continue") is not True:
                 break
+            if join:
+                self._apply_growth(state, start_valid, reply, step)
             step += 1
             self._advance_run(state, start_valid, step, command["grant_id"])
         self.s.cur_batch_for_debug = None
@@ -774,11 +803,83 @@ class ControlledScheduler:
         set_schedule_time_batch(state.batch)
         rows = [req.kv.req_pool_idx for req in state.reqs]
         targets = [valid + step for valid in start_valid]
-        self.pool.advance_decode(rows, targets)
+        if state.run_changes:
+            # Members joined or mappings grew (decode_step_join): only the new
+            # blocks are validated and uploaded.
+            self.pool.grow_decode(rows, targets, [state.run_changes.get(index) for index in range(len(rows))])
+            state.run_changes = {}
+        else:
+            self.pool.advance_decode(rows, targets)
         require(tuple(state.batch.req_pool_indices_cpu.tolist()) == tuple(rows)
                 and tuple(state.batch.seq_lens_cpu.tolist()) == tuple(targets),
                 "Native CPU row/length metadata differs from the run step")
         self.runner._muxserve_permit = {"grant_id": grant_id, "consumed": False}
+
+    def _own_view(self, value):
+        view = view_from_dict(value)
+        return replace(view, block_tables={self.rank: view.block_tables[self.rank]})
+
+    def _service_in_run(self, handoffs):
+        """decode_step_join, at a decode-run step boundary (GPU idle): take, in command
+        order, the commands a running D batch may interleave: a prefill PREPARE or
+        REVOKE, a request CLEANUP, and a HANDOFF that this boundary runs. Its native TP
+        collective needs every rank at the same boundary, which the owner guarantees by
+        holding the boundary until every rank finished each named handoff. Any other
+        command waits for the run to end."""
+        for _ in range(2):  # the second poll delivers ACKs a HANDOFF just produced
+            self._poll(self.backlog[-1]["command_seq"] if self.backlog else self.cursor, 0)
+            while self.backlog and self.handoff_pending is None:
+                command = self.backlog[0]
+                kind = command["kind"]
+                state = self.prepared.get(command.get("batch_id"))
+                if not ((kind == "PREPARE" and command["batch_stage"] == "P")
+                        or (kind == "REVOKE" and state is not None and state.command["batch_stage"] == "P")
+                        or kind == "CLEANUP"
+                        or (kind == "HANDOFF" and command["batch_id"] in handoffs)):
+                    break
+                self.backlog.pop(0)
+                tag = command.get("batch_id") or command.get("cleanup_id")
+                trace.ev("acc", tag, kind=kind, seq=command.get("command_seq"), in_run=True)
+                self._accept(command)
+                self._absorb_reply_commands()
+            if not getattr(self.manager, "pending_acks", None):
+                break
+        self._progress()
+        self._absorb_reply_commands()
+
+    def _apply_growth(self, state, start_valid, reply, step):
+        """The joins and new KV pages the owner decided at this boundary, identical on
+        every rank: a joined request decodes from the next step on exactly as in a
+        fresh decode PREPARE; the next step's binding takes the new rows and pages."""
+        ids = [item["request_id"] for item in state.command["requests"]]
+        for item in reply.get("extend", ()):
+            index = ids.index(item["request_id"])
+            view = self._own_view(item["view"])
+            require(view.allocation_id == state.run_views[index].allocation_id
+                    and view.capacity_tokens > state.run_views[index].capacity_tokens,
+                    "Run KV growth differs from its member")
+            state.run_views[index] = state.run_changes[index] = view
+        for item in reply.get("join", ()):
+            identity = (item["request_id"], item["attempt"])
+            req = self.requests.get(identity)
+            require(req is not None and identity[0] not in ids, "Joined request is unknown or already running")
+            offset = self.history_offsets[identity]
+            require(not req.finished() and req.kv.holds_kv
+                    and req.kv.kv_committed_len == item["start_valid"] + step
+                    and list(req.output_ids) == list(item["output_token_ids"])[offset:]
+                    and len(req.origin_input_ids) + len(req.output_ids) - 1 == req.kv.kv_committed_len,
+                    "Joined request does not own the run boundary")
+            view = self._own_view(item["view"])
+            require(view.identity == RequestIdentity(self.ctx.model.model_id, *identity),
+                    "Joined request view differs")
+            state.reqs.append(req)
+            state.command["requests"].append({"request_id": identity[0], "attempt": identity[1],
+                                              "target_valid_tokens": item["start_valid"] + 1})
+            state.command["ordered_request_ids"] = tuple(state.command["ordered_request_ids"]) + (identity[0],)
+            start_valid.append(item["start_valid"])
+            state.run_changes[len(state.run_views)] = view
+            state.run_views.append(view)
+            ids.append(identity[0])
 
     def _validate_finish(self, req):
         # Native precedence is EOS/stop token before length (same as owner).

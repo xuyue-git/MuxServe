@@ -372,5 +372,121 @@ class DecodeRunMetadataChecks(unittest.TestCase):
             pool.advance_decode([0], [capacity + 1])
 
 
+class GraphArray:
+    """numpy-backed stand-in for a static graph buffer; counts uploads."""
+    copies = []
+
+    def __init__(self, array):
+        self.array = array
+
+    def __getitem__(self, index):
+        return GraphArray(self.array[index])
+
+    def copy_(self, source):
+        self.array[...] = source
+        GraphArray.copies.append(source.shape)
+        return self
+
+
+class StepJoinGrowthChecks(unittest.TestCase):
+    """decode_step_join: a running decode binding takes joined rows and grown pages."""
+
+    def setUp(self):
+        Uploads.from_numpy = staticmethod(lambda array: array)
+        self.pool, self.views = run_fixture(Uploads(), start_lengths=(17, 30), steps=3)
+        namespace = self.pool.bind_forward.__func__.__globals__
+        self.graph_pages = namespace['GRAPH_PAGES']
+        self.replay_arrays = namespace['graph_replay_arrays']
+        layers, heads = self.pool.layer_num, self.pool.head_num
+        self.pool.graph = SimpleNamespace(
+            max_bs=4, static=False,
+            tables=GraphArray(numpy.zeros((layers, 4, heads, self.graph_pages), dtype=numpy.int32)),
+            slots=GraphArray(numpy.zeros((layers, 4, heads), dtype=numpy.int64)),
+            context_lens=GraphArray(numpy.zeros(4, dtype=numpy.int32)))
+        GraphArray.copies.clear()
+
+    def step(self, bs):
+        self.pool.validate_forward(forward_for(self.pool.bound_forward))
+        before = len(GraphArray.copies)
+        self.pool.prepare_graph_replay(bs)
+        return [shape for shape in GraphArray.copies[before:] if len(shape) == 4 or len(shape) == 3
+                and shape[-1] == self.graph_pages]
+
+    def own(self, rows, start):
+        """A (layer, head, page) table of fresh blocks on rank 1 for ``rows`` pages."""
+        layers, heads = self.pool.layer_num, self.pool.head_num
+        blocks = numpy.arange(start, start + layers * heads * rows).reshape(layers, heads, rows)
+        return blocks.tolist()
+
+    def grown(self, index, extra_pages, start):
+        old = self.views[index].block_tables[1]
+        added = self.own(extra_pages, start)
+        table = [[old[layer][head] + added[layer][head] for head in range(len(old[0]))]
+                 for layer in range(len(old))]
+        capacity = self.views[index].capacity_tokens + 16 * extra_pages
+        return KVView(self.views[index].allocation_id, self.views[index].identity, capacity,
+                      self.views[index].valid_tokens, 16, {1: table})
+
+    def joined(self, valid, pages, start):
+        return KVView('a-new', RequestIdentity('m', 'r-new'), 16 * pages, valid, 16,
+                      {1: self.own(pages, start)})
+
+    def expected_graph(self, bs):
+        tables, _, _ = self.replay_arrays(self.pool.bound_forward, 0, self.pool.layer_num - 1,
+                                          self.pool.head_num, True)
+        return tables
+
+    def test_growth_validates_only_new_blocks_and_uploads_only_changed_rows(self):
+        pool = self.pool
+        self.assertEqual(len(self.step(2)), 1)  # the run's first replay uploads every row
+        pool.advance_decode([0, 1], [18, 31])
+        self.assertEqual(self.step(2), [])  # unchanged mapping: nothing uploaded
+        pool.grow_decode([0, 1, 7], [19, 32, 21], [self.grown(0, 1, 15000), None, self.joined(20, 2, 16000)])
+        bound = pool.bound_forward
+        self.assertEqual((bound.req_pool_indices, bound.target_lengths, bound.write_starts),
+                         ((0, 1, 7), (19, 32, 21), (18, 31, 20)))
+        self.assertEqual(bound.capacities, (48, 32, 32))
+        self.assertEqual(len(self.step(3)), 2)  # rows 0 and 2 only
+        self.assertTrue(numpy.array_equal(pool.graph.tables.array[:, :3], self.expected_graph(3)))
+        for layer in range(pool.layer_num):  # eager metadata sees the same mapping
+            slots, _ = pool.layer_metadata(layer)
+            self.assertEqual(slots.tolist(), legacy_metadata(bound, layer)[0])
+        with self.assertRaises(IntegrationError):
+            pool.advance_decode([0, 1, 7], [20, 33, 22])  # row 1 is full: no page was added
+        pool.grow_decode([0, 1, 7], [20, 33, 22], [None, self.grown(1, 1, 17000), None])
+        self.assertEqual(len(self.step(3)), 1)
+        self.assertTrue(numpy.array_equal(pool.graph.tables.array[:, :3], self.expected_graph(3)))
+
+    def test_growth_rejects_aliases_changed_pages_removed_rows_and_skipped_tokens(self):
+        pool = self.pool
+        self.step(2)
+        row1 = self.views[1].block_tables[1]
+        alias = self.grown(0, 1, 15000)
+        alias.block_tables[1][0][0][-1] = row1[0][0][0]  # a new page already mapped by row 1
+        twice = self.joined(20, 2, 16000)
+        twice.block_tables[1][1][1][0] = twice.block_tables[1][0][0][0]  # the same block twice
+        moved = self.grown(0, 1, 15000)
+        moved.block_tables[1][0][0][0] = 19999  # an existing page changed
+        outside = self.joined(20, 2, 39999)
+        for name, args in (
+                ('alias', ([0, 1], [18, 31], [alias, None])),
+                ('duplicate', ([0, 1, 7], [18, 31, 21], [None, None, twice])),
+                ('moved', ([0, 1], [18, 31], [moved, None])),
+                ('outside', ([0, 1, 7], [18, 31, 21], [None, None, outside])),
+                ('removed', ([0], [18], [None])),
+                ('reordered', ([1, 0], [31, 18], [None, None])),
+                ('joined without view', ([0, 1, 7], [18, 31, 21], [None, None, None])),
+                ('skipped token', ([0, 1], [19, 31], [self.grown(0, 1, 15000), None])),
+                ('joined past its KV', ([0, 1, 7], [18, 31, 22], [None, None, self.joined(20, 2, 16000)]))):
+            with self.subTest(name=name), self.assertRaises(IntegrationError):
+                pool.grow_decode(*args)
+        bound = pool.bound_forward
+        self.assertEqual(bound.target_lengths, (17, 30))  # every refusal left the binding alone
+        pool.grow_decode([0, 1], [18, 31], [self.grown(0, 1, 15000), None])
+        pool.validate_forward(forward_for(pool.bound_forward))
+        with self.assertRaises(IntegrationError):  # a page is never handed out twice in a run
+            pool.grow_decode([0, 1, 7], [19, 32, 21], [None, None, self.joined(20, 1, 15000)])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -258,6 +258,16 @@ class DeploymentConfig:
     # model needs them or another request waits to decode, and no decode batch
     # starts until that handoff is done. The next batch holds both requests.
     decode_run_merge: bool = False
+    # Decode admission as in the original MuxServe, whose scheduler adds a new request to
+    # the running decode batch at any token: a running decode run takes its model's
+    # prefill preparation and KV handoff on its D ranks at a step boundary instead of
+    # ending, and a request whose handoff finished joins the run at the next boundary.
+    decode_step_join: bool = False
+    # KV for a decode run grows one page at a time, as the original allocates a block
+    # when a request fills its last one, instead of reserving every step of the run up
+    # front. A page that cannot be had ends the run (full-pool recovery then applies).
+    # Requires decode_step_join (new pages ride on the step decision).
+    decode_kv_per_page: bool = False
     # With two requests of a model in flight: a request that finds its model
     # idle waits this many ms, so a request arriving just after it joins the
     # same prefill batch. The pair then decodes and finishes together, as under
@@ -345,9 +355,11 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "handoff_report_with_ready", "start_in_report_reply", "targeted_wake",
                  "rpc_inline_fast_methods", "decode_leader_reports", "handoff_prepare_after_ack",
                  "decode_prepare_light", "decode_run_merge", "capacity_recovery_all_decode",
-                 "decode_kv_trim"):
+                 "decode_kv_trim", "decode_step_join", "decode_kv_per_page"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
+    if config.decode_kv_per_page and not config.decode_step_join:
+        raise IntegrationError("INVALID_CONFIG", "decode_kv_per_page requires decode_step_join")
     if type(config.prefill_pair_hold_ms) is not int or not 0 <= config.prefill_pair_hold_ms <= 50:
         raise IntegrationError("INVALID_CONFIG", "prefill_pair_hold_ms must be an integer 0..50")
     if config.prefill_pair_hold_ms and not (config.inline_prepare and config.decode_run_merge

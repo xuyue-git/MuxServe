@@ -16,6 +16,10 @@
 # request_timeout_ms), GATEWAY_CONNECTIONS=N (config gateway_connections) for open-loop load.
 # RECOVERY_ALL_DECODE=1 (full KV pool pauses only new prefills: config capacity_recovery_all_decode=true).
 # KV_TRIM=1 (a decode run returns its unused KV reservation when it ends: config decode_kv_trim=true).
+# STEP_JOIN=1 (a decode run takes its model's prefill handoff and new requests at step
+# boundaries, as the original adds requests to the running batch: config decode_step_join=true).
+# KV_PER_PAGE=1 (a decode run's KV grows one page at a time: config decode_kv_per_page=true;
+# needs STEP_JOIN).
 # Optional env: GPUS (default 1,2,3,4), MODELS_ROOT, REFERENCE (bench JSON to
 # compare output tokens against), KV_FRACTION (size the KV pool like original
 # MuxServe: gpu_memory_utilization x total GPU memory, instead of kv_bytes_per_rank),
@@ -119,6 +123,8 @@ REQUEST_TIMEOUT_MS="${REQUEST_TIMEOUT_MS:-}"
 GATEWAY_CONNECTIONS="${GATEWAY_CONNECTIONS:-}"
 RECOVERY_ALL_DECODE="${RECOVERY_ALL_DECODE:-}"
 KV_TRIM="${KV_TRIM:-}"
+STEP_JOIN="${STEP_JOIN:-}"
+KV_PER_PAGE="${KV_PER_PAGE:-}"
 FROZEN_BUNDLE="${FROZEN_BUNDLE:-}"
 WARMUP_TOTAL="${WARMUP_TOTAL:-}"
 mkdir -p "$OUT"
@@ -126,7 +132,7 @@ OUT="$(cd "$OUT" && pwd)"
 
 "$PY" - "$RUNTIME/configs/sglang_a100.json" "$OUT/config.json" "$LOCKS" "$MODELS_ROOT" \
     "$RUN_STEPS" "$KV_FRACTION" "$HEADROOM_MIB" "$DECODE_GRAPH" "$PARK" "$PREFILL_GRAPH" \
-    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" <<'PYEOF'
+    "$INLINE_START" "$SKIP_P" "$EARLY_TOKEN" "$CLEANUP_SKIP_P" "$CLEANUP_WITH_QUIESCE" "$TRIM_MIB"     "$HANDOFF_PREPARE" "$INLINE_META" "$FINAL_STEP" "$EVENT_PUMP" "$BOOTSTRAP_POLL" "$INLINE_PREPARE" "$OWN_TABLE" "$REGISTER_READY" "$BROKER_POLL" "$EARLY_TERMINAL" "$SLOT_AT_CLEANUP" "$ACK_IN_POLL" "$COMBINED_REPORT" "$START_IN_REPLY" "$TARGETED_WAKE" "$RPC_INLINE" "$DECODE_LEADER" "$PREPARE_AFTER_ACK" "$PREPARE_LIGHT" "$INFLIGHT" "$RUN_MERGE" "$PAIR_HOLD_MS" "$MAX_NEW_TOKENS" "$REQUEST_TIMEOUT_MS" "$GATEWAY_CONNECTIONS" "$RECOVERY_ALL_DECODE" "$KV_TRIM" "$STEP_JOIN" "$KV_PER_PAGE" <<'PYEOF'
 import json, sys
 (source, target, locks, root, steps, fraction, headroom, graph, park, pgraph,
  inline, skip_p, early, cleanup_skip_p, cleanup_with_quiesce, trim_mib,
@@ -134,7 +140,8 @@ import json, sys
  inline_prepare, own_table, register_ready, broker_poll, early_terminal,
  slot_at_cleanup, ack_in_poll, combined_report, start_in_reply,
  targeted_wake, rpc_inline, decode_leader, prepare_after_ack, prepare_light,
- inflight, run_merge, pair_hold_ms, max_new, timeout_ms, gateway, recovery_all_decode, kv_trim) = sys.argv[1:]
+ inflight, run_merge, pair_hold_ms, max_new, timeout_ms, gateway, recovery_all_decode, kv_trim,
+ step_join, kv_per_page) = sys.argv[1:]
 config = json.load(open(source))
 config["asset_lock_dir"] = locks
 if fraction:
@@ -182,6 +189,10 @@ if recovery_all_decode:
     config["capacity_recovery_all_decode"] = True
 if kv_trim:
     config["decode_kv_trim"] = True
+if step_join:
+    config["decode_step_join"] = True
+if kv_per_page:
+    config["decode_kv_per_page"] = True
 config.pop("prefill_pair_hold_ms", None)
 if pair_hold_ms:
     config["prefill_pair_hold_ms"] = int(pair_hold_ms)
@@ -233,7 +244,9 @@ print("CONFIG", target, "decode_run_steps=%s" % config.get("decode_run_steps", "
       "timeout_ms=%s" % config.get("request_timeout_ms", 120000),
       "gateway=%s" % config.get("gateway_connections", 32),
       "recovery_all_decode=%s" % config.get("capacity_recovery_all_decode", False),
-      "kv_trim=%s" % config.get("decode_kv_trim", False))
+      "kv_trim=%s" % config.get("decode_kv_trim", False),
+      "step_join=%s" % config.get("decode_step_join", False),
+      "kv_per_page=%s" % config.get("decode_kv_per_page", False))
 PYEOF
 
 busy="$(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name,used_memory --format=csv,noheader || true)"

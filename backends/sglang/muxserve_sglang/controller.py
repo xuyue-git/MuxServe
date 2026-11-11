@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Condition, Event, RLock, Thread
 import math
 import time
@@ -32,6 +32,9 @@ _INT64_MAX = (1 << 63) - 1
 # A parked decode run ends normally if it could not resume within this.
 _PARK_LIMIT_S = 2.0
 _LEADER_RANK = 0  # decode_leader_reports: the D rank that reports every step
+# decode_step_join: a step boundary waits at most this long for D-rank work other
+# than a prefill handoff it already runs (a handoff always completes first).
+_SYNC_LIMIT_S = 1.0
 
 
 class _RetiredIds:
@@ -151,6 +154,19 @@ class _Batch:
     participants: frozenset = frozenset()
     # prefill_early_token: the prefill's tokens were published at commit.
     tokens_published: bool = False
+    # decode_step_join: the plan as prepared (``plan`` gains joined requests), the
+    # first run step of each joined request, and per waiting step boundary the
+    # prefill handoffs its D ranks run there and when that boundary began to wait.
+    prepared_plan: BatchPlan | None = None
+    run_join_step: dict[str, int] = field(default_factory=dict)
+    run_sync: dict[int, set] = field(default_factory=dict)
+    sync_since: dict[int, float] = field(default_factory=dict)
+
+    def members(self, step: int) -> tuple:
+        """The requests that take part in decode run step ``step``."""
+        if not self.run_join_step:
+            return self.plan.requests
+        return tuple(ref for ref in self.plan.requests if self.run_join_step.get(ref.request_id, 1) <= step)
 
 
 def _packed_view(batch: _Batch, request_id: str, committed: bool = False) -> dict[int, PackedBlocks]:
@@ -379,6 +395,10 @@ class MuxController:
                 for rank in group.registered.values():
                     if rank.poll_cv is not None:
                         rank.poll_cv.notify_all()
+            if self.config.decode_step_join:
+                # D ranks waiting at a run's step boundary serve new commands
+                # and broker changes there; their decode_resume waits here.
+                self._park_cv.notify_all()
         self.wake.set()
 
     def group_id(self, model_id: str) -> str:
@@ -842,7 +862,7 @@ class MuxController:
                                 max(0, len(r.output) - 1) for r in rows}))
             active = [b for b in group.batches.values() if b.status not in ("DONE", "ABORTED")]
             busy.update((model.model_id, b.plan.stage) for b in active)
-            if self._merging and self._prefill_needs_d(group):
+            if self._merging and not self.config.decode_step_join and self._prefill_needs_d(group):
                 busy.add((model.model_id, "D"))
             counts[model.model_id] = sum(self._occupies_slot(r) for r in rows)
         rank_free = {rank: data["free_blocks"] for rank, data in self.store.rank_usage().items()}
@@ -1056,6 +1076,8 @@ class MuxController:
                 batch = active[0]
                 state = ("d_preparing" if batch.status == "PREPARING" else
                          "d_parked" if batch.status == "RUNNING" and batch.parked_at is not None else
+                         "d_sync" if batch.status == "RUNNING" and batch.run_decisions
+                         and batch.run_decisions.get(max(batch.run_decisions)) == "SYNC" else
                          "d_running" if batch.status == "RUNNING" else "d_finishing")
             elif not demand.decode:
                 held = {r.state for r in self.requests.values() if r.spec.model_id == model}
@@ -1096,7 +1118,7 @@ class MuxController:
                 raise IntegrationError("NOT_READY", "Model group is not ready")
             old = group.batches.get(plan.batch_id)
             if old:
-                if old.plan != plan:
+                if (old.prepared_plan or old.plan) != plan:
                     raise IntegrationError("IDENTITY_CONFLICT", "Batch replay changed contents")
                 return self._batch_view(old)
             if group.retired.contains("batch", plan.batch_id):
@@ -1146,7 +1168,9 @@ class MuxController:
                         raise IntegrationError("STALE_ATTEMPT", "Decode run exceeds the remaining output budget")
                     # A run reserves capacity for all of its steps up front;
                     # every step then appends one token inside that mapping.
-                    target = request.valid_tokens + plan.steps
+                    # decode_kv_per_page: only the first step's page; later
+                    # pages are added at the step boundary that needs them.
+                    target = request.valid_tokens + (1 if self.config.decode_kv_per_page else plan.steps)
                 targets.append(KVTarget(request.identity, target, request.allocation_id))
                 requests.append(request)
             if len({r.spec.request_id for r in requests}) != len(requests):
@@ -1187,6 +1211,8 @@ class MuxController:
                         len(request.spec.input_ids) if plan.stage == "P" else 1
                         for request in requests))
                 group.batches[plan.batch_id] = batch
+                if self.config.decode_step_join and plan.stage == "D" and plan.steps > 1:
+                    batch.prepared_plan = batch.plan
                 if plan.steps > 1:
                     for request in requests:
                         batch.run_start_valid[request.spec.request_id] = request.valid_tokens
@@ -1848,10 +1874,12 @@ class MuxController:
                 or not 0 <= gpu_time <= 3_600_000):
             raise IntegrationError("INVALID_REPORT", "Invalid forward CUDA event elapsed time")
         results = payload["results"]
-        if not isinstance(results, (tuple, list)) or len(results) != len(batch.plan.requests):
+        members = batch.members(steps_done)
+        if (not isinstance(results, (tuple, list)) or len(results) != len(members)
+                or len(members) != len(batch.plan.requests)):
             raise IntegrationError("INVALID_REPORT", "GPU results must preserve selected order")
         normalized = {}
-        for ref, result in zip(batch.plan.requests, results):
+        for ref, result in zip(members, results):
             if not isinstance(result, dict) or set(result) != {"request_id", "attempt", "token_id", "valid_tokens"}:
                 raise IntegrationError("INVALID_REPORT", "GPU result fields invalid")
             request = self._request(group.model_id, ref.request_id)
@@ -1897,7 +1925,8 @@ class MuxController:
                 self._fence(group, batch, "decode_run_incomplete_step")
                 raise IntegrationError("INVALID_REPORT", "Every rank must report the final run step")
             batch.run_steps_done = payload["steps"]
-            batch.selected_input_tokens = batch.run_steps_done * len(batch.plan.requests)
+            batch.selected_input_tokens = sum(batch.run_steps_done - batch.run_join_step.get(ref.request_id, 1) + 1
+                                              for ref in batch.plan.requests)
         valid = {batch.views[ref.request_id].allocation_id: results[ref.request_id]["valid_tokens"]
                  for ref in batch.plan.requests}
         if batch.plan.stage == "P" and batch.status == "RUNNING":
@@ -2065,7 +2094,10 @@ class MuxController:
             if target is None or target.pid != pid or not target.alive:
                 raise IntegrationError("UNKNOWN_RANK", "Registered D rank/PID required")
             batch = self._batch(group, batch_id)
-            return {"continue": self._record_step(group, batch, rank, step, results, finished)}
+            decision = self._record_step(group, batch, rank, step, results, finished)
+            if self.config.decode_step_join:
+                return self._decision_reply(batch, step, rank, decision)
+            return {"continue": decision}
 
     def _record_step(self, group: _Group, batch: _Batch, rank: int, step: int,
                      results, finished: bool) -> bool | str:
@@ -2075,9 +2107,10 @@ class MuxController:
         if (batch.plan.stage != "D" or batch.plan.steps < 2
                 or batch.status not in ("RUNNING", "FENCED")):
             raise IntegrationError("STALE_REPORT", "No running decode run")
+        members = batch.members(step) if type(step) is int else ()
         if (type(step) is not int or not 1 <= step <= batch.plan.steps
                 or type(finished) is not bool or not isinstance(results, (list, tuple))
-                or len(results) != len(batch.plan.requests)):
+                or len(results) != len(members)):
             raise IntegrationError("INVALID_REPORT", "Invalid decode step report")
         entry = (tuple(deepcopy(dict(item)) if isinstance(item, dict) else item for item in results),
                  finished)
@@ -2092,9 +2125,9 @@ class MuxController:
         leader_only = self.config.decode_leader_reports
         previous_reported = (rank in batch.run_reports.get(step - 1, {})
                              or (leader_only and rank != _LEADER_RANK))
-        if step > 1 and (not previous_reported or batch.run_decisions.get(step - 1) is not True):
+        if step > 1 and (not previous_reported or not self._granted(batch.run_decisions.get(step - 1))):
             raise IntegrationError("REPORT_GAP", "Decode step was not granted")
-        for ref, result in zip(batch.plan.requests, entry[0]):
+        for ref, result in zip(members, entry[0]):
             if (not isinstance(result, dict)
                     or set(result) != {"request_id", "attempt", "token_id", "valid_tokens"}
                     or result["request_id"] != ref.request_id or result["attempt"] != ref.attempt
@@ -2116,6 +2149,8 @@ class MuxController:
         decision = batch.run_decisions.get(step)
         if decision is None:
             decision = self._run_continues(group, batch, step, finished)
+            if decision is True and self.config.decode_step_join:
+                decision = self._boundary_continue(group, batch, step)
             batch.run_decisions[step] = decision
         if (decision == "PARK" and len(reported) == len(group.ranks)
                 and batch.parked_at is None):
@@ -2138,12 +2173,18 @@ class MuxController:
         return decision
 
     def decode_resume(self, group_id: str, rank: int, pid: int, batch_id: str, step: int,
-                      wait_ms: int | float = 100) -> dict:
+                      wait_ms: int | float = 100, after_seq: int | None = None,
+                      epoch: int | None = None, handoffs_seen: tuple | list = ()) -> dict:
         """Long-poll of a D rank whose run parked after ``step``.
 
         Returns PARK (poll again), True (run step + 1) or False (end the run
         exactly as an ordinary stop: GPU_DONE with ``step`` as the last step).
         The outcome is decided once and replayed to every rank.
+
+        decode_step_join: also SYNC (wait at the boundary). While waiting, the
+        rank serves its model's prefill commands there; this returns early once
+        it has a command after ``after_seq``, its group's broker epoch differs
+        from ``epoch``, or the boundary runs a handoff not in ``handoffs_seen``.
         """
         if type(wait_ms) not in (int, float) or not 0 <= wait_ms <= 1000:
             raise IntegrationError("INVALID_ARGUMENT", "Resume wait must be 0..1000 ms")
@@ -2154,6 +2195,9 @@ class MuxController:
             if target is None or target.pid != pid or not target.alive:
                 raise IntegrationError("UNKNOWN_RANK", "Registered D rank/PID required")
             batch = self._batch(group, batch_id)
+            if self.config.decode_step_join:
+                return self._resume_join(group, batch, target, rank, step, deadline,
+                                         after_seq, epoch, handoffs_seen)
             if (batch.plan.stage != "D" or batch.plan.steps < 2 or type(step) is not int
                     or rank not in batch.run_reports.get(step, {})
                     or batch.run_decisions.get(step) not in ("PARK", True, False)):
@@ -2193,9 +2237,267 @@ class MuxController:
             return "PARK"
         return True
 
+    # ---- decode_step_join / decode_kv_per_page ------------------------------
+    @staticmethod
+    def _granted(decision) -> bool:
+        """A step decision that runs the next step (True, or True with joins/pages)."""
+        return decision is True or isinstance(decision, dict)
+
+    @staticmethod
+    def _rank_view(view: Any, rank: int) -> dict:
+        """One rank's part of a KV view, in a PREPARE reservation_view's form."""
+        return {"allocation_id": view.allocation_id,
+                "identity": {"model_id": view.identity.model_id, "request_id": view.identity.request_id,
+                             "attempt": view.identity.attempt},
+                "capacity_tokens": view.capacity_tokens, "valid_tokens": view.valid_tokens,
+                "block_size": view.block_size,
+                "block_tables": {rank: PackedBlocks.pack(view.block_tables[rank])},
+                "version": view.version}
+
+    def _decision_reply(self, batch: _Batch, step: int, rank: int, decision) -> dict:
+        """The step decision as one rank receives it: waits name the prefill
+        handoffs its D ranks run at this boundary; joins and new pages carry
+        only this rank's block tables."""
+        if decision in ("PARK", "SYNC"):
+            return {"continue": decision, "handoffs": tuple(sorted(batch.run_sync.get(step, ())))}
+        if not isinstance(decision, dict):
+            return {"continue": decision}
+        reply = {"continue": True}
+        if decision["join"]:
+            reply["join"] = tuple({"request_id": item["request_id"], "attempt": item["attempt"],
+                                   "start_valid": item["start_valid"],
+                                   "output_token_ids": item["output_token_ids"],
+                                   "max_new_tokens": item["max_new_tokens"],
+                                   "view": self._rank_view(item["view"], rank)}
+                                  for item in decision["join"])
+        if decision["extend"]:
+            reply["extend"] = tuple({"request_id": request_id, "view": self._rank_view(view, rank)}
+                                    for request_id, view in decision["extend"])
+        return reply
+
+    @staticmethod
+    def _handoff_open(group: _Group, batch_id: str) -> bool:
+        batch = group.batches.get(batch_id)
+        return (batch is not None and batch.plan.stage == "P" and batch.status == "HANDOFF"
+                and len(batch.handoff) < len(group.ranks))
+
+    def _open_handoffs(self, group: _Group) -> set:
+        return {batch_id for batch_id in group.batches if self._handoff_open(group, batch_id)}
+
+    def _d_work_pending(self, group: _Group) -> bool:
+        """Some command of this model waits for its D ranks: a prefill's PREPARE,
+        HANDOFF or REVOKE, or a request CLEANUP. A run serves them at a step boundary."""
+        for batch in group.batches.values():
+            if batch.plan.stage != "P":
+                continue
+            if (batch.status == "PREPARING" and any(
+                    key[0] == "D" and key not in batch.ready for key in batch.participants)):
+                return True
+            if batch.status == "HANDOFF" and len(batch.handoff) < len(group.ranks):
+                return True
+            if (batch.status == "REVOKING" and any(
+                    key[0] == "D" and key not in batch.quiesced for key in batch.quiesce_required)):
+                return True
+        return any(key[0] == "D" and key not in cleanup.quiesced
+                   for cleanup in group.cleanups.values() for key in cleanup.participants)
+
+    def _boundary_continue(self, group: _Group, batch: _Batch, step: int):
+        """A run step that would continue (decode_step_join). Wait at the boundary
+        while D-rank work of this model is pending; otherwise grow the run."""
+        if self._d_work_pending(group):
+            batch.run_sync[step] = self._open_handoffs(group)
+            batch.sync_since[step] = self.clock()
+            trace.ev("sync", batch.plan.batch_id, m=group.model_id, step=step,
+                     handoffs=len(batch.run_sync[step]))
+            return "SYNC"
+        return self._grow_run(group, batch, step)
+
+    def _wait_outcome(self, group: _Group, batch: _Batch, step: int):
+        """A waiting step boundary (PARK or SYNC) as of now. Every handoff the
+        ranks run here finishes first: it holds a TP collective, so all ranks
+        must leave the boundary together after it. Then exactly the rules of a
+        parked run apply, and the run waits for other D work (bounded)."""
+        now = self.clock()
+        named = batch.run_sync.setdefault(step, set())
+        if batch.status == "RUNNING" and not group.fenced:
+            named.update(self._open_handoffs(group))
+            if any(self._handoff_open(group, batch_id) for batch_id in named):
+                return "PARK" if batch.parked_at is not None else "SYNC"
+        if batch.parked_at is not None:
+            if not self._run_continues(group, batch, step, False, park=False):
+                return False
+            if now - batch.parked_at >= _PARK_LIMIT_S:
+                return False  # Fall back to an ordinary yield (end, re-prepare later).
+            if self._prefill_pending():
+                return "PARK"
+            credits = self.config.model(batch.plan.model_id).decode_mps // 10
+            if not self.credits.acquire(batch.plan.batch_id, batch.plan.model_id, "D", credits):
+                return "PARK"
+            batch.parked_at = None
+            trace.ev("unpark", batch.plan.batch_id, m=group.model_id, step=step, go=True)
+        else:
+            decision = self._run_continues(group, batch, step, False)
+            if decision is False:
+                return False
+            if decision == "PARK":
+                if len(batch.run_reports.get(step, {})) == len(group.ranks):
+                    # Every rank is at this boundary: release the credits to
+                    # the waiting prefill, exactly as _record_step parks.
+                    batch.parked_at = now
+                    trace.ev("park", batch.plan.batch_id, m=group.model_id, step=step)
+                    self._release_credits(batch.plan.batch_id)
+                    self.wake.set()
+                    self._start_ready_inline()
+                return "PARK"
+        if self._d_work_pending(group) and now - batch.sync_since.setdefault(step, now) < _SYNC_LIMIT_S:
+            return "SYNC"
+        return self._grow_run(group, batch, step)
+
+    def _resume_join(self, group: _Group, batch: _Batch, target: _Rank, rank: int, step: int,
+                     deadline: float, after_seq, epoch, handoffs_seen) -> dict:
+        """decode_resume under decode_step_join; caller holds the lock."""
+        if (batch.plan.stage != "D" or batch.plan.steps < 2 or type(step) is not int
+                or rank not in batch.run_reports.get(step, {}) or step not in batch.run_decisions):
+            raise IntegrationError("STALE_REPORT", "No waiting decode step")
+        if ((after_seq is not None and type(after_seq) is not int)
+                or (epoch is not None and type(epoch) is not int)
+                or not isinstance(handoffs_seen, (tuple, list))):
+            raise IntegrationError("INVALID_ARGUMENT", "Invalid resume position")
+        seen = set(handoffs_seen)
+        while True:
+            decision = batch.run_decisions[step]
+            if decision in ("PARK", "SYNC"):
+                outcome = self._wait_outcome(group, batch, step)
+                batch.run_decisions[step] = outcome
+                if outcome not in ("PARK", "SYNC"):
+                    trace.ev("resolve", batch.plan.batch_id, m=group.model_id, step=step,
+                             go=self._granted(outcome))
+                    if self._granted(outcome):
+                        batch.progress_at = self.clock()
+                    batch.parked_at = None
+                    self._park_cv.notify_all()
+                    self.wake.set()
+                decision = outcome
+            reply = self._decision_reply(batch, step, rank, decision)
+            if decision not in ("PARK", "SYNC"):
+                return reply
+            if (not set(reply["handoffs"]) <= seen
+                    or (after_seq is not None and target.next_command - 1 > after_seq)
+                    or (epoch is not None and epoch != group.epoch)):
+                return reply  # This rank has work to serve at the boundary.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return reply
+            self._park_cv.wait(remaining)
+
+    def _joinable(self, request: _Request, now: float) -> bool:
+        if (request.state != "DECODING" or request.pending_reason or request.finish_reason
+                or now >= request.deadline or request.allocation_id is None
+                or request.spec.max_new_tokens - len(request.output) < 1):
+            return False
+        active = self._active(request)
+        # A prefill whose handoff finished on every rank only quiesces its P
+        # ranks; the request is already decodable (as handoff_prepare_decode).
+        return active is None or (active.plan.stage == "P" and active.status == "QUIESCE")
+
+    def _grow_reservation(self, group: _Group, batch: _Batch, targets: list) -> tuple:
+        before = self.store.rank_usage()
+        views = self.store.extend_kv_batch(batch.reservation.reservation_id, targets)
+        after = self.store.rank_usage()
+        for rank in before:
+            batch.reserved_blocks[rank] = (batch.reserved_blocks.get(rank, 0)
+                                           + before[rank]["free_blocks"] - after[rank]["free_blocks"])
+        for view in views:
+            batch.views[view.identity.request_id] = view
+            batch.packed.pop(view.identity.request_id, None)
+        return views
+
+    def _grow_run(self, group: _Group, batch: _Batch, step: int):
+        """Run step + 1 (decode_step_join): with decode_kv_per_page first add the
+        KV page any member needs for it (none to be had ends the run), then take
+        in this model's newly decodable requests, oldest first, up to the batch
+        limit. True, or the joins and new pages every rank applies first."""
+        model = group.model_id
+        extend = []
+        try:
+            if self.config.decode_kv_per_page:
+                targets = []
+                for ref in batch.members(step + 1):
+                    view = batch.views[ref.request_id]
+                    need = batch.run_start_valid[ref.request_id] + step + 1
+                    if need > view.capacity_tokens:
+                        targets.append(KVTarget(view.identity, need, view.allocation_id))
+                if targets:
+                    try:
+                        views = self._grow_reservation(group, batch, targets)
+                    except IntegrationError as exc:
+                        if exc.code != "OUT_OF_CAPACITY":
+                            raise
+                        trace.ev("page_fail", batch.plan.batch_id, m=model, step=step, n=len(targets))
+                        return False
+                    extend = [(view.identity.request_id, view) for view in views]
+            joined = []
+            limit = min(self.config.max_model_inflight, self.policy.limits[model])
+            room = limit - len(batch.plan.requests)
+            if room > 0 and self._decode_only_for(model) is None:
+                now = self.clock()
+                members = {ref.request_id for ref in batch.plan.requests}
+                picked = sorted((r for r in self.requests.values()
+                                 if r.spec.model_id == model and r.spec.request_id not in members
+                                 and self._joinable(r, now)), key=lambda r: r.ordinal)[:room]
+                left = batch.plan.steps - step
+                budget = {r.spec.request_id: min(left, r.spec.max_new_tokens - len(r.output)) for r in picked}
+                if picked:
+                    try:
+                        group.outbox.grow(batch.holder, sum(budget.values()))
+                    except IntegrationError as exc:
+                        if exc.code != "EVENT_BACKPRESSURE":
+                            raise
+                        trace.ev("join_fail", batch.plan.batch_id, m=model, step=step, code=exc.code)
+                        return False  # End: the next run is sized to the event window.
+                views = ()
+                while picked:
+                    targets = [KVTarget(r.identity, r.valid_tokens + (
+                                   1 if self.config.decode_kv_per_page else budget[r.spec.request_id]),
+                                        r.allocation_id) for r in picked]
+                    try:
+                        views = self._grow_reservation(group, batch, targets)
+                        break
+                    except IntegrationError as exc:
+                        if exc.code != "OUT_OF_CAPACITY":
+                            raise
+                        dropped = picked.pop()
+                        group.outbox.grow(batch.holder, -budget[dropped.spec.request_id])
+                for request, view in zip(picked, views):
+                    request_id = request.spec.request_id
+                    batch.run_start_valid[request_id] = request.valid_tokens - step
+                    batch.run_start_output[request_id] = len(request.output)
+                    batch.run_published[request_id] = 0
+                    batch.run_join_step[request_id] = step + 1
+                    request.state = "RUNNING"
+                    joined.append({"request_id": request_id, "attempt": request.attempt,
+                                   "start_valid": request.valid_tokens - step,
+                                   "output_token_ids": tuple(request.output),
+                                   "max_new_tokens": request.spec.max_new_tokens, "view": view})
+                if joined:
+                    batch.plan = replace(batch.plan, requests=batch.plan.requests + tuple(
+                        RequestRef(item["request_id"], item["attempt"], len(item["output_token_ids"]))
+                        for item in joined))
+                    trace.ev("join", batch.plan.batch_id, m=model, step=step,
+                             reqs=[item["request_id"] for item in joined], size=len(batch.plan.requests))
+        except IntegrationError as exc:
+            # The store refused a running reservation it owns: ownership is uncertain.
+            self._fence(group, batch, "run_growth:" + exc.code)
+            return False
+        if extend:
+            trace.ev("page", batch.plan.batch_id, m=model, step=step, n=len(extend))
+        if not joined and not extend:
+            return True
+        return {"join": tuple(joined), "extend": tuple(extend)}
+
     def _apply_run_step(self, group: _Group, batch: _Batch, step: int, results) -> None:
         batch.run_applied = step
-        for ref, result in zip(batch.plan.requests, results):
+        for ref, result in zip(batch.members(step), results):
             request = self._request(group.model_id, ref.request_id)
             published = batch.run_published[ref.request_id]
             if (request.attempt != ref.attempt or len(request.output) !=
@@ -2248,7 +2550,10 @@ class MuxController:
         return "PARK" if self.config.decode_run_park else False
 
     def _decode_waiting(self, group: _Group, batch: _Batch) -> bool:
-        """decode_run_merge: end this run so another request of its model can join."""
+        """decode_run_merge: end this run so another request of its model can join.
+        decode_step_join: never; the run serves the prefill and takes the request in."""
+        if self.config.decode_step_join:
+            return False
         if (not self._merging or len(batch.plan.requests) >= min(self.config.max_model_inflight,
                                                                  self.policy.limits[group.model_id])):
             return False  # A full batch has no room for another request of its model.
