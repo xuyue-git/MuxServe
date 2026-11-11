@@ -71,3 +71,49 @@ def flush() -> None:
 
 
 atexit.register(flush)
+
+
+def start_sampler(period_s: float = 1.0) -> None:
+    """Diagnosis only: a daemon thread that records, once per period, this process's
+    CPU time by thread (from /proc, threads grouped by name with digits removed) and
+    how late its own 1 ms sleeps wake up, which measures how long a waking thread
+    waits for the interpreter lock. No-op unless tracing; never raises."""
+    if _DIR is None:
+        return
+    import re
+
+    def stat_ticks(tid):
+        with open(f"/proc/self/task/{tid}/stat", encoding="ascii") as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        return int(fields[11]) + int(fields[12])  # utime + stime
+
+    def run():
+        hertz = os.sysconf("SC_CLK_TCK")
+        last = {}
+        while True:
+            try:
+                lates = []
+                end = time.monotonic() + period_s
+                while time.monotonic() < end:
+                    started = time.perf_counter()
+                    time.sleep(0.001)
+                    lates.append((time.perf_counter() - started) * 1000 - 1.0)
+                names = {thread.native_id: thread.name for thread in threading.enumerate()}
+                cpu = {}
+                for tid in os.listdir("/proc/self/task"):
+                    try:
+                        ticks = stat_ticks(tid)
+                    except (OSError, ValueError, IndexError):
+                        continue
+                    previous, last[tid] = last.get(tid), ticks
+                    if previous is not None and ticks > previous:
+                        name = re.sub(r"\d+", "#", names.get(int(tid), "native"))
+                        cpu[name] = cpu.get(name, 0.0) + (ticks - previous) * 1000 / hertz
+                lates.sort()
+                ev("owner_sample", None, period_s=period_s, cpu_ms=cpu, late_n=len(lates),
+                   late_mean=round(sum(lates) / len(lates), 3),
+                   late_p90=round(lates[int(len(lates) * 0.9)], 3), late_max=round(lates[-1], 3))
+            except Exception:
+                time.sleep(period_s)
+
+    threading.Thread(target=run, name="trace-sampler", daemon=True).start()

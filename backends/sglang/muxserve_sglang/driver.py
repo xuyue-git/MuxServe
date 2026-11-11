@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from threading import Event, RLock, Thread
 from uuid import uuid4
 
@@ -108,6 +109,7 @@ class ControllerDriver:
         inline_error = getattr(self.controller, "inline_start_error", None)
         if inline_error is not None:
             raise inline_error  # an inline START failed exactly where ours would have
+        step_started = time.perf_counter()
         proposals = self.controller.tick(include_adjustments=False)
         if not self._pumping:
             self._pump_events()
@@ -134,6 +136,9 @@ class ControllerDriver:
                 return
             for proposal in proposals["suggestions"]:
                 self._prepare(proposal)
+        if trace.enabled():
+            trace.ev("drv_step", None, ms=round((time.perf_counter() - step_started) * 1000, 3),
+                     proposals=len(proposals["suggestions"]))
 
     def _run_steps(self, proposal, outputs):
         limit = getattr(self.config, "decode_run_steps", 1)

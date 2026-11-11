@@ -1004,6 +1004,7 @@ class MuxController:
         """Run deadline/recovery accounting and return ADBS proposals; no implicit START."""
         started = time.perf_counter()
         with self.lock:
+            locked = time.perf_counter()
             if self.protected_failure is not None:
                 return {"suggestions": (), "adjustments": (), "groups": {
                     m: {"group_id": g.group_id, "ready": False, "fenced": g.fenced}
@@ -1058,6 +1059,9 @@ class MuxController:
                 self._trace_decode_states(snap, suggestions)
             self._tick_count += 1
             self._tick_duration_ms += (time.perf_counter() - started) * 1000
+            if trace.enabled():
+                trace.ev("tick", None, lock_ms=round((locked - started) * 1000, 3),
+                         work_ms=round((time.perf_counter() - locked) * 1000, 3), reqs=len(self.requests))
             return {"suggestions": suggestions,
                     "adjustments": deepcopy(tuple(self.policy.adjustments)) if include_adjustments else (),
                     "groups": {m: {"group_id": g.group_id, "ready": g.ready,
@@ -2088,16 +2092,21 @@ class MuxController:
         whether another forward follows.
         """
         trace.ev("dstep", batch_id, gid=group_id, r=rank, step=step)
+        entered = time.perf_counter()
         with self.lock:
+            locked = time.perf_counter()
             group = self._group(group_id)
             target = group.registered.get(("D", rank))
             if target is None or target.pid != pid or not target.alive:
                 raise IntegrationError("UNKNOWN_RANK", "Registered D rank/PID required")
             batch = self._batch(group, batch_id)
             decision = self._record_step(group, batch, rank, step, results, finished)
-            if self.config.decode_step_join:
-                return self._decision_reply(batch, step, rank, decision)
-            return {"continue": decision}
+            reply = (self._decision_reply(batch, step, rank, decision) if self.config.decode_step_join
+                     else {"continue": decision})
+            if trace.enabled():
+                trace.ev("dstep_end", batch_id, r=rank, step=step, lock_ms=round((locked - entered) * 1000, 3),
+                         work_ms=round((time.perf_counter() - locked) * 1000, 3))
+            return reply
 
     def _record_step(self, group: _Group, batch: _Batch, rank: int, step: int,
                      results, finished: bool) -> bool | str:

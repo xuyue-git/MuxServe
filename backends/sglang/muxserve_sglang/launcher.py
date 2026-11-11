@@ -335,6 +335,8 @@ class Supervisor:
             eager_io=self.config.rpc_inline_fast_methods)
         self.rpc_thread = Thread(target=self.rpc.serve_forever, name="owner-rpc", daemon=False)
         self.rpc_thread.start()
+        from . import trace
+        trace.start_sampler()  # MXS_TRACE_DIR only: owner CPU by thread and lock-free wake delay
         environment = dict(os.environ)
         for key in tuple(environment):
             if key.startswith("MUXSERVE_"):
