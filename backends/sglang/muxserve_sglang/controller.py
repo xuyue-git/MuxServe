@@ -246,6 +246,7 @@ class MuxController:
         self.capacity_blocked: set[str] = set()
         self.recovery_protected: dict[str, tuple[str, str]] = {}
         self.recovery_owners: dict[str, tuple[tuple[str, str], ...]] = {}
+        self._decode_states: dict[str, str] = {}  # trace only: last traced decode state per model
         self.recovery_cycles = self.recovery_suspensions = 0
         self._ordinal = 0
         self.credits = CreditLedger(config.credit_multiplier, tuple(range(config.tp_size)))
@@ -1033,12 +1034,51 @@ class MuxController:
                     self._issue_drain(group)
             snap = self._snapshot_policy()
             suggestions = self.policy.suggestions(snap)
+            if trace.enabled():
+                self._trace_decode_states(snap, suggestions)
             self._tick_count += 1
             self._tick_duration_ms += (time.perf_counter() - started) * 1000
             return {"suggestions": suggestions,
                     "adjustments": deepcopy(tuple(self.policy.adjustments)) if include_adjustments else (),
                     "groups": {m: {"group_id": g.group_id, "ready": g.ready,
                                     "fenced": g.fenced} for m, g in self.groups.items()}}
+
+    def _trace_decode_states(self, snap: PolicySnapshot, suggestions) -> None:
+        """Trace only (no effect on scheduling): what each model's decode side is doing,
+        and why no decode batch is proposed while requests wait to decode. Emitted on
+        change. Caller holds the lock."""
+        proposed = {s.model_id for s in suggestions if s.stage == "D"}
+        for demand in snap.demands:
+            model = demand.model_id
+            active = [b for b in self.groups[model].batches.values()
+                      if b.plan.stage == "D" and b.status not in ("DONE", "ABORTED")]
+            if active:
+                batch = active[0]
+                state = ("d_preparing" if batch.status == "PREPARING" else
+                         "d_parked" if batch.status == "RUNNING" and batch.parked_at is not None else
+                         "d_running" if batch.status == "RUNNING" else "d_finishing")
+            elif not demand.decode:
+                held = {r.state for r in self.requests.values() if r.spec.model_id == model}
+                state = ("in_prefill" if held & {"PREPARING", "RUNNING"} else
+                         "rebuild_wait" if held & {"REBUILD", "SUSPENDED"} else
+                         "queued_only" if "QUEUED" in held else "empty")
+            elif model in proposed:
+                state = "proposed"
+            elif model in snap.blocked:
+                state = "blocked"
+            elif (model, "D") in snap.busy:
+                state = "own_prefill_holds_d"
+            elif snap.credit_admissible is not None and (model, "D") not in snap.credit_admissible:
+                state = "no_credits"
+            elif self.policy.limits.get(model, 0) <= 0:
+                state = "limit_zero"
+            elif not suggestions:
+                state = "prefill_priority"
+            else:
+                state = "other"
+            if self._decode_states.get(model) != state:
+                self._decode_states[model] = state
+                trace.ev("d_state", None, m=model, s=state, n=len(demand.decode))
 
     def prepare_batch(self, plan: BatchPlan, *, _after_handoff: "_Batch | None" = None) -> dict:
         """``_after_handoff`` (controller-internal, handoff_prepare_decode): the
