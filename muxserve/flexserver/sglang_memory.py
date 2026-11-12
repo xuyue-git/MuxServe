@@ -1,0 +1,573 @@
+"""Fixed SGLang adapter over controller-owned original Head-wise buffers.
+
+Logical SGLang token IDs never index these buffers. Physical addresses come only
+from an explicitly bound, externally granted KVView snapshot.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Sequence
+
+import numpy as np
+import torch
+from sglang.srt.mem_cache.memory_pool import KVCache
+
+from muxserve.flexserver import ops
+from muxserve.contracts import IntegrationError, KVView, ModelLayout, PackedBlocks
+
+
+def _require(condition: bool, message: str, code: str = "LAYOUT_MISMATCH") -> None:
+    if not condition:
+        raise IntegrationError(code, message)
+
+
+def _cpu_ints(value, name: str) -> tuple[int, ...]:
+    _require(value is not None, f"Missing {name}", "FORWARD_MISMATCH")
+    if isinstance(value, torch.Tensor):
+        _require(value.device.type == "cpu" and value.ndim == 1,
+                 f"{name} must be a one-dimensional CPU mirror", "FORWARD_MISMATCH")
+        value = value.tolist()
+    result = tuple(value)
+    _require(all(type(v) is int for v in result), f"{name} must contain integers")
+    return result
+
+
+@dataclass
+class BoundForward:
+    mode: str
+    req_pool_indices: tuple[int, ...]
+    target_lengths: tuple[int, ...]
+    write_lengths: tuple[int, ...]
+    write_starts: tuple[int, ...]
+    # Frozen CPU copies: request -> layer -> head -> physical block IDs.
+    tables: tuple[tuple[tuple[tuple[int, ...], ...], ...], ...]
+    batch: object | None = None
+    layer_metadata: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    metadata_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
+    # Per-forward write-slot buffer (all layers) and its per-layer views.
+    slot_buffer: torch.Tensor | None = None
+    layer_slot_views: dict[int, torch.Tensor] = field(default_factory=dict)
+    # A prefill/rebuild grant is one ForwardBatch executed once: after its
+    # full check, later layers of that same object skip re-reading the CPU
+    # mirrors. Decode bindings are always fully re-checked.
+    extend_checked: bool = False
+    context_lens: torch.Tensor | None = None
+    # Reserved token capacity per request; a decode run advances within it.
+    capacities: tuple[int, ...] = ()
+    # Per-request numpy copies of ``tables`` and the uploaded padded block
+    # table. Both depend only on the frozen tables, so a decode run that
+    # advances inside its reserved capacity reuses them for every step.
+    np_tables: list | None = None
+    table_buffer: torch.Tensor | None = None
+    # Set once this run's padded tables were uploaded into the decode graph's
+    # static table buffer; advance_decode carries it to later run steps.
+    graph_tables: object | None = None
+    # decode_step_join: physical blocks mapped by any row (bool per pool block,
+    # built at a run's first growth) and graph rows whose tables changed since
+    # the last replay upload.
+    used_blocks: object | None = None
+    graph_dirty: tuple = ()
+
+    @property
+    def total_written(self) -> int:
+        return sum(self.write_lengths)
+
+
+# Decode CUDA graphs bake the attention kernel's context capacity into the
+# capture; every request is capped at this many tokens by the controller.
+GRAPH_MAX_CONTEXT = 2048
+GRAPH_PAGES = GRAPH_MAX_CONTEXT // 16
+
+
+@dataclass
+class GraphBuffers:
+    """Static decode-graph metadata. Captured kernels read these addresses;
+    each replay overwrites their contents from the validated bound grant."""
+    max_bs: int
+    slots: torch.Tensor         # [layers, max_bs, heads] int64 physical write slots
+    tables: torch.Tensor        # [layers, max_bs, heads, GRAPH_PAGES] int32 page tables
+    context_lens: torch.Tensor  # [max_bs] int32
+    static: bool = False        # capture/warmup Python forwards use these buffers
+
+
+def graph_replay_arrays(bound: BoundForward, start_layer: int, end_layer: int, head_num: int,
+                        upload_tables: bool):
+    """Numpy contents for one decode-graph replay of ``bound`` (no torch).
+
+    Identical indexing to layer_metadata: write slot = page * 16 + offset of
+    the single appended token, per layer and head; tables padded with zeros
+    to GRAPH_PAGES (the kernel reads only ceil(context / 16) pages).
+    """
+    _require(bound.mode == "DECODE" and all(count == 1 for count in bound.write_lengths),
+             "Decode graphs replay one appended token per request", "FORWARD_MISMATCH")
+    _require(all(0 < target <= GRAPH_MAX_CONTEXT for target in bound.target_lengths),
+             "Decode graph context exceeds the captured capacity", "FORWARD_MISMATCH")
+    if bound.np_tables is None:
+        bound.np_tables = [np.asarray(table, dtype=np.int64) for table in bound.tables]
+    selected = slice(start_layer, end_layer + 1)
+    layers, rows = end_layer - start_layer + 1, len(bound.np_tables)
+    tables = None
+    if upload_tables:
+        tables = np.zeros((layers, rows, head_num, GRAPH_PAGES), dtype=np.int32)
+        for row, table in enumerate(bound.np_tables):
+            _require(table.shape[1] == head_num and table.shape[2] <= GRAPH_PAGES,
+                     "Decode graph page table exceeds the captured capacity", "FORWARD_MISMATCH")
+            tables[:, row, :, :table.shape[2]] = table[selected]
+    slots = np.empty((layers, rows, head_num), dtype=np.int64)
+    for row, (start, table) in enumerate(zip(bound.write_starts, bound.np_tables)):
+        slots[:, row, :] = table[selected][:, :, start // 16] * 16 + start % 16
+    lengths = np.asarray(bound.target_lengths, dtype=np.int32)
+    return tables, slots, lengths
+
+
+class HeadwiseTokenToKVPool(KVCache):
+    """One imported physical K/V pair shared by all layers and local heads."""
+
+    headwise_shared = True
+
+    def __init__(self, layout: ModelLayout, rank: int, pool_key: torch.Tensor,
+                 pool_value: torch.Tensor, logical_token_capacity: int):
+        _require(rank in layout.ranks, "Rank absent from model layout")
+        _require(type(logical_token_capacity) is int and logical_token_capacity > 0,
+                 "Logical token capacity must be positive")
+        _require(pool_key.dtype == pool_value.dtype == torch.float16,
+                 "Shared Head-wise buffers must be FP16")
+        _require(pool_key.is_cuda and pool_key.device == pool_value.device,
+                 "Shared Head-wise buffers must be on the same CUDA device")
+        _require(pool_key.is_contiguous() and pool_value.is_contiguous(),
+                 "Shared Head-wise buffers must be contiguous")
+        _require(pool_key.ndim == 4 and tuple(pool_key.shape[1:]) == (16, 16, 8),
+                 "Original K layout must be [N,16,16,8]")
+        _require(tuple(pool_value.shape) == (pool_key.shape[0], 128, 16)
+                 and pool_key.shape[0] > 0, "Original V layout must be [N,128,16]")
+        self.layout, self.rank = layout, rank
+        self.pool_key, self.pool_value = pool_key, pool_value
+        self.physical_block_count = pool_key.shape[0]
+        # Do not call KVCache.__init__: it initializes optional native custom
+        # memory pools. Imported storage has exactly one authoritative owner.
+        self.size, self.page_size, self.kernel_page_blocks = logical_token_capacity, 1, 1
+        self.dtype = self.store_dtype = torch.float16
+        self.device = pool_key.device
+        self.head_num, self.head_dim = layout.kv_heads_per_rank, 128
+        self.v_head_dim, self.layer_num = 128, layout.num_layers
+        self.start_layer, self.end_layer = 0, layout.num_layers - 1
+        self.kv_buffer = (pool_key, pool_value)
+        self.k_buffer, self.v_buffer = (pool_key,), (pool_value,)
+        self.use_mla = self.use_hnd = self.is_quantized_kv_cache = False
+        self.quant_method = None
+        self.allocation_label = "controller-owned Head-wise shared pool"
+        self.enable_custom_mem_pool, self.custom_mem_pool = False, None
+        self.memory_saver_adapter = None
+        self.layer_transfer_counter = None
+        self.cpu_offloading_chunk_size = 8192
+        self.host_capacity_tokens = logical_token_capacity
+        self.host_capacity_bytes = sum(self.get_kv_size_bytes())
+        self.mem_usage = self.host_capacity_bytes / (1 << 30)
+        self._bound: BoundForward | None = None
+        self.graph: GraphBuffers | None = None
+
+    @property
+    def bound_req_pool_indices(self) -> tuple[int, ...]:
+        return self.bound_forward.req_pool_indices
+
+    @property
+    def bound_forward(self) -> BoundForward:
+        _require(self._bound is not None, "No externally granted forward is bound", "UNBOUND_FORWARD")
+        return self._bound
+
+    def bind_forward(self, views: Sequence[KVView], req_pool_indices: Sequence[int],
+                     target_lengths: Sequence[int], mode: str, own_rank_only: bool = False) -> None:
+        """``own_rank_only`` (prepare_own_rank_table): views carry and are
+        validated for this rank's table only; otherwise every rank's."""
+        _require(self._bound is None, "Previous forward has not been cleared", "FORWARD_BUSY")
+        _require(mode in ("PREFILL", "DECODE", "REBUILD"), "Unsupported bound mode")
+        rows = _cpu_ints(req_pool_indices, "bound request rows")
+        targets = _cpu_ints(target_lengths, "bound target lengths")
+        views = tuple(views)
+        _require(len(views) == len(rows) == len(targets) and len(views) > 0,
+                 "Bound request metadata lengths differ")
+        _require(len(set(rows)) == len(rows) and all(r >= 0 for r in rows),
+                 "Duplicate or negative request row")
+        _require(len({v.identity for v in views}) == len(views)
+                 and len({v.allocation_id for v in views}) == len(views),
+                 "Duplicate request identity or allocation")
+        tables, starts, writes = [], [], []
+        used_blocks: dict[int, list] = {r: [] for r in ((self.rank,) if own_rank_only else self.layout.ranks)}
+        for view, target in zip(views, targets):
+            _require(view.identity.model_id == self.layout.model_id and bool(view.allocation_id),
+                     "Wrong model or absent allocation identity")
+            _require(type(view.capacity_tokens) is int and type(view.valid_tokens) is int
+                     and 0 <= view.valid_tokens <= view.capacity_tokens
+                     and 0 < target <= min(view.capacity_tokens, 2048)
+                     and view.block_size == 16, "Invalid view capacity, length or block size")
+            _require(set(view.block_tables) == ({self.rank} if own_rank_only else set(self.layout.ranks)),
+                     "Incomplete rank mapping")
+            if mode == "DECODE":
+                _require(target == view.valid_tokens + 1, "Decode must append exactly one token")
+                starts.append(view.valid_tokens)
+                writes.append(1)
+            else:
+                _require(mode != "PREFILL" or view.valid_tokens == 0,
+                         "Initial prefill requires empty committed KV")
+                starts.append(0)
+                writes.append(target)
+            pages = (view.capacity_tokens + 15) // 16
+            for rank, rank_table in view.block_tables.items():
+                if isinstance(rank_table, PackedBlocks):
+                    _require(rank_table.layers == self.layer_num, "Incomplete layer mapping")
+                    _require(rank_table.heads == self.head_num, "Incomplete head mapping")
+                    _require(rank_table.pages == pages, "Incomplete physical page mapping")
+                    rank_blocks = rank_table.array().reshape(-1)
+                else:
+                    _require(len(rank_table) == self.layer_num, "Incomplete layer mapping")
+                    flat = []
+                    for heads in rank_table:
+                        _require(len(heads) == self.head_num, "Incomplete head mapping")
+                        for blocks in heads:
+                            _require(len(blocks) == pages, "Incomplete physical page mapping")
+                            flat.extend(blocks)
+                    _require(set(map(type, flat)) == {int}, "Physical block index outside imported pool")
+                    rank_blocks = np.asarray(flat, dtype=np.int64)
+                # Every block on every rank is still validated, with numpy
+                # reductions instead of per-block Python dispatch.
+                _require(rank_blocks.size > 0 and int(rank_blocks.min()) >= 0
+                         and int(rank_blocks.max()) < self.physical_block_count,
+                         "Physical block index outside imported pool")
+                used_blocks[rank].append(rank_blocks)
+            own = view.block_tables[self.rank]
+            tables.append(own.array().astype(np.int64) if isinstance(own, PackedBlocks) else
+                          tuple(tuple(tuple(blocks) for blocks in heads) for heads in own))
+        for rank, arrays in used_blocks.items():
+            combined = np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
+            _require(np.unique(combined).size == combined.size,
+                     "Aliased physical blocks across requests/layers/heads")
+        self._bound = BoundForward(mode, rows, targets, tuple(writes), tuple(starts), tuple(tables),
+                                   capacities=tuple(view.capacity_tokens for view in views))
+
+    def advance_decode(self, req_pool_indices: Sequence[int], target_lengths: Sequence[int]) -> None:
+        """Re-bind the next step of a granted decode run without re-reading views.
+
+        Only an executed DECODE binding may advance, by exactly one token per
+        request, inside the capacity reserved and fully validated at bind time.
+        """
+        bound = self.bound_forward
+        _require(bound.mode == "DECODE" and bound.batch is not None,
+                 "Only an executed decode binding can advance", "FORWARD_MISMATCH")
+        rows = _cpu_ints(req_pool_indices, "bound request rows")
+        targets = _cpu_ints(target_lengths, "bound target lengths")
+        _require(rows == bound.req_pool_indices, "Decode run rows changed", "FORWARD_MISMATCH")
+        _require(len(targets) == len(bound.target_lengths) and all(
+                     new == old + 1 and new <= min(capacity, 2048)
+                     for new, old, capacity in zip(targets, bound.target_lengths, bound.capacities)),
+                 "Decode run must append one token inside its reserved capacity", "FORWARD_MISMATCH")
+        self._bound = BoundForward("DECODE", rows, targets, (1,) * len(rows), bound.target_lengths,
+                                   bound.tables, capacities=bound.capacities,
+                                   np_tables=bound.np_tables, table_buffer=bound.table_buffer,
+                                   graph_tables=bound.graph_tables, used_blocks=bound.used_blocks,
+                                   graph_dirty=bound.graph_dirty)
+
+    def grow_decode(self, req_pool_indices: Sequence[int], target_lengths: Sequence[int],
+                    views: Sequence[KVView | None]) -> None:
+        """decode_step_join: the next step of a granted decode run whose members joined,
+        left or got pages at this boundary. ``req_pool_indices`` lists the rows that stay,
+        in their previous order, then the joined rows. ``views`` has one entry per row:
+        None keeps the row's frozen mapping; otherwise this rank's view of that request,
+        either a joined row (its target exactly one token past its committed KV) or a
+        staying row whose mapping kept its pages and grew by whole pages.
+
+        Only the new blocks are validated (in the imported pool, not mapped by any row,
+        including the same row), against a per-run map of mapped blocks that also drops
+        the blocks of rows that left, so a change costs as much as the blocks it touches.
+        Every row still advances by exactly one token inside its mapping; rows that moved
+        or changed are re-uploaded to a decode graph alone.
+        """
+        bound = self.bound_forward
+        _require(bound.mode == "DECODE" and bound.batch is not None,
+                 "Only an executed decode binding can grow", "FORWARD_MISMATCH")
+        rows = _cpu_ints(req_pool_indices, "bound request rows")
+        targets = _cpu_ints(target_lengths, "bound target lengths")
+        views = list(views)
+        position = {row: index for index, row in enumerate(bound.req_pool_indices)}
+        kept = 0
+        while kept < len(rows) and rows[kept] in position:
+            kept += 1
+        order = [position[row] for row in rows[:kept]]
+        _require(len(rows) == len(targets) == len(views) and len(rows) > 0
+                 and len(set(rows)) == len(rows) and all(row >= 0 for row in rows)
+                 and order == sorted(order) and all(view is not None for view in views[kept:]),
+                 "Decode run rows may only leave or be appended", "FORWARD_MISMATCH")
+        previous = list(bound.np_tables if bound.np_tables is not None else
+                        [np.asarray(table, dtype=np.int64) for table in bound.tables])
+        if bound.used_blocks is None:
+            mapped = np.zeros(self.physical_block_count, dtype=bool)
+            for table in previous:
+                mapped[table.reshape(-1)] = True
+        else:
+            mapped = bound.used_blocks.copy()
+        for index in set(range(len(previous))) - set(order):
+            mapped[previous[index].reshape(-1)] = False  # the row left the run
+        np_tables = [previous[index] for index in order]
+        capacities = [bound.capacities[index] for index in order]
+        prior_targets = [bound.target_lengths[index] for index in order]
+        changed = {new for new, old in enumerate(order) if new != old}
+        changed |= {order.index(old) for old in bound.graph_dirty if old in order}
+        for index, view in enumerate(views):
+            if view is None:
+                continue
+            _require(view.identity.model_id == self.layout.model_id and bool(view.allocation_id)
+                     and type(view.capacity_tokens) is int and type(view.valid_tokens) is int
+                     and 0 <= view.valid_tokens <= view.capacity_tokens and view.block_size == 16
+                     and set(view.block_tables) == {self.rank}, "Invalid grown decode view")
+            own = view.block_tables[self.rank]
+            table = (own.array() if isinstance(own, PackedBlocks) else np.asarray(own)).astype(np.int64)
+            _require(table.shape == (self.layer_num, self.head_num, (view.capacity_tokens + 15) // 16),
+                     "Incomplete physical page mapping")
+            if index < kept:
+                prior = np_tables[index]
+                _require(view.capacity_tokens > capacities[index]
+                         and np.array_equal(table[:, :, :prior.shape[2]], prior),
+                         "A grown mapping must keep its pages", "FORWARD_MISMATCH")
+                added = table[:, :, prior.shape[2]:].reshape(-1)
+                np_tables[index], capacities[index] = table, view.capacity_tokens
+            else:
+                _require(targets[index] == view.valid_tokens + 1,
+                         "A joined row must append exactly one token", "FORWARD_MISMATCH")
+                added = table.reshape(-1)
+                np_tables.append(table)
+                capacities.append(view.capacity_tokens)
+            _require(added.size > 0 and int(added.min()) >= 0
+                     and int(added.max()) < self.physical_block_count,
+                     "Physical block index outside imported pool")
+            _require(np.unique(added).size == added.size and not mapped[added].any(),
+                     "Aliased physical blocks across requests/layers/heads")
+            mapped[added] = True
+            changed.add(index)
+        _require(all(new == prior + 1 for new, prior in zip(targets, prior_targets))
+                 and all(0 < target <= min(capacity, 2048) for target, capacity in zip(targets, capacities)),
+                 "Decode run must append one token inside its mapping", "FORWARD_MISMATCH")
+        self._bound = BoundForward("DECODE", rows, targets, (1,) * len(rows),
+                                   tuple(target - 1 for target in targets), tuple(np_tables),
+                                   capacities=tuple(capacities), np_tables=np_tables,
+                                   graph_tables=bound.graph_tables, used_blocks=mapped,
+                                   graph_dirty=tuple(sorted(changed)))
+
+    def clear_forward(self) -> None:
+        """Caller must hold the grant until all-rank GPU completion before clearing."""
+        self._bound = None
+
+    def validate_forward(self, forward_batch) -> BoundForward:
+        bound = self.bound_forward
+        if bound.extend_checked and bound.batch is forward_batch:
+            return bound
+        _require(getattr(forward_batch.forward_mode, "name", None)
+                 == ("DECODE" if bound.mode == "DECODE" else "EXTEND"),
+                 "Forward mode does not match granted mode", "FORWARD_MISMATCH")
+        _require(forward_batch.batch_size == len(bound.req_pool_indices),
+                 "Forward batch size mismatch", "FORWARD_MISMATCH")
+        _require(_cpu_ints(forward_batch.req_pool_indices_cpu, "req_pool_indices_cpu")
+                 == bound.req_pool_indices, "Request row order mismatch", "FORWARD_MISMATCH")
+        _require(_cpu_ints(forward_batch.seq_lens_cpu, "seq_lens_cpu") == bound.target_lengths,
+                 "Target lengths mismatch", "FORWARD_MISMATCH")
+        _require(getattr(forward_batch, "spec_info", None) is None,
+                 "Speculative attention is unsupported")
+        spec = getattr(forward_batch, "spec_algorithm", None)
+        _require(spec is None or (hasattr(spec, "is_none") and spec.is_none()),
+                 "Speculative decoding is unsupported")
+        for name in ("encoder_lens", "encoder_lens_cpu", "encoder_out_cache_loc"):
+            _require(getattr(forward_batch, name, None) is None, "Encoder attention is unsupported")
+        if bound.mode != "DECODE":
+            _require(_cpu_ints(forward_batch.extend_seq_lens_cpu, "extend_seq_lens_cpu")
+                     == bound.write_lengths, "Extend lengths mismatch", "FORWARD_MISMATCH")
+            _require(_cpu_ints(forward_batch.extend_prefix_lens_cpu, "extend_prefix_lens_cpu")
+                     == (0,) * len(bound.req_pool_indices),
+                     "Prefix/chunked prefill is unsupported", "FORWARD_MISMATCH")
+            _require(forward_batch.extend_num_tokens == bound.total_written,
+                     "Extend token count mismatch", "FORWARD_MISMATCH")
+        _require(forward_batch.input_ids.numel() == bound.total_written
+                 and forward_batch.out_cache_loc.numel() == bound.total_written,
+                 "Input/write geometry mismatch", "FORWARD_MISMATCH")
+        _require(bound.batch is None or bound.batch is forward_batch,
+                 "A grant cannot be reused for a different ForwardBatch", "FORWARD_MISMATCH")
+        bound.batch = forward_batch
+        if bound.context_lens is None:
+            bound.context_lens = torch.tensor(bound.target_lengths, dtype=torch.int32, device=self.device)
+        bound.extend_checked = bound.mode != "DECODE"
+        return bound
+
+    def _validated_bound(self, layer_id: int) -> BoundForward:
+        self._check_layer(layer_id)
+        bound = self.bound_forward
+        _require(bound.batch is not None, "ForwardBatch must be validated before layer use", "UNBOUND_FORWARD")
+        if bound.np_tables is None:
+            bound.np_tables = [np.asarray(table, dtype=np.int64) for table in bound.tables]
+        return bound
+
+    def _slot_buffer(self, bound: BoundForward) -> torch.Tensor:
+        # One upload per forward for all layers; a leading layer dimension
+        # gives contiguous kernel views. Index math runs in numpy, not per block.
+        if bound.slot_buffer is None:
+            selected = slice(self.start_layer, self.end_layer + 1)
+            layers = self.end_layer - self.start_layer + 1
+            slots = np.empty((layers, bound.total_written, self.head_num), dtype=np.int64)
+            offset = 0
+            for row, (start, count) in enumerate(zip(bound.write_starts, bound.write_lengths)):
+                positions = np.arange(start, start + count, dtype=np.int64)
+                pages = bound.np_tables[row][selected][:, :, positions // 16]
+                slots[:, offset:offset + count, :] = (pages * 16 + positions % 16).transpose(0, 2, 1)
+                offset += count
+            bound.slot_buffer = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        return bound.slot_buffer
+
+    def _table_buffer(self, bound: BoundForward) -> torch.Tensor:
+        if bound.table_buffer is None:
+            # Pad every request to the widest reserved mapping. The kernel
+            # reads only ceil(context/16) pages; unused entries are zero or
+            # blocks this request already owns.
+            selected = slice(self.start_layer, self.end_layer + 1)
+            layers = self.end_layer - self.start_layer + 1
+            max_pages = max(table.shape[2] for table in bound.np_tables)
+            padded = np.zeros((layers, len(bound.np_tables), self.head_num, max_pages), dtype=np.int32)
+            for row, table in enumerate(bound.np_tables):
+                padded[:, row, :, :table.shape[2]] = table[selected]
+            bound.table_buffer = torch.tensor(padded, dtype=torch.int32, device=self.device)
+        return bound.table_buffer
+
+    def layer_slots(self, layer_id: int) -> torch.Tensor:
+        """Write slots only: K/V stores need no block table (prefill never
+        reads one), so a prefill uploads a single metadata buffer."""
+        bound = self._validated_bound(layer_id)
+        cached = bound.layer_slot_views.get(layer_id)
+        if cached is None:
+            cached = self._slot_buffer(bound)[layer_id - self.start_layer]
+            _require(cached.is_contiguous(), "Layer metadata must be contiguous")
+            bound.layer_slot_views[layer_id] = cached
+        return cached
+
+    def layer_metadata(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        bound = self._validated_bound(layer_id)
+        if layer_id not in bound.layer_metadata:
+            # All layers retain this metadata until clear_forward: at most
+            # two uploads per forward.
+            slots = self.layer_slots(layer_id)
+            tables = self._table_buffer(bound)[layer_id - self.start_layer]
+            _require(tables.is_contiguous(), "Layer metadata must be contiguous")
+            bound.metadata_buffers = (bound.slot_buffer, bound.table_buffer)
+            bound.layer_metadata[layer_id] = slots, tables
+        return bound.layer_metadata[layer_id]
+
+    def _check_layer(self, layer_id: int) -> None:
+        _require(type(layer_id) is int and self.start_layer <= layer_id <= self.end_layer,
+                 "Layer outside model layout")
+
+    # ---- decode CUDA graph support -------------------------------------
+    def init_graph_buffers(self, max_bs: int) -> None:
+        _require(type(max_bs) is int and 1 <= max_bs <= 16, "Invalid decode graph batch size")
+        layers = self.end_layer - self.start_layer + 1
+        self.graph = GraphBuffers(
+            max_bs,
+            torch.zeros((layers, max_bs, self.head_num), dtype=torch.int64, device=self.device),
+            torch.zeros((layers, max_bs, self.head_num, GRAPH_PAGES), dtype=torch.int32, device=self.device),
+            torch.ones((max_bs,), dtype=torch.int32, device=self.device))
+
+    def graph_capture_metadata(self, bs: int) -> None:
+        """Dummy metadata for warmup/capture forwards, before any grant exists.
+
+        Capture runs at model-runner initialization, before this rank
+        registers with the owner, so no request owns KV yet; the dummy forward
+        writes only page 0 of physical block 0.
+        """
+        graph = self.graph
+        _require(graph is not None and 1 <= bs <= graph.max_bs, "Decode graph buffers are not sized")
+        _require(self._bound is None, "Graph capture must precede every granted forward", "FORWARD_BUSY")
+        graph.slots.zero_()
+        graph.tables.zero_()
+        graph.context_lens.fill_(1)
+        graph.static = True
+
+    def graph_layer_metadata(self, layer_id: int, bs: int):
+        self._check_layer(layer_id)
+        graph = self.graph
+        _require(graph is not None and 1 <= bs <= graph.max_bs, "Decode graph buffers are not sized")
+        offset = layer_id - self.start_layer
+        return graph.slots[offset, :bs], graph.tables[offset, :bs], graph.context_lens[:bs]
+
+    def prepare_graph_replay(self, bs: int) -> None:
+        """Load the validated bound decode grant into the static graph buffers."""
+        graph = self.graph
+        _require(graph is not None, "Decode graph buffers are not sized")
+        bound = self.bound_forward
+        _require(bound.batch is not None, "Replay requires a validated ForwardBatch", "UNBOUND_FORWARD")
+        _require(len(bound.req_pool_indices) == bs <= graph.max_bs,
+                 "Decode graph replay must exactly fill the captured batch", "FORWARD_MISMATCH")
+        graph.static = False
+        upload = bound.graph_tables is not graph.tables
+        tables, slots, lengths = graph_replay_arrays(bound, self.start_layer, self.end_layer,
+                                                     self.head_num, upload)
+        if upload:
+            graph.tables[:, :bs].copy_(torch.from_numpy(tables))
+            bound.graph_tables = graph.tables
+        elif bound.graph_dirty:
+            # decode_step_join: only rows that joined or grew since the last upload.
+            selected = slice(self.start_layer, self.end_layer + 1)
+            for row in bound.graph_dirty:
+                table = bound.np_tables[row][selected]
+                _require(table.shape[2] <= GRAPH_PAGES,
+                         "Decode graph page table exceeds the captured capacity", "FORWARD_MISMATCH")
+                padded = np.zeros((table.shape[0], self.head_num, GRAPH_PAGES), dtype=np.int32)
+                padded[:, :, :table.shape[2]] = table
+                graph.tables[:, row].copy_(torch.from_numpy(padded))
+        bound.graph_dirty = ()
+        graph.slots[:, :bs].copy_(torch.from_numpy(slots))
+        graph.context_lens[:bs].copy_(torch.from_numpy(lengths))
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        self._check_layer(layer_id)
+        return self.pool_key
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        self._check_layer(layer_id)
+        return self.pool_value
+
+    def get_kv_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_v_head_dim(self) -> int:
+        return self.v_head_dim
+
+    def get_kv_size_bytes(self) -> tuple[int, int]:
+        return self.pool_key.nbytes, self.pool_value.nbytes
+
+    def get_contiguous_buf_infos(self):
+        tensors = self.kv_buffer
+        return ([t.data_ptr() for t in tensors], [t.nbytes for t in tensors],
+                [t[0].nbytes for t in tensors])
+
+    def set_kv_buffer(self, layer, loc, cache_k: torch.Tensor, cache_v: torch.Tensor,
+                      k_scale=None, v_scale=None, layer_id_override=None, dcp_kv_mask=None) -> None:
+        _require(k_scale is None and v_scale is None and dcp_kv_mask is None,
+                 "Quantized/scaled/masked writes are unsupported")
+        _require(layer_id_override is None, "Layer remapping is unsupported")
+        bound = self.bound_forward
+        _require(bound.batch is not None and loc is bound.batch.out_cache_loc,
+                 "Write locations must be the validated logical forward locations", "FORWARD_MISMATCH")
+        expected = (bound.total_written, self.head_num, self.head_dim)
+        _require(tuple(cache_k.shape) == tuple(cache_v.shape) == expected,
+                 "K/V writes must be [written tokens,local heads,128]")
+        _require(cache_k.dtype == cache_v.dtype == self.dtype
+                 and cache_k.device == cache_v.device == self.device,
+                 "K/V write dtype or device mismatch")
+        slots = self.layer_slots(layer.layer_id)
+        ops.store(cache_k.contiguous(), cache_v.contiguous(), self.pool_key, self.pool_value, slots)
+
+    def get_cpu_copy(self, *args, **kwargs):
+        raise IntegrationError("UNSUPPORTED", "Controller PD transport owns physical KV movement")
+
+    def load_cpu_copy(self, *args, **kwargs):
+        raise IntegrationError("UNSUPPORTED", "Native CPU offload is unsupported for shared Head-wise storage")
+
+    def move_kv_cache(self, *args, **kwargs):
+        raise IntegrationError("UNSUPPORTED", "Native cache mutation is unsupported for shared Head-wise storage")
+
+    def delete_buffers(self):
+        raise IntegrationError("UNSUPPORTED", "Only the authoritative storage owner may release shared buffers")

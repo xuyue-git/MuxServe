@@ -1,14 +1,14 @@
-__version__ = "0.0.0"
+"""MuxServe: flexible spatial-temporal multiplexing for multiple LLM serving.
 
+Execution runs on SGLang (pinned v0.5.20 with the patches under
+``upstream-reference/``). The package keeps MuxServe's structure:
 
-def __getattr__(name):
-    # PEP 562: import the vLLM-based entry points on first use, so that
-    # vLLM-free submodules (muxsched.resource, used by the SGLang backend)
-    # import on their own. `from muxserve import MuxScheduler` is unchanged.
-    if name == "MuxServeArgs":
-        from .arg_utils import MuxServeArgs
-        return MuxServeArgs
-    if name == "MuxScheduler":
-        from .muxsched.scheduler import MuxScheduler
-        return MuxScheduler
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+- ``muxserve.muxsched``: scheduling (controller, ADBS policy, driver, placement,
+  SM accounting, workload generation);
+- ``muxserve.flexstore``: unified memory (shared model weights, Head-wise KV
+  store, CUDA IPC, owner RPC);
+- ``muxserve.flexserver``: per-model prefill/decode execution on SGLang;
+- ``muxserve.launch``: the deployment entry point
+  (``python -m muxserve.launch CONFIG``).
+"""
+__version__ = "0.1.0"

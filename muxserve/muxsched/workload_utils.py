@@ -1,6 +1,8 @@
 """Workload definition
 Borrowed from https://github.com/alpa-projects/mms/blob/main/alpa_serve/simulator/workload.py
 """
+from __future__ import annotations
+
 import argparse
 from abc import ABC, abstractmethod
 from copy import deepcopy
@@ -9,8 +11,9 @@ import dataclasses
 import json
 import random
 import numpy as np
-from vllm.transformers_utils.tokenizer import get_tokenizer
-from transformers import PreTrainedTokenizerBase
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:  # type hints only
+    from transformers import PreTrainedTokenizerBase
 from typing import Any, List, Tuple, Sequence, Dict, Optional
 
 import numpy as np
@@ -22,6 +25,12 @@ DEFAULT_WARMUP = 10
 DEFAULT_DATASET_PATH = "/mnt/afs/dmhj/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 DEFAULT_TOKENIZER_PATH = "/mnt/afs/share/LLMCKPTs/huggyllama/llama-7b"
 eps = 1e-6
+
+
+def get_tokenizer(tokenizer_path: str):
+    """SGLang's tokenizer loader, imported on use: arrival generation needs no tokenizer."""
+    from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer as sglang_get_tokenizer
+    return sglang_get_tokenizer(tokenizer_path)
 
 
 def to_str_round(x: Any, decimal: int = 6):

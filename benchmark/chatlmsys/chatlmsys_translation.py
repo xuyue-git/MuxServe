@@ -1,5 +1,5 @@
 from transformers import PreTrainedTokenizerBase
-from vllm.transformers_utils.tokenizer import get_tokenizer
+from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 from typing import AsyncGenerator, List, Tuple
 from typing import Dict
 import yaml

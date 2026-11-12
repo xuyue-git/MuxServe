@@ -1,0 +1,1096 @@
+"""Permit-controlled native Scheduler for the frozen SGLang Llama path.
+
+CPU commands select every batch. Native helpers retain request normalization,
+logical allocation, sampling, finish checking, and metadata-only PD processing.
+"""
+from __future__ import annotations
+
+from array import array
+from collections import OrderedDict
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+import json
+import os
+import time
+import zlib
+
+import numpy as np
+import torch
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.prefill import maybe_release_metadata_buffer
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+from sglang.srt.mem_cache.common import (
+    kv_to_page_indices, maybe_cache_unfinished_req, release_kv_cache,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.observability.metrics_collector import QueueCount
+from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils import DynamicGradMode
+
+from muxserve import trace
+from muxserve.flexserver.step_profile import StepProfiler
+from muxserve.contracts import IntegrationError, KVView, PackedBlocks, RequestIdentity
+from muxserve.flexstore.ipc import CommandSnapshot, copy_message
+
+
+def require(ok, message, code="NATIVE_STATE_MISMATCH"):
+    if not ok:
+        raise IntegrationError(code, message)
+
+
+def view_from_dict(value):
+    return KVView(**{**value, "identity": RequestIdentity(**value["identity"])})
+
+
+class CoordinatorOutputCapture:
+    """Native callbacks remain reachable; only controller events leave the rank."""
+    def __init__(self):
+        self.calls = 0
+
+    def stream_output(self, reqs, *args, **kwargs):
+        # No second output history is retained here. Native result processors
+        # already update Req; the controller validates ordered results itself.
+        self.calls += 1
+
+
+@dataclass
+class Prepared:
+    command: dict
+    reqs: list = field(default_factory=list)
+    batch: object | None = None
+    ready: bool = False
+    started: bool = False
+    handoff: dict | None = None
+    handoff_done: bool = False
+    decode_rollback: list = field(default_factory=list)
+    # decode_step_join: this rank's KV view of every run member (own table
+    # only), the views of members that joined or grew (by request) and whether
+    # members joined, left or grew since the last step's binding.
+    run_views: list = field(default_factory=list)
+    run_changes: dict = field(default_factory=dict)
+    run_regrow: bool = False
+
+
+class ControlledScheduler:
+    def __init__(self, scheduler, context):
+        self.s, self.ctx = scheduler, context
+        self.runner = scheduler.tp_worker.model_runner
+        self.pool = self.runner.token_to_kv_pool
+        self.rank, self.pid = self.runner.ps.tp_rank, os.getpid()
+        self.cursor = self.report_seq = 0
+        self.commands = OrderedDict()
+        self.prepared = {}
+        self.requests = {}
+        self.history_offsets = {}
+        self.handoff_pending = None
+        self.pending_report = None
+        self.deferred_report = None  # handoff_report_with_ready
+        self.backlog = []  # commands fetched but not yet accepted
+        self.reply_commands = ()  # start_in_report_reply
+        self.step_box = None  # decode_leader_reports
+        self._poll_epoch = None  # last broker epoch a command long-poll returned
+        self._report_pool = None  # decode_step_pipeline: sends the leader's step reports
+        self.drained = False
+        require(self.pool.headwise_shared and not scheduler.enable_overlap
+                and scheduler.spec_algorithm.is_none() and self.runner.ps.pp_size == 1
+                and scheduler.tree_cache.is_chunk_cache() and not scheduler.enable_hisparse
+                and not scheduler.enable_decode_hicache and scheduler.chunked_req is None,
+                "Controlled runtime requires the supported non-overlap Llama/ChunkCache path")
+        require(scheduler.transfer_backend.value == "shared_headwise", "Shared PD backend is required")
+        timeout = scheduler.server_args.dist_timeout
+        require(type(timeout) in (int, float) and 0 < timeout <= context.config.request_timeout_ms / 1000,
+                "Launcher must configure a finite native distributed timeout")
+        decode_graph = getattr(self.runner, "decode_cuda_graph_runner", None)
+        graphs_allowed = context.stage == "D" and getattr(context.config, "decode_cuda_graph", False)
+        require(decode_graph is None or (graphs_allowed and getattr(self.pool, "graph", None) is not None
+                                         and getattr(decode_graph, "attn_backend", None)
+                                         is getattr(self.runner, "attn_backend", None)),
+                "Decode CUDA graphs require decode_cuda_graph on a D rank with the Head-wise backend")
+        prefill_graph = getattr(self.runner, "prefill_cuda_graph_runner", None)
+        require(prefill_graph is None or type(prefill_graph).__name__ == "EagerRunner"
+                or (context.stage == "P" and getattr(context.config, "prefill_cuda_graph", False)
+                    and type(getattr(prefill_graph, "backend", None)).__name__ == "BreakableCudaGraphBackend"
+                    and getattr(self.runner, "attn_backend", None).__class__.__name__
+                    == "HeadwiseAttentionBackend"),
+                "Prefill CUDA graphs require prefill_cuda_graph on a P rank (breakable, Head-wise)")
+        require(getattr(self.runner, "cuda_graph_runner", None) is None
+                and not getattr(scheduler, "enable_staging", False)
+                and getattr(scheduler, "decode_offload_manager", None) is None
+                and getattr(scheduler, "kv_checksum_computer", None) is None,
+                "Graphs, staging, native KV offload and dense KV checksums are unsupported")
+        self.capture = CoordinatorOutputCapture()
+        # Native result processors are frozen; retain every other field by reference.
+        scheduler.batch_result_processor = replace(
+            scheduler.batch_result_processor, output_streamer=self.capture)
+        scheduler.output_streamer = self.capture
+        if context.stage == "P":
+            self.manager = scheduler.disagg_prefill_bootstrap_queue.kv_manager
+        else:
+            self.manager = scheduler.disagg_decode_prealloc_queue.kv_manager
+
+    def rpc(self, name, *args):
+        return self.ctx.rpc.call("controller_" + name, self.ctx.group_id, *args)
+
+    def sync(self):
+        torch.cuda.synchronize(self.runner.gpu_id)
+
+    def _flag(self, name):
+        return getattr(getattr(self.ctx, "config", None), name, False)
+
+    def _absorb_reply_commands(self):
+        """start_in_report_reply: queue a START the owner returned with READY,
+        if it is the next command; anything else arrives by the normal poll."""
+        for command in self.reply_commands:
+            last = self.backlog[-1]["command_seq"] if self.backlog else self.cursor
+            if command["command_seq"] == last + 1:
+                self.backlog.append(command)
+        self.reply_commands = ()
+
+    def _report(self, batch_id, kind, payload):
+        if getattr(self, "deferred_report", None) is not None:
+            return self._report_with_deferred(batch_id, kind, payload)
+        envelope = (str(self.report_seq + 1), batch_id, kind, deepcopy(payload))
+        require(self.pending_report is None or self.pending_report == envelope,
+                "An uncertain report must be replayed before advancing its sequence")
+        self.pending_report = envelope
+        trace.ev("rep_send", batch_id, kind=kind)
+        reply = self.rpc("rank_report", self.ctx.stage, self.rank, self.pid, *envelope)
+        require(reply["accepted"], "Controller refused a rank report")
+        self.report_seq += 1
+        self.pending_report = None
+        self.reply_commands = reply.get("commands", ())
+
+    def _report_with_deferred(self, batch_id, kind, payload):
+        """Send the held HANDOFF_READY and this report in one RPC, in order."""
+        first = (str(self.report_seq + 1), *deepcopy(self.deferred_report))
+        second = (str(self.report_seq + 2), batch_id, kind, deepcopy(payload))
+        self.deferred_report = None
+        self.pending_report = first  # an uncertain RPC replays the first report
+        trace.ev("rep_send", first[1], kind=first[2])
+        trace.ev("rep_send", batch_id, kind=kind)
+        reply = self.rpc("rank_reports", self.ctx.stage, self.rank, self.pid, (first, second))
+        require(reply["accepted"], "Controller refused a rank report")
+        self.report_seq += 2
+        self.pending_report = None
+        self.reply_commands = reply.get("commands", ())
+
+    @DynamicGradMode()
+    def run(self):
+        trace.set_role(f"{self.ctx.model.model_id}-{self.ctx.stage}{self.rank}")
+        self.step_profiler = StepProfiler(self.ctx.model.model_id, self.ctx.stage, self.rank)
+        eos = self.s.model_config.hf_eos_token_id
+        eos = () if eos is None else tuple(eos) if isinstance(eos, (tuple, list, set)) else (eos,)
+        tokenizer = self.s.tokenizer
+        if tokenizer is not None:
+            eos += tuple(getattr(tokenizer, "additional_stop_token_ids", ()) or ())
+            if tokenizer.eos_token_id is not None:
+                eos += (tokenizer.eos_token_id,)
+        eos = tuple(sorted(set(eos)))
+        self.rpc("register_rank", self.ctx.stage, self.rank, self.pid,
+                 {"vocab_size": self.s.model_config.vocab_size, "eos_token_ids": eos,
+                  "native_pd": True, "headwise_kv": True})
+        try:
+            # Commands fetched but not yet accepted (held while a HANDOFF is
+            # pending). Long polls ask only for newer commands, and wake early
+            # when this group's broker state changes (epoch), so neither idle
+            # ranks nor pending handoffs spin on the owner.
+            backlog = self.backlog
+            wait_ms = 0
+            # Held commands (a decode PREPARE behind its HANDOFF, a START from
+            # a report reply) run at once: nothing a poll returns gates them.
+            run_held = self._flag("handoff_report_with_ready") or self._flag("start_in_report_reply")
+            skip_poll = False
+            while not self.drained:
+                if not skip_poll:
+                    after = backlog[-1]["command_seq"] if backlog else self.cursor
+                    self._poll(after, wait_ms)
+                skip_poll = False
+                accepted = 0
+                while backlog:
+                    # HANDOFF contains a native TP all-reduce. Every rank must
+                    # complete it before consuming any later START/QUIESCE,
+                    # even when command polling returns different-sized pages.
+                    if self.handoff_pending is not None:
+                        break
+                    command = backlog.pop(0)
+                    tag = command.get("batch_id") or command.get("cleanup_id")
+                    trace.ev("acc", tag, kind=command.get("kind"), seq=command.get("command_seq"))
+                    self._accept(command)
+                    trace.ev("acc_end", tag, kind=command.get("kind"), seq=command.get("command_seq"))
+                    self._absorb_reply_commands()
+                    accepted += 1
+                    if self.drained or self.handoff_pending is not None:
+                        break
+                if self.drained:
+                    # DRAIN receipt ACK is delivered before returning through
+                    # native run_scheduler_process's normal finally block.
+                    self.rpc("poll_commands", self.ctx.stage, self.rank, self.pid,
+                             self.cursor, self.cursor)
+                    self.s.gracefully_exit = True
+                    trace.flush()
+                    return
+                self._progress()
+                self._absorb_reply_commands()
+                skip_poll = run_held and bool(backlog) and self.handoff_pending is None
+                if getattr(self.manager, "pending_acks", None):
+                    wait_ms = 20  # this poll carries the ACK and waits for the other ranks
+                elif accepted or (backlog and self.handoff_pending is None):
+                    wait_ms = 0
+                elif self.prepared or self.handoff_pending is not None:
+                    wait_ms = 20
+                else:
+                    wait_ms = 200
+        except Exception as exc:
+            # Never issue a QUIESCED proof after an uncertain CUDA/API failure.
+            # Preserve the original error if the owner is unreachable too.
+            try:
+                if self.pending_report is not None:
+                    _, batch_id, kind, payload = self.pending_report
+                    self._report(batch_id, kind, payload)
+                active = next(iter(self.prepared), None)
+                if active is not None:
+                    self._report(active, "ERROR", {"code": getattr(exc, "code", type(exc).__name__)})
+                else:
+                    self.rpc("rank_failed", self.ctx.stage, self.rank, self.pid,
+                             getattr(exc, "code", type(exc).__name__))
+            except Exception:
+                pass
+            raise
+
+    def _poll(self, after, wait_ms):
+        """One command long-poll: carries pending broker ACKs, refreshes broker state."""
+        acks = tuple(getattr(self.manager, "pending_acks", ()))
+        reply = self.rpc("poll_commands_wait", self.ctx.stage, self.rank, self.pid,
+                         after, self.cursor or None, wait_ms, self._poll_epoch, *((acks,) if acks else ()))
+        if acks:
+            del self.manager.pending_acks[:len(acks)]
+        self._poll_epoch = reply["epoch"]
+        if "bootstrap_ready" in reply:
+            self.manager.bootstrap_ready = frozenset(tuple(room) for room in reply["bootstrap_ready"])
+        if "broker_status" in reply:
+            self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
+        self.backlog.extend(reply["commands"])
+
+    def _accept(self, command):
+        require(command["group_id"] == self.ctx.group_id
+                and command["model_id"] == self.ctx.model.model_id
+                and command["stage"] == self.ctx.stage and command["rank"] == self.rank,
+                "Command execution identity differs")
+        seq = command["command_seq"]
+        if seq <= self.cursor:
+            retained = self.commands.get(seq)
+            previous = retained.detach() if isinstance(retained, CommandSnapshot) else retained
+            require(previous == command, "Changed or expired command replay")
+            return
+        require(seq == self.cursor + 1, "Command stream gap")
+        self.commands[seq] = (CommandSnapshot.capture(command) if command["kind"] in ("PREPARE", "HANDOFF")
+                              else deepcopy(command))
+        kind = command["kind"]
+        if kind == "PREPARE":
+            self._prepare(command)
+        elif kind == "START":
+            if self._flag("decode_step_join"):
+                # A decode run takes later commands at its step boundaries.
+                self.cursor = seq
+            self._start(command)
+        elif kind == "HANDOFF":
+            state = self.prepared[command["batch_id"]]
+            require(self.ctx.stage == "D" and state.command["batch_stage"] == "P"
+                    and state.command["reservation_id"] == command["reservation_id"],
+                    "HANDOFF does not match native preparation")
+            state.handoff = copy_message(command)
+            self.handoff_pending = command["batch_id"]
+            require(tuple(i["request_id"] for i in command["requests"]) ==
+                    state.command["ordered_request_ids"], "Handoff order differs")
+            queue = self.s.disagg_decode_transfer_queue
+            for item, req in zip(command["requests"], state.reqs):
+                native = next(dr for dr in queue.queue if dr.req is req)
+                native.kv_receiver.accept_handoff(item, self.pool)
+        elif kind in ("QUIESCE", "REVOKE"):
+            self._quiesce(command)
+        elif kind == "CLEANUP":
+            identity = (command["request_id"], command["attempt"])
+            self.sync()
+            self._release_request(identity)
+            self.sync()
+            self._trim_idle_cuda_cache(command["cleanup_id"])
+            self._report(command["cleanup_id"], "QUIESCED", {
+                "cleanup_id": command["cleanup_id"], "request_id": identity[0], "attempt": identity[1]})
+        elif kind == "DRAIN":
+            require(not self.prepared and not self.requests and self.pool._bound is None
+                    and not self.manager.descriptors, "Cannot drain live native/imported request state")
+            self.sync()
+            self.drained = True
+        else:
+            raise IntegrationError("UNKNOWN_COMMAND", f"Unsupported controlled command: {kind}")
+        # A decode run (decode_step_join) may have taken later commands already.
+        self.cursor = max(self.cursor, seq)
+        while len(self.commands) > 1024:
+            self.commands.popitem(last=False)
+
+    def _trim_idle_cuda_cache(self, cleanup_id):
+        """Release unused allocator slabs after synchronized, fully idle cleanup.
+
+        Apply the same rule to warmup and serving requests, so startup does not
+        hide an allocator-cache footprint that immediately returns in service.
+        Live tensors, shared imports and the owner's physical KV remain intact.
+        """
+        if (self.prepared or self.requests or self.pool._bound is not None
+                or self.manager.descriptors):
+            return
+        require(self.runner._muxserve_permit is None, "Live permit prevents idle cache trimming")
+        from muxserve.flexstore.weight_loader import _local_alias, audit_shared_weights
+        aliases = (_local_alias(self.pool.pool_key), _local_alias(self.pool.pool_value))
+        # Weight aliases are audited once after the release (they were
+        # audited at load and by every earlier trim); a pre-release audit
+        # walked the whole model again on every request cleanup.
+        device = self.runner.gpu_id
+        before_allocated = torch.cuda.memory_allocated(device)
+        before_reserved = torch.cuda.memory_reserved(device)
+        threshold_mib = getattr(getattr(self.ctx, "config", None), "idle_cache_trim_mib", 0)
+        trimmable = None
+        if threshold_mib:
+            # empty_cache returns only wholly free segments: reserved minus
+            # active blocks minus free blocks inside partly used (split)
+            # segments. reserved - allocated overstates it by those splits.
+            stats = torch.cuda.memory_stats(device)
+            trimmable = max(0, stats.get("reserved_bytes.all.current", 0)
+                            - stats.get("active_bytes.all.current", 0)
+                            - stats.get("inactive_split_bytes.all.current", 0))
+        if threshold_mib and trimmable < threshold_mib * 1024**2:
+            # Below the threshold the cache is kept: the next forward reuses it
+            # (a per-request release is reallocated by the next prefill).
+            print("IDLE_CUDA_CACHE " + json.dumps({"model_id": self.ctx.model.model_id,
+                "stage": self.ctx.stage, "rank": self.rank, "pid": self.pid, "cleanup_id": cleanup_id,
+                "allocated_before_bytes": before_allocated, "allocated_after_bytes": before_allocated,
+                "reserved_before_bytes": before_reserved, "reserved_after_bytes": before_reserved,
+                "released_reserved_bytes": 0, "trimmable_bytes": trimmable, "trimmed": False,
+                "threshold_mib": threshold_mib}), flush=True)
+            return
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+            self.sync()
+        audit_shared_weights(self.runner.model)
+        require(aliases == (_local_alias(self.pool.pool_key), _local_alias(self.pool.pool_value)),
+                "Shared KV alias changed during idle cache trimming", "KV_ALIAS_CHANGED")
+        after_allocated = torch.cuda.memory_allocated(device)
+        after_reserved = torch.cuda.memory_reserved(device)
+        print("IDLE_CUDA_CACHE " + json.dumps({"model_id": self.ctx.model.model_id,
+            "stage": self.ctx.stage, "rank": self.rank, "pid": self.pid, "cleanup_id": cleanup_id,
+            "allocated_before_bytes": before_allocated, "allocated_after_bytes": after_allocated,
+            "reserved_before_bytes": before_reserved, "reserved_after_bytes": after_reserved,
+            "released_reserved_bytes": max(0, before_reserved - after_reserved),
+            "shared_aliases_verified": True, "trimmable_bytes": trimmable, "trimmed": True}), flush=True)
+
+    def _native_request(self, item):
+        identity = (item["request_id"], item["attempt"])
+        require(identity not in self.requests, "Attempt already owns a native request")
+        rebuild = item["purpose"] == "REBUILD"
+        inputs = item["selected_input_ids"] if rebuild else item["input_ids"]
+        remaining = item["max_new_tokens"] - len(item["output_token_ids"]) + 1 if rebuild else item["max_new_tokens"]
+        params = SamplingParams(max_new_tokens=remaining, temperature=0, top_k=1,
+                                ignore_eos=item["sampling"].get("ignore_eos", False))
+        params.normalize(self.s.tokenizer)
+        params.verify(self.s.model_config.vocab_size)
+        # The length-prefixed ID plus attempt cannot prefix-match another
+        # native request in SGLang's abort handlers.
+        rid = f"mux:{self.ctx.group_id}:{len(identity[0])}:{identity[0]}:a{identity[1]}:"
+        recv = TokenizedGenerateReqInput(rid=rid, input_text=None, input_ids=array("q", inputs),
+            input_embeds=None, mm_inputs=None, token_type_ids=None, sampling_params=params,
+            return_logprob=False, logprob_start_len=-1, top_logprobs_num=0,
+            token_ids_logprob=None, stream=False, bootstrap_host="127.0.0.1",
+            bootstrap_port=self.ctx.model.bootstrap_port, bootstrap_room=item["bootstrap_room"],
+            disagg_prefill_dp_rank=0)
+        self.manager.bind_request(item)
+        self.s.handle_generate_request(recv)
+        if self.ctx.stage == "P":
+            req = next(r for r in self.s.disagg_prefill_bootstrap_queue.queue if r.rid == rid)
+        else:
+            req = next(dr.req for dr in self.s.disagg_decode_prealloc_queue.queue if dr.req.rid == rid)
+        require(not req.finished() and req.to_finish is None and list(req.origin_input_ids) == list(inputs),
+                "Native request normalization rejected or changed selected input")
+        # Native P deliberately budgets one boundary sample; only D owns the
+        # remaining output budget. Controller limits stay unchanged on both.
+        expected_budget = 1 if self.ctx.stage == "P" else remaining
+        require(req.sampling_params.max_new_tokens == expected_budget,
+                "Native context normalization changed the controller output budget")
+        self.requests[identity] = req
+        self.history_offsets[identity] = len(item["output_token_ids"]) - 1 if rebuild else 0
+        return req
+
+    def _new_batch(self, reqs):
+        return ScheduleBatch.init_new(reqs, self.s.req_to_token_pool,
+            self.s.token_to_kv_pool_allocator, self.s.tree_cache, self.s.model_config,
+            self.s.enable_overlap, self.s.spec_algorithm)
+
+    def _validate_views(self, command, rows, logical_only=False):
+        # Compute and passive ranks use the same complete global-view checks.
+        # Bind the compute pool once; passive preparation gets no GPU permission.
+        from muxserve.flexserver.sglang_memory import HeadwiseTokenToKVPool
+        validator = (HeadwiseTokenToKVPool(self.pool.layout, self.rank,
+            self.pool.pool_key, self.pool.pool_value, self.pool.size) if logical_only else self.pool)
+        views = [view_from_dict(item["reservation_view"]) for item in command["requests"]]
+        targets = [item["target_valid_tokens"] for item in command["requests"]]
+        mode = "DECODE" if command["batch_stage"] == "D" else command["purpose"] if command["purpose"] == "REBUILD" else "PREFILL"
+        for view, item in zip(views, command["requests"]):
+            require(view.identity == RequestIdentity(self.ctx.model.model_id, item["request_id"], item["attempt"])
+                    and view.block_tables[self.rank] == item["rank_block_table"], "Reservation identity/map mismatch")
+        if getattr(getattr(self.ctx, "config", None), "prepare_own_rank_table", False):
+            validator.bind_forward(views, rows, targets, mode, own_rank_only=True)
+        else:
+            validator.bind_forward(views, rows, targets, mode)
+        return views, targets, mode
+
+    def _prepare(self, command):
+        require(command["batch_id"] not in self.prepared, "Batch preparation already exists")
+        require(tuple(item["request_id"] for item in command["requests"]) == command["ordered_request_ids"],
+                "Selected native request order differs")
+        state = Prepared(copy_message(command))
+        self.prepared[command["batch_id"]] = state
+        if command["batch_stage"] == "P":
+            state.reqs = [self._native_request(item) for item in command["requests"]]
+            if self.ctx.stage == "D":
+                queue = self.s.disagg_decode_prealloc_queue
+                for req in state.reqs:
+                    native = next(dr for dr in queue.queue if dr.req is req)
+                    require(native.kv_receiver.poll() == KVPoll.WaitingForInput,
+                            "Native D handshake is not ready for logical allocation")
+                    native.waiting_for_input = True
+                    req.time_stats.set_bootstrap_done_time()
+                    indices = queue._pre_alloc(req)
+                    self._register_destination(queue, native, indices)
+                    queue.queue.remove(native)
+                    self.s.disagg_decode_transfer_queue.add(native)
+                    queue.note_destinations_queued(1)
+                self._ready(state, logical_only=True)
+        elif self.ctx.stage == "D":
+            for item in command["requests"]:
+                req = self.requests[(item["request_id"], item["attempt"])]
+                require(not req.finished() and req.kv.holds_kv
+                        and req.kv.kv_committed_len == item["target_valid_tokens"] - 1,
+                        "D request does not own the selected native boundary")
+                offset = self.history_offsets[(item["request_id"], item["attempt"])]
+                require(list(req.output_ids) == list(item["output_token_ids"])[offset:]
+                        and len(req.origin_input_ids) + len(req.output_ids) - 1 == req.kv.kv_committed_len,
+                        "Native output history differs from committed controller state")
+                # Preserve rollback state before native prepare_for_decode
+                # appends a logical ID and advances the request counters.
+                state.decode_rollback.append((req, req.kv.kv_committed_len,
+                    req.kv.kv_allocated_len, req.decode_batch_idx))
+                state.reqs.append(req)
+            state.batch = self._new_batch(state.reqs)
+            self._initialize_decode_metadata(state.batch)
+            state.batch.prepare_for_decode()
+            set_schedule_time_batch(state.batch)
+            self._ready(state)
+        else:
+            # P participates in all-rank readiness without a D model forward.
+            self._ready(state, logical_only=True)
+
+    def _initialize_decode_metadata(self, batch):
+        """Fresh non-spec metadata; PREBUILT belongs only to initial handoff.
+
+        Native alloc_for_decode reads the committed row/length tensors, then
+        prepare_for_decode increments them. Native run_batch resolves input_ids
+        from FutureMap, populated once by PREBUILT and then by each real sample.
+        No previous ScheduleBatch or SamplingBatchInfo is reused.
+        """
+        rows = [req.kv.req_pool_idx for req in batch.reqs]
+        lengths = [req.kv.kv_committed_len for req in batch.reqs]
+        batch.req_pool_indices_cpu = torch.tensor(rows, dtype=torch.int64)
+        batch.req_pool_indices = batch.req_pool_indices_cpu.to(batch.device)
+        batch.seq_lens_cpu = torch.tensor(lengths, dtype=torch.int64)
+        batch.seq_lens = batch.seq_lens_cpu.to(batch.device)
+        batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+        batch.seq_lens_sum = sum(lengths)
+        batch.input_ids = None
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, self.s.model_config.vocab_size)
+        require(not batch.sampling_info.penalizer_orchestrator.is_required,
+                "Controlled greedy path does not support stateful penalties")
+
+    def _register_destination(self, queue, native, indices):
+        # v0.5.20 performs this inside pop_preallocated. Keep its supported
+        # MHA/page1 metadata steps while selecting only the granted requests.
+        require(self.manager.kv_args.page_size == 1
+                and not self.manager.kv_args.state_types
+                and not queue.transfer_queue.enable_staging,
+                "Controlled destinations require page1 MHA without staging")
+        native.metadata_buffer_index = queue.req_to_metadata_buffer_idx_allocator.alloc()
+        require(native.metadata_buffer_index is not None, "Native metadata slots exhausted")
+        page_indices = kv_to_page_indices(indices, 1).astype(np.int32)
+        native.kv_receiver.send_metadata(page_indices, native.metadata_buffer_index,
+                                         [], decode_prefix_len=0)
+        queue._num_published_destinations += 1
+        native.req.time_stats.set_decode_transfer_queue_entry_time()
+
+    def _ready(self, state, logical_only=False):
+        command = state.command
+        rows = [r.kv.req_pool_idx for r in state.reqs] if state.reqs else list(range(len(command["requests"])))
+        if not logical_only:
+            require(self.pool._bound is None, "A selected native compute binding is still live")
+        views, targets, mode = self._validate_views(command, rows, logical_only)
+        if not logical_only:
+            batch = state.batch
+            light = (getattr(getattr(self.ctx, "config", None), "decode_prepare_light", False)
+                     and mode == "DECODE")
+            if not light:
+                self.sync()
+            require(tuple(batch.req_pool_indices_cpu.tolist()) == tuple(rows)
+                    and tuple(batch.seq_lens_cpu.tolist()) == tuple(targets)
+                    and (light or (tuple(batch.req_pool_indices.cpu().tolist()) == tuple(rows)
+                                   and tuple(batch.seq_lens.cpu().tolist()) == tuple(targets))),
+                    "Native CPU/GPU row/length metadata differs before READY")
+            if mode != "DECODE":
+                require(batch.extend_lens == targets and batch.prefix_lens == [0] * len(rows),
+                        "Native extend selection differs from bound Headwise targets")
+        else:
+            self.sync()  # logical preallocation writes must complete before READY
+        state.ready = True
+        payload = {"reservation_id": command["reservation_id"]}
+        if (getattr(getattr(self.ctx, "config", None), "register_in_ready", False)
+                and self.ctx.stage == "D" and command["batch_stage"] == "P"):
+            # register_in_ready: this batch's destinations, registered locally
+            # by _prepare just before, are registered by the owner with READY.
+            rooms = {item["bootstrap_room"] for item in command["requests"]}
+            pending = self.manager.pending_destinations
+            require({d["room"] for d in pending} == rooms and len(pending) == len(rooms),
+                    "READY destinations differ from the prefill selection")
+            payload["destinations"] = tuple(pending)
+            self.manager.pending_destinations = []
+        self._report(command["batch_id"], "READY", payload)
+
+    def _progress(self):
+        for state in tuple(self.prepared.values()):
+            if not state.ready and self.ctx.stage == "P":
+                polls = [r.disagg_kv_sender.poll() for r in state.reqs]
+                require(KVPoll.Failed not in polls, "P bootstrap was aborted")
+                if all(p == KVPoll.WaitingForInput for p in polls):
+                    trace.ev("p_boot_ok", state.command["batch_id"])
+                    queue = self.s.disagg_prefill_bootstrap_queue
+                    for req in state.reqs:
+                        require(queue.finalize_bootstrap(req), "Native P metadata slots exhausted")
+                        queue.queue.remove(req)
+                        req.init_next_round_input(self.s.tree_cache)
+                        require(len(req.prefix_indices) == 0, "P prefix reuse is unsupported")
+                        req.set_extend_range(0, len(req.origin_input_ids))
+                        req.time_stats.set_forward_entry_time()
+                    state.batch = self._new_batch(state.reqs)
+                    state.batch.prepare_for_extend()
+                    state.batch.prefill_stats = PrefillStats(
+                        log_input_tokens=sum(len(req.origin_input_ids) for req in state.reqs),
+                        log_hit_tokens=0, new_token_ratio=1.0,
+                        num_running_reqs=QueueCount.from_reqs([], False),
+                        num_new_seqs=len(state.reqs))
+                    set_schedule_time_batch(state.batch)
+                    self._ready(state)
+            if state.handoff is not None and not state.handoff_done:
+                require(time.monotonic() < state.handoff["handoff_deadline"],
+                        "Native handoff watchdog expired; ownership remains uncertain", "HANDOFF_TIMEOUT")
+                queue = self.s.disagg_decode_transfer_queue
+                natives = [next(dr for dr in queue.queue if dr.req is req) for req in state.reqs]
+                polls = [dr.kv_receiver.poll() for dr in natives]
+                require(KVPoll.Failed not in polls, "Committed D handoff was aborted")
+                if all(p == KVPoll.Success for p in polls):
+                    # Exactly one native collective transfer pass, only after
+                    # owner proof that every rank has ACKed every selected room.
+                    trace.ev("ho_ok", state.command["batch_id"])
+                    transferred = queue.pop_transferred([r.rid for r in state.reqs])
+                    trace.ev("ho_pop", state.command["batch_id"])
+                    require(transferred == state.reqs, "Native transfer order or success differs")
+                    for req in transferred:
+                        req.init_next_round_input(self.s.tree_cache)
+                        req.set_extend_range(len(req.prefix_indices), req.kv.kv_committed_len)
+                    batch = self._new_batch(transferred)
+                    batch.prepare_for_prebuilt()
+                    require(batch.inner_idle_batch is None, "PREBUILT cannot hide an ungranted idle forward")
+                    batch.process_prebuilt(self.s.future_map)
+                    self.s.batch_result_processor.process_batch_result_prebuilt(batch)
+                    for req in transferred:
+                        self._validate_finish(req)
+                    trace.ev("ho_prebuilt", state.command["batch_id"])
+                    self.sync()
+                    trace.ev("ho_sync", state.command["batch_id"])
+                    state.handoff_done = True
+                    ready = {"requests": state.handoff["requests"]}
+                    if getattr(self.manager, "local_success", False):
+                        # handoff_local_success: this rank's ACKs for these rooms go with
+                        # its HANDOFF_READY instead of its next decode_resume.
+                        rooms = {item["bootstrap_room"] for item in state.handoff["requests"]}
+                        pending = self.manager.pending_acks
+                        ready["acks"] = tuple(a for a in pending if a[0] in rooms)
+                        pending[:] = [a for a in pending if a[0] not in rooms]
+                        trace.ev("ho_local", state.command["batch_id"], acks=len(ready["acks"]))
+                    following = self.backlog[0] if self.backlog else {}
+                    if (self._flag("handoff_report_with_ready") and following.get("kind") == "PREPARE"
+                            and following.get("batch_stage") == "D"):
+                        # Sent with that batch's READY (one RPC, not two).
+                        self.deferred_report = (state.command["batch_id"], "HANDOFF_READY", ready)
+                    else:
+                        self._report(state.command["batch_id"], "HANDOFF_READY", ready)
+                    # D is not sent the P-only batch QUIESCE. This preparation
+                    # owns no forward binding; retain Req, discard batch state.
+                    del self.prepared[state.command["batch_id"]]
+                    self.handoff_pending = None
+                    for item in state.command["requests"]:
+                        self.manager.forget(item["bootstrap_room"])
+
+    def _start(self, command):
+        state = self.prepared[command["batch_id"]]
+        require(state.ready and not state.started and state.batch is not None
+                and state.command["batch_stage"] == self.ctx.stage
+                and command["grant_id"] == state.command["reservation_id"],
+                "START requires the fresh selected native preparation", "FORWARD_NOT_GRANTED")
+        require(self.runner._muxserve_permit is None, "Prior permit still exists")
+        state.started = True
+        self.runner._muxserve_permit = {"grant_id": command["grant_id"], "consumed": False}
+        if state.command.get("run_steps", 1) > 1:
+            return self._start_run(command, state)
+        start = time.monotonic()
+        previous_output_counts = [len(req.output_ids) for req in state.reqs]
+        self.s.cur_batch_for_debug = state.batch
+        # Opt-in diagnosis: on P ranks one profiled "step" is one prefill
+        # forward (run_batch/forward .. result handling .. sync).
+        profiler = getattr(self, "step_profiler", None) if self.ctx.stage == "P" else None
+        if profiler is not None:
+            profiler.before()
+        if state.command["purpose"] == "REBUILD":
+            # EXTEND executes the historical prefix but never enters sampling
+            # or native prefill result handling that would append a new token.
+            self.s.forward_ct += 1
+            state.batch.forward_iter = self.s.forward_ct
+            state.batch.launch_ts = start
+            resolve_forward_inputs(state.batch, self.s.future_map)
+            forward = ForwardBatch.init_new(state.batch, self.runner,
+                                            return_hidden_states_before_norm=False)
+            self.runner.forward(forward)
+            self.sync()
+            for req, item in zip(state.reqs, state.command["requests"]):
+                req.time_stats.set_prefill_finished_time()
+                req.output_ids.append(item["boundary_token_id"])
+                maybe_cache_unfinished_req(req, self.s.tree_cache)
+                self.s.disagg_prefill_inflight_queue.append(req)
+                self.s.send_kv_chunk(req, last_chunk=True)
+                req.time_stats.set_prefill_transfer_queue_entry_time()
+        else:
+            result = self.s.run_batch(state.batch)
+            require(result.delay_sample_func is None, "Delayed sampling is unsupported on controlled non-overlap path")
+            self.s.process_batch_result(state.batch, result)
+            require(all(len(req.output_ids) == previous + 1
+                        for req, previous in zip(state.reqs, previous_output_counts)),
+                    "Native greedy result must append exactly one token")
+            if self.ctx.stage == "D":
+                for req in state.reqs:
+                    self._validate_finish(req)
+        self.sync()
+        if profiler is not None:
+            profiler.after()
+        self.s.cur_batch_for_debug = None
+        require(self.runner._muxserve_permit["consumed"], "Granted native forward was not consumed")
+        permit = self.runner._muxserve_permit
+        require(permit.get("gpu_timing_finished"), "Native forward CUDA timing boundary is missing")
+        gpu_forward_ms = permit["gpu_start_event"].elapsed_time(permit["gpu_end_event"])
+        results = [{"request_id": item["request_id"], "attempt": item["attempt"],
+                    "token_id": None if state.command["purpose"] == "REBUILD" else req.output_ids[-1],
+                    "valid_tokens": item["target_valid_tokens"]}
+                   for req, item in zip(state.reqs, state.command["requests"])]
+        payload = {"reservation_id": state.command["reservation_id"], "results": results,
+                   "gpu_forward_ms": gpu_forward_ms, "duration_ms": (time.monotonic() - start) * 1000}
+        if self.ctx.stage == "P" and self._flag("prefill_stage_in_gpu_done"):
+            payload["staged"] = tuple(self.manager.pending_stages)
+            self.manager.pending_stages = []
+        self._report(command["batch_id"], "GPU_DONE", payload)
+
+    def _start_run(self, command, state):
+        """Execute a multi-step D grant: forward, report, then continue only on
+        the owner's per-step decision (identical for every TP rank)."""
+        steps = state.command["run_steps"]
+        require(self.ctx.stage == "D" and state.command["batch_stage"] == "D"
+                and state.command["purpose"] == "GENERATE" and type(steps) is int and steps > 1,
+                "Decode runs require a D GENERATE grant")
+        start = time.monotonic()
+        start_valid = [item["target_valid_tokens"] - 1 for item in state.command["requests"]]
+        gpu_forward_ms = 0.0
+        step = 1
+        final_step = None
+        leader_only = self._flag("decode_leader_reports")
+        digest = 0
+        tag = zlib.crc32(command["batch_id"].encode())
+        if leader_only and self.step_box is None:
+            from muxserve.flexserver.step_box import StepBox
+            self.step_box = StepBox(os.path.join(str(self.ctx.runtime_dir),
+                                                 "stepbox-%08x" % zlib.crc32(self.ctx.group_id.encode())))
+        join = self._flag("decode_step_join")
+        if join:
+            state.run_views = [self._own_view(item["reservation_view"]) for item in state.command["requests"]]
+            state.command["requests"] = list(state.command["requests"])
+        prep_ms = 0.0  # trace only: the step boundary's local batch preparation
+        # decode_step_pipeline (leader only): the previous step's report, still being
+        # answered while this step runs, and whether this boundary was granted ahead.
+        pipeline = leader_only and self.rank == 0 and self._flag("decode_step_pipeline")
+        if pipeline and self._report_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._report_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="step-report")
+        in_flight, ahead = None, False
+        leave = self._flag("decode_step_leave")
+        while True:
+            forward_started = time.perf_counter()
+            previous_output_counts = [len(req.output_ids) for req in state.reqs]
+            self.s.cur_batch_for_debug = state.batch
+            profiler = getattr(self, "step_profiler", None)
+            if profiler is not None:
+                profiler.before()
+            result = self.s.run_batch(state.batch)
+            require(result.delay_sample_func is None, "Delayed sampling is unsupported on controlled non-overlap path")
+            self.s.process_batch_result(state.batch, result)
+            require(all(len(req.output_ids) == previous + 1
+                        for req, previous in zip(state.reqs, previous_output_counts)),
+                    "Native greedy result must append exactly one token")
+            for req in state.reqs:
+                self._validate_finish(req)
+            self.sync()
+            if profiler is not None:
+                profiler.after()
+            permit = self.runner._muxserve_permit
+            require(permit["consumed"] and permit.get("gpu_timing_finished"),
+                    "Granted native forward was not consumed or timed")
+            step_gpu_ms = permit["gpu_start_event"].elapsed_time(permit["gpu_end_event"])
+            gpu_forward_ms += step_gpu_ms
+            # Trace only: batch size, forward wall (run_batch .. sync), its CUDA-event
+            # forward time, and the local preparation that preceded this step.
+            trace.ev("step_fwd", command["batch_id"], step=step, bs=len(state.reqs),
+                     fwd_ms=round((time.perf_counter() - forward_started) * 1000, 3),
+                     gpu_ms=round(step_gpu_ms, 3), prep_ms=round(prep_ms, 3))
+            results = [{"request_id": item["request_id"], "attempt": item["attempt"],
+                        "token_id": req.output_ids[-1], "valid_tokens": valid + step}
+                       for req, item, valid in zip(state.reqs, state.command["requests"], start_valid)]
+            finished = any(req.finished() for req in state.reqs)
+            # decode_step_leave: a finished member leaves at this boundary; only a run
+            # whose every member finished ends here.
+            ending = all(req.finished() for req in state.reqs) if leave else finished
+            if leader_only:
+                digest = zlib.crc32(",".join(str(item["token_id"]) for item in results).encode(), digest)
+            if in_flight is not None:
+                # The previous step's report: its answer says whether this boundary
+                # may simply continue (and raises the report's failure, if any).
+                ahead = in_flight.result().get("ahead") is True
+                in_flight = None
+            if (ending or step >= steps) and getattr(getattr(self.ctx, "config", None), "final_step_in_gpu_done", False):
+                # The owner's decision for a locally final step is always to
+                # stop: report the step inside GPU_DONE (one RPC, not two).
+                final_step = {"step": step, "results": results, "finished": ending}
+                break
+            continuing = not (ending or step >= steps)
+            if (pipeline and continuing and ahead and not finished and all(
+                    view.capacity_tokens >= valid + step + 1 for view, valid in zip(state.run_views, start_valid))):
+                # Granted ahead: run on now, report this step while the next one runs.
+                in_flight = self._report_pool.submit(self.rpc, "decode_step", self.rank, self.pid,
+                                                     command["batch_id"], step, results, ending, True)
+                reply, ahead = {"continue": True}, False
+                self.step_box.publish(tag, step, True)
+            elif (leader_only and continuing and self.rank != 0
+                    and self.step_box.wait(tag, step, self.ctx.config.prepare_timeout_ms / 1000)):
+                reply = {"continue": True}
+            else:
+                reply = self.rpc("decode_step", self.rank, self.pid, command["batch_id"], step,
+                                 results, ending)
+                ahead = reply.get("ahead") is True
+                if leader_only and continuing and self.rank == 0:
+                    # Joins and new pages reach every rank through its own report.
+                    self.step_box.publish(tag, step, reply.get("continue") is True and not reply.get("join")
+                                          and not reply.get("extend") and not reply.get("leave"))
+            if join and self._flag("decode_wait_commands"):
+                reply = self._wait_at_boundary(command["batch_id"], step, reply)
+            if join:
+                while reply.get("continue") in ("PARK", "SYNC"):
+                    # Waiting at the boundary (GPU idle, synchronized above):
+                    # serve this model's prefill commands, then ask again.
+                    handoffs = tuple(reply.get("handoffs", ()))
+                    self._service_in_run(handoffs)
+                    after = self.backlog[-1]["command_seq"] if self.backlog else self.cursor
+                    reply = self.rpc("decode_resume", self.rank, self.pid, command["batch_id"], step, 100,
+                                     after, self._poll_epoch, handoffs)
+            while reply.get("continue") == "PARK":
+                # Parked for a waiting prefill: the GPU is idle (synchronized
+                # above) and every native/KV state stays as it is.
+                reply = self.rpc("decode_resume", self.rank, self.pid, command["batch_id"], step, 100)
+            if ending or step >= steps or reply.get("continue") is not True:
+                break
+            prepared_at = time.perf_counter()
+            if join:
+                self._apply_growth(state, start_valid, reply, step)
+            step += 1
+            self._advance_run(state, start_valid, step, command["grant_id"])
+            prep_ms = (time.perf_counter() - prepared_at) * 1000
+        self.s.cur_batch_for_debug = None
+        payload = {"reservation_id": state.command["reservation_id"], "results": results,
+                   "gpu_forward_ms": gpu_forward_ms, "duration_ms": (time.monotonic() - start) * 1000,
+                   "steps": step}
+        if in_flight is not None:  # never: every exit waits for it first
+            in_flight.result()
+        if leader_only:
+            payload["token_digest"] = digest
+        if final_step is not None:
+            payload["final_step"] = final_step
+        self._report(command["batch_id"], "GPU_DONE", payload)
+
+    def _advance_run(self, state, start_valid, step, grant_id):
+        """Prepare decode step ``step`` locally, exactly as a fresh per-token
+        PREPARE would, inside the KV capacity already reserved for the run."""
+        for req, valid in zip(state.reqs, start_valid):
+            require(not req.finished() and req.kv.holds_kv
+                    and req.kv.kv_committed_len == valid + step - 1
+                    and len(req.origin_input_ids) + len(req.output_ids) - 1 == req.kv.kv_committed_len,
+                    "D request does not own the next run boundary")
+        state.batch = self._new_batch(state.reqs)
+        self._initialize_decode_metadata(state.batch)
+        state.batch.prepare_for_decode()
+        set_schedule_time_batch(state.batch)
+        rows = [req.kv.req_pool_idx for req in state.reqs]
+        targets = [valid + step for valid in start_valid]
+        if state.run_regrow:
+            # Members joined, left or grew (decode_step_join): only the blocks they
+            # touch are validated and uploaded.
+            self.pool.grow_decode(rows, targets, [state.run_changes.get(item["request_id"])
+                                                  for item in state.command["requests"]])
+            state.run_changes, state.run_regrow = {}, False
+        else:
+            self.pool.advance_decode(rows, targets)
+        require(tuple(state.batch.req_pool_indices_cpu.tolist()) == tuple(rows)
+                and tuple(state.batch.seq_lens_cpu.tolist()) == tuple(targets),
+                "Native CPU row/length metadata differs from the run step")
+        self.runner._muxserve_permit = {"grant_id": grant_id, "consumed": False}
+
+    def _own_view(self, value):
+        view = view_from_dict(value)
+        return replace(view, block_tables={self.rank: view.block_tables[self.rank]})
+
+    def _accept_in_run(self, handoffs):
+        """Take, in command order, the backlog's commands a running D batch may interleave."""
+        while self.backlog and self.handoff_pending is None:
+            command = self.backlog[0]
+            kind = command["kind"]
+            state = self.prepared.get(command.get("batch_id"))
+            if not ((kind == "PREPARE" and command["batch_stage"] == "P")
+                    or (kind == "REVOKE" and state is not None and state.command["batch_stage"] == "P")
+                    or kind == "CLEANUP"
+                    or (kind == "HANDOFF" and command["batch_id"] in handoffs)):
+                break
+            self.backlog.pop(0)
+            tag = command.get("batch_id") or command.get("cleanup_id")
+            trace.ev("acc", tag, kind=kind, seq=command.get("command_seq"), in_run=True)
+            self._accept(command)
+            self._absorb_reply_commands()
+
+    def _wait_at_boundary(self, batch_id, step, reply):
+        """decode_wait_commands: wait at a step boundary through decode_resume alone. Each
+        call ACKs the commands taken, carries this rank's broker ACKs and returns the next
+        commands and broker state, exactly as a command long-poll would."""
+        while reply.get("continue") in ("PARK", "SYNC"):
+            if "commands" in reply:
+                self._poll_epoch = reply["epoch"]
+                self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
+                self.backlog.extend(reply["commands"])
+            handoffs = tuple(reply.get("handoffs", ()))
+            # handoff_local_success: a handoff named here pops once this rank validated it.
+            self.manager.local_success = self._flag("handoff_local_success")
+            try:
+                self._accept_in_run(handoffs)
+                self._progress()
+            finally:
+                self.manager.local_success = False
+            self._absorb_reply_commands()
+            acks = tuple(getattr(self.manager, "pending_acks", ()))
+            after = self.backlog[-1]["command_seq"] if self.backlog else self.cursor
+            reply = self.rpc("decode_resume", self.rank, self.pid, batch_id, step, 100, after,
+                             self._poll_epoch, handoffs, self.cursor or None, acks)
+            if acks:
+                del self.manager.pending_acks[:len(acks)]
+        if "commands" in reply:
+            self._poll_epoch = reply["epoch"]
+            self.manager.broker_status = {room: status for room, status in reply["broker_status"]}
+            self.backlog.extend(reply["commands"])
+        return reply
+
+    def _service_in_run(self, handoffs):
+        """decode_step_join, at a decode-run step boundary (GPU idle): take, in command
+        order, the commands a running D batch may interleave: a prefill PREPARE or
+        REVOKE, a request CLEANUP, and a HANDOFF that this boundary runs. Its native TP
+        collective needs every rank at the same boundary, which the owner guarantees by
+        holding the boundary until every rank finished each named handoff. Any other
+        command waits for the run to end."""
+        for _ in range(2):  # the second poll delivers ACKs a HANDOFF just produced
+            self._poll(self.backlog[-1]["command_seq"] if self.backlog else self.cursor, 0)
+            while self.backlog and self.handoff_pending is None:
+                command = self.backlog[0]
+                kind = command["kind"]
+                state = self.prepared.get(command.get("batch_id"))
+                if not ((kind == "PREPARE" and command["batch_stage"] == "P")
+                        or (kind == "REVOKE" and state is not None and state.command["batch_stage"] == "P")
+                        or kind == "CLEANUP"
+                        or (kind == "HANDOFF" and command["batch_id"] in handoffs)):
+                    break
+                self.backlog.pop(0)
+                tag = command.get("batch_id") or command.get("cleanup_id")
+                trace.ev("acc", tag, kind=kind, seq=command.get("command_seq"), in_run=True)
+                self._accept(command)
+                self._absorb_reply_commands()
+            if not getattr(self.manager, "pending_acks", None):
+                break
+        self._progress()
+        self._absorb_reply_commands()
+
+    def _apply_growth(self, state, start_valid, reply, step):
+        """What the owner decided at this boundary, identical on every rank: members that
+        leave, new pages (only the pages after the ones this rank holds), joined requests
+        that decode from the next step on exactly as in a fresh decode PREPARE. The next
+        step's binding takes these changes."""
+        leave = set(reply.get("leave", ()))
+        if leave:
+            ids = [item["request_id"] for item in state.command["requests"]]
+            require(leave <= set(ids), "A leaving request is not in the run")
+            keep = [index for index, request_id in enumerate(ids) if request_id not in leave]
+            state.reqs = [state.reqs[index] for index in keep]
+            state.command["requests"] = [state.command["requests"][index] for index in keep]
+            start_valid[:] = [start_valid[index] for index in keep]
+            state.run_views = [state.run_views[index] for index in keep]
+            state.command["ordered_request_ids"] = tuple(item["request_id"] for item in state.command["requests"])
+            for request_id in leave:
+                state.run_changes.pop(request_id, None)
+            state.run_regrow = True
+        ids = [item["request_id"] for item in state.command["requests"]]
+        for item in reply.get("extend", ()):
+            index = ids.index(item["request_id"])
+            old = state.run_views[index]
+            own = old.block_tables[self.rank]
+            table = own.array() if isinstance(own, PackedBlocks) else np.asarray(own, dtype=np.int32)
+            pages = item["pages"]
+            require(item["first_page"] == table.shape[2] and pages.layers == table.shape[0]
+                    and pages.heads == table.shape[1]
+                    and table.shape[2] + pages.pages == (item["capacity_tokens"] + 15) // 16
+                    and item["capacity_tokens"] > old.capacity_tokens, "Run KV growth differs from its member")
+            grown = np.concatenate([table, pages.array()], axis=2)
+            state.run_views[index] = state.run_changes[item["request_id"]] = replace(
+                old, capacity_tokens=item["capacity_tokens"], block_tables={self.rank: grown})
+            state.run_regrow = True
+        for item in reply.get("join", ()):
+            identity = (item["request_id"], item["attempt"])
+            req = self.requests.get(identity)
+            require(req is not None and identity[0] not in ids, "Joined request is unknown or already running")
+            offset = self.history_offsets[identity]
+            require(not req.finished() and req.kv.holds_kv
+                    and req.kv.kv_committed_len == item["start_valid"] + step
+                    and list(req.output_ids) == list(item["output_token_ids"])[offset:]
+                    and len(req.origin_input_ids) + len(req.output_ids) - 1 == req.kv.kv_committed_len,
+                    "Joined request does not own the run boundary")
+            view = self._own_view(item["view"])
+            require(view.identity == RequestIdentity(self.ctx.model.model_id, *identity),
+                    "Joined request view differs")
+            state.reqs.append(req)
+            state.command["requests"].append({"request_id": identity[0], "attempt": identity[1],
+                                              "target_valid_tokens": item["start_valid"] + 1})
+            state.command["ordered_request_ids"] = tuple(state.command["ordered_request_ids"]) + (identity[0],)
+            start_valid.append(item["start_valid"])
+            state.run_views.append(view)
+            state.run_changes[identity[0]] = view
+            ids.append(identity[0])
+            state.run_regrow = True
+        if leave:
+            # Their cleanup was queued with this decision: release them here (no
+            # collective), so their KV returns to the pool without waiting for the run.
+            self._service_in_run(())
+
+    def _validate_finish(self, req):
+        # Native precedence is EOS/stop token before length (same as owner).
+        # Only the declared greedy subset is accepted, so other finish types
+        # indicate an abort/corruption and must never produce GPU_DONE success.
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH, FINISH_MATCHED_TOKEN
+        reason = req.finished_reason
+        require(reason is None or isinstance(reason, (FINISH_LENGTH, FINISH_MATCHED_TOKEN)),
+                "Native request finished with an unsupported/error reason")
+        require(req.to_finish is None, "Native request has an unprocessed abort")
+
+    def _rollback_decode(self, state):
+        require(not state.started and state.batch is not None, "Cannot roll back started decode")
+        self.s.token_to_kv_pool_allocator.free(state.batch.out_cache_loc)
+        for req, committed, allocated, decode_idx in state.decode_rollback:
+            req.kv.kv_committed_len = committed
+            req.kv.kv_allocated_len = allocated
+            req.decode_batch_idx = decode_idx
+
+    def _quiesce(self, command):
+        state = self.prepared[command["batch_id"]]
+        require(command["reservation_id"] == state.command["reservation_id"], "Quiescence reservation differs")
+        self.sync()
+        if command["kind"] == "REVOKE":
+            require(not state.started, "Cannot revoke an already started forward")
+            if state.command["batch_stage"] == "D" and self.ctx.stage == "D":
+                self._rollback_decode(state)
+            elif state.command["batch_stage"] == "P":
+                for item in state.command["requests"]:
+                    self._release_request((item["request_id"], item["attempt"]))
+        elif self.ctx.stage == "P" and state.command["batch_stage"] == "P":
+            # HANDOFF_READY on every D rank precedes this command, hence the
+            # native P inflight poll collective executes once with Success.
+            done = self.s.process_disagg_prefill_inflight_queue([r.rid for r in state.reqs])
+            require(done == state.reqs, "P native transfer cleanup is incomplete")
+            for item in state.command["requests"]:
+                self._release_request((item["request_id"], item["attempt"]), successful_prefill=True)
+        self.sync()
+        if state.batch is not None:
+            self.pool.clear_forward()
+            self.runner._muxserve_permit = None
+        del self.prepared[command["batch_id"]]
+        if (command["kind"] == "QUIESCE" and self.ctx.stage == "P"
+                and state.command["batch_stage"] == "P"
+                and getattr(getattr(self.ctx, "config", None), "cleanup_skip_prefill_ranks", False)):
+            # This QUIESCE released every request on this P rank, and request
+            # CLEANUP skips P ranks: trim here (off the request's end path).
+            self._trim_idle_cuda_cache(command["batch_id"])
+        self._report(command["batch_id"], "QUIESCED", {
+            "reservation_id": command["reservation_id"],
+            "request_ids": tuple(state.command["ordered_request_ids"])})
+
+    def _release_request(self, identity, successful_prefill=False):
+        req = self.requests.pop(identity, None)
+        self.history_offsets.pop(identity, None)
+        if req is None:
+            return
+        if self.ctx.stage == "P":
+            queue = self.s.disagg_prefill_bootstrap_queue
+            sender = getattr(req, "disagg_kv_sender", None)
+            if sender is not None:
+                if not successful_prefill:
+                    sender.abort()
+                sender.clear()
+            for requests in (queue.queue, self.s.disagg_prefill_inflight_queue, self.s.waiting_queue):
+                if req in requests:
+                    requests.remove(req)
+            self.s.clear_pending_chunk_send(req)
+            maybe_release_metadata_buffer(req, self.s.req_to_metadata_buffer_idx_allocator)
+            req.pending_bootstrap = False
+        else:
+            prealloc = self.s.disagg_decode_prealloc_queue
+            transfer = self.s.disagg_decode_transfer_queue
+            for queue in (prealloc.queue, prealloc.pending_reqs, transfer.queue):
+                for native in tuple(queue):
+                    if native.req is req:
+                        if native.kv_receiver is not None:
+                            native.kv_receiver.abort()
+                            native.kv_receiver.clear()
+                        if native.metadata_buffer_index >= 0:
+                            self.manager.metadata_buffers.bootstrap_room[native.metadata_buffer_index].zero_()
+                            self.s.req_to_metadata_buffer_idx_allocator.free(native.metadata_buffer_index)
+                            native.metadata_buffer_index = -1
+                        queue.remove(native)
+            if req in self.s.waiting_queue:
+                self.s.waiting_queue.remove(req)
+        if req.kv.holds_kv:
+            release_kv_cache(req, self.s.tree_cache, is_insert=False)
+        if not successful_prefill:
+            self.s._release_aborted_request(req)
+        self.manager.forget(req.bootstrap_room)

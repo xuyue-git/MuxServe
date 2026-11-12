@@ -1,131 +1,95 @@
 # MuxServe: Flexible Spatial-Temporal Multiplexing for LLM Serving [[paper](https://arxiv.org/abs/2404.02015)]
 
-MuxServe is an efficient multiple LLMs serving system with flexible spatial-temporal multiplexing.
+MuxServe is an efficient multiple-LLM serving system with flexible
+spatial-temporal multiplexing. It colocates LLMs considering their popularity to
+multiplex memory resources, and disaggregates and flexibly colocates prefill and
+decoding phases leveraging their characteristics to multiplex computation
+resources.
 
-MuxServe colocates LLMs considering their popularity to multiplex memory resources, and disaggragates and flexibly colocate prefill and decoding phases leveraging their characteristics to multiplex computation resources.
+This repository runs MuxServe on **SGLang v0.5.20** (commit
+`94602c9c2b7cbdb8efd5c52802dac6a1c180089e`). vLLM is neither used nor installed:
+the vLLM-based execution, memory manager and scheduler were replaced module by
+module inside the `muxserve` package (see [docs/MIGRATION.md](docs/MIGRATION.md)).
 
+## Architecture
 
-## Motivation
-Recent years, Large language models (LLMs) have demonstrated remarkable performance, and organizations are racing to serve LLMs of varying sizes as endpoints for use-cases like chat, programming and search. Efficienly serving multiple LLMs poses significant challenges due to varying sizes and popularity of LLMs.
-
-MuxServe aims to serve multiple LLMs efficiently with flexible spatial-temporal multiplexing. The key insight behind is to collocate LLMs considering their popularity to multiplex memory resources, and disaggragate and flexibly colocate prefill and decoding phases leveraging their characteristics to multiplex computation resources.
+```text
+muxserve/
+  launch.py        python -m muxserve.launch CONFIG: private MPS, weight owners,
+                   per-model prefill/decode ranks, owner RPC, HTTP gateway
+  config.py        DeploymentConfig (what launch runs) and the placement configs
+  muxsched/        scheduling: controller (request/batch lifecycle, decode runs),
+                   policy (ADBS: quotas, 8 s re-sizing, SM credits), driver,
+                   events, placement optimizer, SM accounting, workload generator
+  flexstore/       unified memory: Head-wise KV store, CUDA storage, shared model
+                   weights (one owner process per model), owner RPC
+  flexserver/      execution on SGLang: rank runtime, Head-wise attention and
+                   memory pool, P/D handoff, hooks used by the patched SGLang
+  gateway.py       native-SGLang /generate SSE gateway (gateway_proc.py: child process)
+csrc/headwise/     Head-wise CUDA kernels, built as muxserve._headwise
+configs/           deployment configs
+upstream-reference/ pinned SGLang source manifest and the 13 recorded patches
+tools/             bootstrap/patch SGLang, preflight locks, perf runs, CPU checks
+acceptance/        CPU checks (storage, control, transport, simulated 24-rank e2e)
+benchmark/         xbench catalogue (standard benchmarks), paired fixed point,
+                   original placement/workload tooling
+```
 
 ## Installation
 
-#### Prerequisites
-MuxServe uses [vLLM](https://github.com/vllm-project/vllm) as the default inference engine. Please follow the instructions to install our [modified MuxServe-vLLM](https://github.com/EfficientLLMSys/MuxServe-vLLM) from source:
+Linux, Python 3.10, four A100 40 GB GPUs, CUDA 13.2. Use a dedicated environment
+that contains SGLang and no vLLM.
 
+1. Materialize the pinned SGLang source: `python tools/bootstrap_source.py`
+   (offline: `--archive /path/to/sglang-v0.5.20-source.tar.gz`; size and SHA-256
+   are checked).
+2. Apply the recorded hooks: `python tools/patch_sglang.py`, then install
+   `third_party/sglang/python` and `pip install -r requirements.txt`.
+3. Build this package and its CUDA extension: `pip install -e .`
+4. Fill in model/tokenizer paths and a personal `asset_lock_dir` in
+   `configs/sglang_a100.json`, then lock the assets:
+   `python tools/lock_assets.py configs/sglang_a100.json`.
 
-```
-conda create -n muxserve python=3.9
-conda activate muxserve
-git clone https://github.com/EfficientLLMSys/MuxServe-vLLM.git
-cd MuxServe-vLLM
-pip install -e .  # This may take 5-10 minutes.
-```
-
-#### Install MuxServe from source
-
-```
-git clone https://github.com/EfficientLLMSys/MuxServe.git
-cd MuxServe
-pip install -e .
-pip install -r requirements.txt
-```
-
-## Getting Start
-
-We get start with a simple example for offline serving multiple LLMs with MuxServe ([`examples/basic`](./examples/basic/)).
-
-#### Model config setting preparation
-
-We've set the config file in `examples/basic/model_config.yaml`. you sould change the model checkpoint path inside the file, change `/mnt/afs/share/LLMCKPTs/huggyllama/llama-30b` into `yourpath/to/llama-30b`
-
-
-#### Workload generation
-
-We sample a workload from the [ShareGPT_V3](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/blob/main/ShareGPT_V3_unfiltered_cleaned_split.json) dataset according to the workloads defined in `examples/basic/models.yaml`. The `rate` represents the arrival rate for a model in `req/s`. We can get the workload `examples/workloads/sharedgpt_n3_rate_12_5_3.json` with the following command:
-
-```shell
-python muxserve/muxsched/workload_utils.py \
-    --dataset-source /yourpathto/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --workload_info_from_yaml True \
-    --output-file examples/basic/sharedgpt_n3_rate_12_5_3.json \
-    --model-yaml examples/basic/models.yaml
-```
-
-#### Set the MPS
-
-MuxServe uses NVIDIA MPS to manage the SM resources. We can start the MPS service with the following command:
-
-```shell
-sudo bash scripts/start_mps.sh examples/basic/mps
-```
-
-After starting the MPS service, we can find `nvidia-log` and `nvidia-mps` directories in `examples/basic/mps`.
-
-#### Run MuxServe
-
-```shell
-mkdir -p log/vllm_proc
-python -m muxserve.launch examples/basic/model_config.yaml \
-    --nnodes=1 --node-rank=0 --master-addr=127.0.0.1 \
-    --nproc_per_node=4 \
-    --server-port 4145 --flexstore-port 50025 \
-    --workload-file examples/basic/sharedgpt_n3_rate_12_5_3.json \
-    2>&1 | tee log/muxserve_test.log
-```
-
-#### Run Temporal Multiplexing
-
-close the MPS Service, see [Stop the MPS](#stop-the-mps).
-Then run same command as [Run MuxServe](#run-MuxServe)
-
-#### Run Spatial Partitioning
-
-close the MPS Service, see [Stop the MPS](#stop-the-mps).
-
-```shell
-CUDA_VISIBLE_DEVICES=0 python -m muxserve.launch examples/basic/model_config_spatial_0.yaml \
-    --nnodes=1 --node-rank=0 --master-addr=127.0.0.1 \
-    --nproc_per_node=1 \
-    --server-port 4145 --flexstore-port 50025 \
-    --workload-file examples/basic/sharedgpt_n3_rate_12_5_3.json \
-    --split-by-model llm-0 \
-    2>&1 | tee log/muxserve_test_spatial_0.log & \
-CUDA_VISIBLE_DEVICES=1 python -m muxserve.launch examples/basic/model_config_spatial_1.yaml \
-    --nnodes=1 --node-rank=0 --master-addr=127.0.0.1 \
-    --nproc_per_node=1 \
-    --server-port 4245 --flexstore-port 51025 \
-    --workload-file examples/basic/sharedgpt_n3_rate_12_5_3.json \
-    --split-by-model llm-1 \
-    2>&1 | tee log/muxserve_test_spatial_1.log & \
-CUDA_VISIBLE_DEVICES=2,3 python -m muxserve.launch examples/basic/model_config_spatial_2.yaml \
-    --nnodes=1 --node-rank=0 --master-addr=127.0.0.1 \
-    --nproc_per_node=2 \
-    --server-port 4345 --flexstore-port 52025 \
-    --workload-file examples/basic/sharedgpt_n3_rate_12_5_3.json \
-    --split-by-model llm-2 \
-    2>&1 | tee log/muxserve_test_spatial_2.log
-```
-
-#### Stop the MPS
-
-Stop the NVIDIA MPS Service
+## Launch
 
 ```bash
-sudo bash scripts/stop_mps.sh examples/basic/mps
+export CUDA_VISIBLE_DEVICES=1,2,3,4
+python -m muxserve.preflight configs/sglang_a100.json
+python -m muxserve.launch configs/sglang_a100.json
 ```
 
-## End-to-End Evaluations
-- [Synthetic Workloads](./benchmark/end_to_end/)
-- [Real Workloads](./benchmark/chatlmsys/)
+The launcher starts a private MPS controller. The gateway serves `/health` and
+`POST /models/<model_id>/generate` (native SGLang request and SSE stream format)
+on the configured `controller_port`.
 
+## Benchmarks
 
-## TODO
-- [ ] Add support for api serve.
+- [`benchmark/xbench/`](benchmark/xbench/README.md): the standard benchmark. A
+  CrossPool xbench catalogue (`benches.toml`) with client-mode cases that state
+  the arrival process, rates, duration, input and output lengths, and the one
+  command that runs each case against a launched server.
+- [`benchmark/paired/`](benchmark/paired/README.md): the fixed 512/128 point paired
+  with original MuxServe's frozen inputs and expected outputs.
+- `benchmark/end_to_end`, `benchmark/chatlmsys`, `muxserve/muxsched/workload_utils.py`
+  and `muxserve/muxsched/placement.py`: the paper's workload generator (power-law
+  popularity `alpha`, Poisson arrivals, ShareGPT lengths) and placement optimizer.
+
+Runtime switches and their measured effects are documented in
+[docs/runtime.md](docs/runtime.md).
+
+## CPU checks
+
+```bash
+python -I -B tools/check_cpu.py
+```
+
+Linux Python 3.10+ (WSL works) with `numpy` and `pyzmq`. Without the materialized
+SGLang source, three checks are skipped (`--require-source` makes that an error).
+`acceptance/no_vllm_check.py` fails if any vLLM import or requirement appears.
+These checks do not load weights or validate CUDA execution or performance.
 
 ## Citation
+
 ```
 @article{duan2024muxserve,
   title={MuxServe: Flexible Multiplexing for Efficient Multiple LLM Serving},
@@ -134,14 +98,3 @@ sudo bash scripts/stop_mps.sh examples/basic/mps
   year={2024}
 }
 ```
-
-## SGLang backend
-
-This fork adds an [SGLang Head-wise backend](backends/sglang/README.md) on top of
-this repository's original MuxServe: it imports and calls the original SM
-accounting (`muxserve/muxsched/resource.py` `SMResource`) and KV block sizing
-(`num_gpu_blocks`). The original MuxServe/vLLM code and history are preserved.
-See the [migration and original-code comparison](backends/sglang/MIGRATION.md)
-for what is reused, what is reimplemented, and validation limits.
-The paired evaluation against original MuxServe is in
-[`backends/sglang/benchmark`](backends/sglang/benchmark/README.md).

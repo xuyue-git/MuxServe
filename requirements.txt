@@ -1,2 +1,14 @@
+# Install the pinned patched SGLang first (third_party/sglang/python, see README),
+# in an isolated A100 environment without vLLM. CUDA 13.2 and its PyTorch wheel
+# are deployment prerequisites.
+torch==2.13.0
+torchaudio==2.11.0
+torchvision==0.28.0
+transformers==5.12.1
+sglang-kernel==0.4.7
+# HTTP framing of the bundled benchmark client (also an SGLang dependency).
 aiohttp
-zmq
+numpy
+pyyaml
+# Placement optimizer only (muxserve.muxsched.placement).
+cvxpy

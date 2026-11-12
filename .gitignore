@@ -167,3 +167,8 @@ log/*
 
 *.pdf
 *.pkl
+# Pinned SGLang source and local run outputs
+/third_party/
+/.venv*/
+/results/
+/artifacts/
