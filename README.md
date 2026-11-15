@@ -40,10 +40,16 @@ benchmark/         xbench catalogue (standard benchmarks), paired fixed point,
 Linux, four A100 40 GB GPUs, CUDA 13.2 (`nvcc`), [uv](https://docs.astral.sh/uv/).
 The environment contains SGLang and no vLLM.
 
-1. Clone the two repositories side by side: this MuxServe checkout and
-   `../MuxServe-SGLang-Engine` (the directory name is fixed; `pyproject.toml`
-   refers to it by relative path). See
-   [the repository boundary notes](docs/two-repositories.md).
+1. Clone the two repositories side by side; the engine directory name is fixed
+   because `pyproject.toml` refers to `../MuxServe-SGLang-Engine`:
+
+   ```bash
+   git clone -b Muxserve-SGLang https://github.com/xuyue-git/MuxServe.git
+   git clone https://github.com/xuyue-git/Muxserve-SGLang-Engine.git MuxServe-SGLang-Engine
+   cd MuxServe
+   ```
+
+   See [the repository boundary notes](docs/two-repositories.md).
 2. Verify the engine source: `python tools/bootstrap_source.py`.
 3. Install both, the engine editable and this package with its CUDA extension:
    `uv sync`. (`pyproject.toml` pins the dependencies; `uv.lock` pins every

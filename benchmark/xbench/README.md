@@ -93,7 +93,7 @@ prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fractio
 
 ```bash
 git clone -b Muxserve-SGLang https://github.com/xuyue-git/MuxServe.git
-git clone <引擎仓库地址> MuxServe-SGLang-Engine
+git clone https://github.com/xuyue-git/Muxserve-SGLang-Engine.git MuxServe-SGLang-Engine
 ```
 
 目录名必须是 `MuxServe-SGLang-Engine`，且和 `MuxServe` 同级（`pyproject.toml` 按相对路径引用）。
