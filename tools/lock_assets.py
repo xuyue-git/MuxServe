@@ -19,8 +19,10 @@ from muxserve.preflight import _asset_file, _check_lock, _inventory_names, _sha2
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", help="Deployment JSON with staged model/tokenizer revisions")
+    parser.add_argument("--local-config", default=os.environ.get("MUXSERVE_LOCAL_CONFIG") or None,
+                        help="machine-local settings JSON (default: $MUXSERVE_LOCAL_CONFIG)")
     args = parser.parse_args()
-    config = load_config(args.config, require_assets=False)
+    config = load_config(args.config, require_assets=False, local=args.local_config)
     if not config.asset_lock_dir:
         raise IntegrationError("INVALID_CONFIG", "Set asset_lock_dir to an absolute personal directory")
     roots: dict[Path, str] = {}

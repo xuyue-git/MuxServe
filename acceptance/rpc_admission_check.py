@@ -161,6 +161,34 @@ class AdmissionChecks(unittest.TestCase):
         self.assertLessEqual(sum(id(thread) not in joined for thread in workers), 1)
         client.close()
 
+    def test_non_persistent_client_authenticates_every_call(self):
+        # rpc_persistent_connections=false (ablation baseline): each call opens
+        # and authenticates its own connection, and none outlives its call.
+        import muxserve.flexstore.ipc as ipc_module
+        challenges = []  # one entry per client connection (each runs the challenge)
+        original = ipc_module._connect_unix
+        def counted(*args, **kwargs):
+            challenges.append(1)
+            return original(*args, **kwargs)
+        client = StorageRPCClient(self.address, self.key, 4, persistent=False)
+        ipc_module._connect_unix = counted
+        try:
+            for index in range(5):
+                self.assertEqual(client.call('once', ('np', index)), ('np', index))
+                self.assertIsNone(client._state)
+        finally:
+            ipc_module._connect_unix = original
+        self.assertEqual(len(challenges), 5)
+        persistent = StorageRPCClient(self.address, self.key, 4)
+        ipc_module._connect_unix = counted
+        try:
+            for index in range(5):
+                persistent.call('once', ('p', index))
+        finally:
+            ipc_module._connect_unix = original
+        self.assertEqual(len(challenges), 6)
+        persistent.close()
+
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Real AF_UNIX owner requires Linux')
 class InlineMethodChecks(unittest.TestCase):
     def setUp(self):

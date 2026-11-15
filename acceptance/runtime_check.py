@@ -23,6 +23,7 @@ import uuid
 
 ROOT = Path(__file__).absolute().parents[1]
 sys.path.insert(0, str(ROOT))
+from muxserve.engine_source import engine_file
 
 
 def _is_link(path):
@@ -69,7 +70,7 @@ def source_check():
     extraction = json.loads(_source_file("upstream-reference/extraction.json").read_text())
     patches = json.loads(_source_file("upstream-reference/patches.json").read_text())
     for name, record in patches.items():
-        data = _source_file("third_party/sglang/" + name).read_bytes()
+        data = engine_file(name.removeprefix("python/"), root=ROOT).read_bytes()
         assert hashlib.sha256(data).hexdigest() == record["patched_sha256"], name
         assert record["source_sha256"] == extraction["files_sha256"][name], name
         ast.parse(data.decode(), filename=name)
@@ -88,8 +89,8 @@ def source_check():
     assert "self.runner.forward" in body_calls
     assert "self.s.run_batch" not in body_calls
     assert not any("sample" in call for call in body_calls)
-    forward_ast = ast.parse(_source_file(
-        "third_party/sglang/python/sglang/srt/model_executor/forward_batch_info.py").read_text())
+    forward_ast = ast.parse(engine_file(
+        "sglang/srt/model_executor/forward_batch_info.py", root=ROOT).read_text(encoding="utf-8"))
     native_init = next(n for n in ast.walk(forward_ast)
                        if isinstance(n, ast.FunctionDef) and n.name == "init_new")
     assert "return_hidden_states_before_norm" in [a.arg for a in native_init.args.kwonlyargs]

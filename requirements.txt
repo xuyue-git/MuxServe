@@ -1,4 +1,4 @@
-# Install the pinned patched SGLang first (third_party/sglang/python, see README),
+# Install the pinned patched SGLang first (../MuxServe-SGLang-Engine, see README),
 # in an isolated A100 environment without vLLM. CUDA 13.2 and its PyTorch wheel
 # are deployment prerequisites.
 torch==2.13.0

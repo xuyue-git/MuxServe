@@ -35,9 +35,16 @@ class KVFractionChecks(unittest.TestCase):
                 self.assertEqual(got % 8192, 0)
                 self.assertEqual(got // 8192, 2 * blocks)
 
+    def test_shipped_fraction_is_two_gib_on_the_measured_a100(self):
+        # torch total_memory of the A100-SXM4-40GB cards used for every result.
+        self.assertEqual(kv_bytes_from_fraction(0.05061, 42_436_526_080), 2 * 1024 ** 3)
+        for name in ("configs/a100_open_loop.json", "configs/a100_xbench_poisson.json"):
+            self.assertEqual(load_config(ROOT / name, require_assets=False).kv_memory_fraction, 0.05061)
+
     def _write(self, directory, **fields):
         source = json.loads((ROOT / "configs/sglang_a100.json").read_text())
-        source.pop("kv_bytes_per_rank")
+        source.pop("kv_bytes_per_rank", None)
+        source.pop("kv_memory_fraction", None)
         source.update(fields)
         path = Path(directory) / "config.json"
         path.write_text(json.dumps(source))

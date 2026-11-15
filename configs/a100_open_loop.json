@@ -2,7 +2,7 @@
   "tp_size": 4,
   "kv_pool_mode": "shared",
   "batch_history_limit": 4000000,
-  "kv_bytes_per_rank": 2147483648,
+  "kv_memory_fraction": 0.05061,
   "extra_headroom_bytes_per_rank": 1073741824,
   "max_model_inflight": 16,
   "credit_multiplier": 3,

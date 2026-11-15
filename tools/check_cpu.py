@@ -2,7 +2,7 @@
 
     python -I -B tools/check_cpu.py [--require-source]
 
-Three checks read the pinned SGLang source under third_party/ (materialized by
+Three checks read the sibling MuxServe-SGLang-Engine checkout (verified by
 tools/bootstrap_source.py). Without it they are reported as skipped and the
 suite ends with CPU_SUITE_PASS_WITH_SKIPS; --require-source makes a missing
 source an error instead.
@@ -22,9 +22,9 @@ CHECKS = (
     'revoked_ready_check', 'decode_run_check', 'kv_fraction_check', 'trace_check', 'decode_graph_check',
     'fast_path_check', 'owner_speed_check', 'no_vllm_check',
 )
-# Checks that read third_party/sglang/python (the pinned, patched SGLang source).
+# Checks that read the separate pinned, patched SGLang checkout.
 NEEDS_SOURCE = ('watchdog_teardown_check', 'startup_regression_check', 'runtime_check')
-SOURCE = ROOT / 'third_party' / 'sglang' / 'python' / 'sglang'
+SOURCE = ROOT.parent / 'MuxServe-SGLang-Engine' / 'sglang'
 
 
 def main():

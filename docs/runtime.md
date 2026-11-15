@@ -1,7 +1,17 @@
 # Runtime switches and control-plane behaviour
 
 All switches below are deployment-config fields (see `muxserve/config.py`), off by
-default; `tools/run_perf_point.sh` maps the upper-case environment names to them.
+default. Experiments set them in a complete config file (`configs/`,
+`configs/ablation/`) launched with `uv run muxserve CONFIG`. Upper-case names in
+the text are those of the former `tools/run_perf_point.sh`, kept only so that
+older reports can be matched; the runner has been removed.
+
+## RPC connections
+
+`rpc_persistent_connections` (default on) keeps one authenticated connection per
+rank to the owner and reuses it for every call. Off, every call connects and
+runs the two-way challenge again, as before persistent connections; that is the
+ablation baseline (`configs/ablation/s00-baseline.json`), not a deployment mode.
 
 ## Decode runs and control-plane performance
 
@@ -53,14 +63,14 @@ next pass; `decode_skip_prefill_ranks` runs decode batches with the D ranks
 only (P ranks no longer prepare/quiesce decode batches they never execute);
 `prefill_early_token` publishes the prefill token once every P rank's result
 is committed, as original MuxServe returns it at prefill end (it moves the
-TTFT boundary; the request is not shorter). `tools/run_perf_point.sh` takes
+TTFT boundary; the request is not shorter). The former runner's names are
 `INLINE_START=1 SKIP_P=1 EARLY_TOKEN=1`, and `FROZEN_BUNDLE=... WARMUP_TOTAL=128`
 to bench original MuxServe's frozen 512/128 inputs with its 43/43/42 warmup,
 checking every output against the original's tokens.
 
 The remaining opt-in paths are grouped by where they act. Each is documented
 where it is defined in `muxserve/config.py`; `benchmark/paired/paired_a100.json`
-turns them all on, and `tools/run_perf_point.sh` lists the matching switches.
+turns them all on.
 
 | Stage | Config keys |
 |---|---|
@@ -79,7 +89,7 @@ MuxServe does: only new prefills wait, every decode that still fits keeps
 running, a one-step decode batch that cannot get its KV preempts the youngest
 idle decoding request younger than the batch, and a finished request lets
 prefills resume. `decode_kv_trim` returns a decode run's unused up-front KV
-reservation to the pool when the run ends. `tools/run_perf_point.sh` takes
+reservation to the pool when the run ends. The former runner's names are
 `INFLIGHT`, `MAX_NEW_TOKENS`, `REQUEST_TIMEOUT_MS`, `GATEWAY_CONNECTIONS`,
 `RECOVERY_ALL_DECODE=1` and `KV_TRIM=1`. Independently of any switch, the
 gateway wakes only the stream whose request changed, a request stays known
@@ -97,7 +107,7 @@ the next boundary, up to the batch limit, as original MuxServe adds requests
 to its running batch. With `decode_kv_per_page` (requires `decode_step_join`)
 a run reserves only its first step's page and gets one more page at the
 boundary before a request needs it; a page that cannot be had ends the run and
-the full-pool recovery above applies. `tools/run_perf_point.sh` takes
+the full-pool recovery above applies. The former runner's names are
 `STEP_JOIN=1` and `KV_PER_PAGE=1`. With `decode_step_pipeline` (requires
 `decode_leader_reports`; `STEP_PIPELINE=1`) the decode leader no longer waits
 for the owner at a step boundary the owner granted ahead: each answer to a step

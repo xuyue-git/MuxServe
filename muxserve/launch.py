@@ -194,11 +194,13 @@ def _write_json(path, value):
 
 
 class Supervisor:
-    def __init__(self, config_path, *, startup_timeout=1800, manual_control=False):
+    def __init__(self, config_path, *, startup_timeout=1800, manual_control=False, local_config=None):
         if os.name != "posix" or not 0 < startup_timeout <= 7200:
             raise IntegrationError("DEPLOYMENT_PLATFORM", "Use Linux and a bounded startup timeout")
         from muxserve.preflight import inspect_assets, inspect_gpus, inspect_software
-        config = load_config(config_path)
+        config = load_config(config_path, local=local_config)
+        if local_config is not None:
+            print(f"Local settings: {local_config}", flush=True)
         software = inspect_software()
         assets = inspect_assets(config)
         cards = inspect_gpus(config.tp_size)
@@ -666,15 +668,18 @@ class Supervisor:
                 continue
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config")
+    parser.add_argument("config", help="deployment config JSON (the experiment)")
+    parser.add_argument("--local-config", default=os.environ.get("MUXSERVE_LOCAL_CONFIG") or None,
+                        help="machine-local settings JSON: asset_lock_dir, runtime_dir, model paths "
+                             "(default: $MUXSERVE_LOCAL_CONFIG)")
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--manual-control", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     Supervisor(args.config, startup_timeout=args.startup_timeout,
-               manual_control=args.manual_control).run()
+               manual_control=args.manual_control, local_config=args.local_config).run()
 
 
 if __name__ == "__main__":

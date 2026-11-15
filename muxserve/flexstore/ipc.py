@@ -308,13 +308,16 @@ class StorageRPCClient:
     transport, framing or deadline error closes the connection: the result of
     that call stays uncertain exactly as before, and the next call reconnects
     and authenticates again. A forked child never reuses its parent's socket.
+    With persistent=False every call connects and authenticates anew.
     """
 
-    def __init__(self, address: str, authkey: bytes, timeout_s: float = 30.0):
+    def __init__(self, address: str, authkey: bytes, timeout_s: float = 30.0,
+                 persistent: bool = True):
         _validate_options(authkey, timeout_s)
         self.address = _validate_endpoint(address)
         self._authkey = authkey
         self.timeout_s = timeout_s
+        self._persistent = bool(persistent)
         self._lock = Lock()
         self._state: tuple[int, Connection, _DeadlineConnection] | None = None
 
@@ -399,6 +402,8 @@ class StorageRPCClient:
             except BaseException:
                 self._drop()
                 raise
+            if not self._persistent:
+                self._drop()
         if not response["ok"]:
             raise IntegrationError(response["code"], response["message"])
         return response["result"]

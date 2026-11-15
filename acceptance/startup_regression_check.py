@@ -30,10 +30,12 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from muxserve.contracts import IntegrationError
+from muxserve.engine_source import engine_file
 
 
 def functions(path, names, namespace):
-    tree = ast.parse((ROOT / path).read_text(encoding='utf-8'))
+    source = engine_file(path, root=ROOT) if path.startswith('sglang/') else ROOT / path
+    tree = ast.parse(source.read_text(encoding='utf-8'))
     body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     exec(compile(ast.Module(body=body, type_ignores=[]), path, 'exec'), namespace)
 
@@ -67,10 +69,11 @@ class EagerForwardChecks(unittest.TestCase):
         for path, class_name, methods in (
             ('muxserve/flexserver/sglang_memory.py', None, None),
             ('muxserve/flexserver/sglang_attention.py', 'HeadwiseAttentionBackend', {'init_forward_metadata'}),
-            ('third_party/sglang/python/sglang/srt/model_executor/runner/eager_runner.py', 'EagerRunner', {'load_batch'}),
-            ('third_party/sglang/python/sglang/srt/model_executor/cuda_graph_buffer_registry.py',
+            ('sglang/srt/model_executor/runner/eager_runner.py', 'EagerRunner', {'load_batch'}),
+            ('sglang/srt/model_executor/cuda_graph_buffer_registry.py',
              'CudaGraphBufferRegistry', {'extract_buffer'})):
-            tree = ast.parse((ROOT / path).read_text(encoding='utf-8'))
+            source = engine_file(path, root=ROOT) if path.startswith('sglang/') else ROOT / path
+            tree = ast.parse(source.read_text(encoding='utf-8'))
             if class_name is None:
                 body = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef))]
             else:
@@ -153,8 +156,8 @@ class OutputCaptureChecks(unittest.TestCase):
     def test_native_frozen_processor_rebound_for_prefill_and_decode(self):
         # Execute the pinned class and real controlled constructor without
         # importing their Torch/CUDA dependency graph. Only context inputs vary.
-        native_path = 'third_party/sglang/python/sglang/srt/managers/scheduler_components/batch_result_processor.py'
-        native_tree = ast.parse((ROOT / native_path).read_text(encoding='utf-8'))
+        native_path = 'sglang/srt/managers/scheduler_components/batch_result_processor.py'
+        native_tree = ast.parse(engine_file(native_path, root=ROOT).read_text(encoding='utf-8'))
         native = next(node for node in native_tree.body
                       if isinstance(node, ast.ClassDef) and node.name == 'SchedulerBatchResultProcessor')
         runtime_path = 'muxserve/flexserver/sglang_runtime.py'
@@ -273,7 +276,7 @@ class RopeExportChecks(unittest.TestCase):
             for key, value in [('SGLANG_SPEC_EXPANSION_SAFETY_FACTOR', 1),
                                ('SGLANG_ROPE_CACHE_SAFETY_MARGIN', 256), ('SGLANG_ROPE_CACHE_ALIGN', 128)]})
         reserve_namespace = dict(get_model=lambda: context, get_spec=lambda: spec)
-        functions('third_party/sglang/python/sglang/srt/utils/common.py',
+        functions('sglang/srt/utils/common.py',
                   {'reserve_rope_cache_for_long_sequences'}, reserve_namespace)
         reserve = reserve_namespace['reserve_rope_cache_for_long_sequences']
         utils = ModuleType('sglang.srt.utils')
@@ -285,7 +288,7 @@ class RopeExportChecks(unittest.TestCase):
         class Base:
             def _init_distributed(self, server_args, model_config):
                 pass
-        tree = ast.parse((ROOT / 'muxserve/flexstore/weight_owner.py').read_text())
+        tree = ast.parse((ROOT / 'muxserve/flexstore/weight_owner.py').read_text(encoding='utf-8'))
         owner_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'SharedWeightOwner')
         methods = [node for node in owner_class.body if isinstance(node, ast.FunctionDef)
                    and node.name in ('_init_distributed', '_export_state')]
@@ -309,7 +312,7 @@ class RopeExportChecks(unittest.TestCase):
             native_namespace = dict(torch=SimpleNamespace(device=lambda _: nullcontext()), time=time,
                 nn=SimpleNamespace(Module=object), logger=logging.getLogger('ipc-test'),
                 _initialize_model=lambda *args: Model())
-            native_tree = ast.parse((ROOT / 'third_party/sglang/python/sglang/srt/weight_cache/ipc_loader.py').read_text())
+            native_tree = ast.parse(engine_file('sglang/srt/weight_cache/ipc_loader.py', root=ROOT).read_text(encoding='utf-8'))
             native_class = next(node for node in native_tree.body if isinstance(node, ast.ClassDef)
                                 and node.name == 'IpcModelLoader')
             native_methods = [node for node in native_class.body if isinstance(node, ast.FunctionDef)
@@ -317,7 +320,7 @@ class RopeExportChecks(unittest.TestCase):
             base_class = ast.ClassDef(name='IpcModelLoader', bases=[], keywords=[], body=native_methods, decorator_list=[])
             exec(compile(ast.fix_missing_locations(ast.Module(body=[base_class], type_ignores=[])),
                          'native-loader-test', 'exec'), native_namespace)
-            custom_tree = ast.parse((ROOT / 'muxserve/flexstore/weight_loader.py').read_text())
+            custom_tree = ast.parse((ROOT / 'muxserve/flexstore/weight_loader.py').read_text(encoding='utf-8'))
             custom_class = next(node for node in custom_tree.body if isinstance(node, ast.ClassDef)
                                 and node.name == 'SharedWeightLoader')
             custom_methods = [node for node in custom_class.body if isinstance(node, ast.FunctionDef)

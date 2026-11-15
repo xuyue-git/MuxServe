@@ -183,6 +183,8 @@ def inspect_software() -> dict:
                                         or safe_path(importer.path) != checked):
                 raise IntegrationError("SOFTWARE_MISMATCH", "Unsupported cached path importer; use a filesystem installation")
     search = list(dict.fromkeys(checked_search))
+    if _distribution("vllm", search) is not None:
+        raise IntegrationError("SOFTWARE_MISMATCH", "vLLM must not be installed in the SGLang serving environment")
     packages = {}
     for name, expected in required.items():
         distribution = _distribution(name, search)
@@ -212,6 +214,16 @@ def inspect_software() -> dict:
         inspected[relative] = actual
     if not inspected:
         raise IntegrationError("SOFTWARE_MISMATCH", "SGLang patch identity inventory is empty")
+    engine_pin_path = root / "upstream-reference/engine-repository.json"
+    if engine_pin_path.is_file():
+        engine_pin = _read_json(engine_pin_path)
+        for name, expected in engine_pin.get("source_projection", {}).get("overrides_sha256", {}).items():
+            if name.startswith("sglang/"):
+                relative = name[len("sglang/"):]
+                actual = _sha256(_asset_file(package, relative))
+                if actual != expected:
+                    raise IntegrationError("SOFTWARE_MISMATCH", f"Installed SGLang fork mismatch: {relative}")
+                inspected[relative] = actual
     cuda_home = safe_path(os.environ.get("CUDA_HOME", "/usr/local/cuda-13.2"))
     nvcc = safe_path(cuda_home / "bin/nvcc")
     cuda_version = _tool_output([str(nvcc), "--version"])
@@ -230,6 +242,7 @@ def inspect_software() -> dict:
     return {"packages": packages, "sglang_source_path": str(package),
             "sglang_commit": SGLANG_COMMIT, "sglang_tag": SGLANG_TAG,
             "sglang_patch_sha256": inspected, "patch_manifest_sha256": _sha256(root / "upstream-reference/patches.json"),
+            "engine_repository_manifest_sha256": _sha256(engine_pin_path) if engine_pin_path.is_file() else None,
             "cuda_home": str(cuda_home), "nvcc_path": str(nvcc), "nvcc_version": cuda_version.strip(),
             "cxx_command": compiler, "cxx_version": compiler_version.strip(), "cxx_standard": "c++20",
             "extension_build_validation": "unexecuted",
@@ -398,8 +411,10 @@ def inspect_gpus(tp_size: int) -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", help="Frozen deployment JSON")
+    parser.add_argument("--local-config", default=os.environ.get("MUXSERVE_LOCAL_CONFIG") or None,
+                        help="machine-local settings JSON (default: $MUXSERVE_LOCAL_CONFIG)")
     args = parser.parse_args()
-    config = load_config(args.config)
+    config = load_config(args.config, local=args.local_config)
     software = inspect_software()
     assets = inspect_assets(config)
     cards = inspect_gpus(config.tp_size)

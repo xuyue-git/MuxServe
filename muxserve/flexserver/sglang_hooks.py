@@ -27,7 +27,8 @@ def context():
     runtime_dir = safe_path(os.environ["MUXSERVE_RUNTIME_DIR"])
     key_path = runtime_dir / "auth.key"
     rpc = StorageRPCClient(str(runtime_dir / "store.sock"), key_path.read_bytes(),
-                           timeout_s=config.prepare_timeout_ms / 1000)
+                           timeout_s=config.prepare_timeout_ms / 1000,
+                           persistent=config.rpc_persistent_connections)
     return SimpleNamespace(config=config, model=model, stage=stage,
                            group_id=os.environ["MUXSERVE_EXECUTION_GROUP"],
                            runtime_dir=runtime_dir, rpc=rpc)

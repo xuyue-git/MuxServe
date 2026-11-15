@@ -248,6 +248,10 @@ class DeploymentConfig:
     # new thread per call, and its sockets read and write before polling. Their
     # waits are already bounded; every other RPC keeps its worker and deadline.
     rpc_inline_fast_methods: bool = False
+    # Each rank keeps one authenticated RPC connection to the owner and reuses
+    # it for every call. False reconnects and repeats the two-way challenge on
+    # every call, as before persistent connections (ablation baseline only).
+    rpc_persistent_connections: bool = True
     # Only D rank 0 reports a continuing decode step; the other ranks read its
     # decision from shared memory and report only when it is not "continue".
     # Each rank's token digest is compared at GPU_DONE instead of every step.
@@ -414,9 +418,46 @@ def kv_bytes_from_fraction(fraction: float, total_memory_bytes: int) -> int:
     return blocks * block_mem
 
 
-def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentConfig:
+LOCAL_KEYS = ("asset_lock_dir", "runtime_dir")
+LOCAL_MODEL_KEYS = ("model_path", "tokenizer_path")
+
+
+def apply_local_settings(raw: dict, local: dict) -> dict:
+    """Machine-local settings over a shared deployment config.
+
+    The deployment file states the experiment; the local file (git-ignored,
+    like CrossPool's xpool.local.toml) holds only where this machine keeps
+    things: the personal asset lock directory, the runtime directory and each
+    model's checkpoint and tokenizer paths. Anything else is refused, so a
+    local file cannot change an experimental condition.
+    """
+    if not isinstance(local, dict) or set(local) - {*LOCAL_KEYS, "models"}:
+        raise IntegrationError("INVALID_CONFIG", "Local settings take only " + ", ".join((*LOCAL_KEYS, "models")))
+    merged = dict(raw)
+    for key in LOCAL_KEYS:
+        if key in local:
+            merged[key] = local[key]
+    overrides = local.get("models", {})
+    if not isinstance(overrides, dict):
+        raise IntegrationError("INVALID_CONFIG", "Local models must map model_id to paths")
+    # One local file serves every deployment; models a deployment does not
+    # serve are ignored, and a served model without an entry keeps its paths.
+    models = []
+    for item in raw.get("models", []):
+        paths = overrides.get(item.get("model_id"), {})
+        if not isinstance(paths, dict) or set(paths) - set(LOCAL_MODEL_KEYS):
+            raise IntegrationError("INVALID_CONFIG", "Local model settings take only model_path, tokenizer_path")
+        models.append({**item, **paths})
+    merged["models"] = models
+    return merged
+
+
+def load_config(path: str | Path, *, require_assets: bool = True,
+                local: str | Path | None = None) -> DeploymentConfig:
     path = safe_path(path)
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if local is not None:
+        raw = apply_local_settings(raw, json.loads(safe_path(local).read_text(encoding="utf-8")))
     fraction = raw.get("kv_memory_fraction")
     if fraction is not None:
         if "kv_bytes_per_rank" in raw:
@@ -476,7 +517,8 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
                  "register_in_ready", "broker_status_in_poll", "terminal_before_cleanup",
                  "slot_free_at_cleanup", "handoff_ack_in_poll",
                  "handoff_report_with_ready", "start_in_report_reply", "targeted_wake",
-                 "rpc_inline_fast_methods", "decode_leader_reports", "handoff_prepare_after_ack",
+                 "rpc_inline_fast_methods", "rpc_persistent_connections",
+                 "decode_leader_reports", "handoff_prepare_after_ack",
                  "decode_prepare_light", "decode_run_merge", "capacity_recovery_all_decode",
                  "decode_kv_trim", "decode_step_join", "decode_kv_per_page", "decode_step_pipeline",
                  "decode_step_leave", "decode_wait_commands", "prefill_stage_in_gpu_done",
@@ -539,16 +581,21 @@ def load_config(path: str | Path, *, require_assets: bool = True) -> DeploymentC
         raise IntegrationError("INVALID_CONFIG", "Decode run length exceeds the output budget")
     if config.queue_limit > 100000:
         raise IntegrationError("INVALID_CONFIG", "Queue limit exceeds the bounded lifetime ceiling")
-    if config.tp_size not in (1, 2, 4):
-        raise IntegrationError("INVALID_CONFIG", "Initial TP is 1, 2 or 4; acceptance requires TP4")
+    if config.tp_size != 4:
+        raise IntegrationError("INVALID_CONFIG", "This engine integration requires TP4")
     if config.gateway_connections > 4096:
         raise IntegrationError("INVALID_CONFIG", "gateway_connections must be at most 4096")
     # 16 is the decode graph buffers' batch limit (sglang_memory.init_graph_buffers).
     if not 1 <= config.max_model_inflight <= 16 or config.credit_multiplier not in (1, 3):
         raise IntegrationError("INVALID_CONFIG", "Initial inflight and credit profiles are restricted")
-    if (config.max_input_tokens != 1792 or config.max_context_tokens != 2048
+    # Context is 2048 (LLaMA-1, SGLang context_length and the decode graph
+    # capacity). The input limit defaults to 1792; up to 2047 admits every
+    # request whose input and output fit the context, as SGLang itself does.
+    # Startup warms up the largest prefill shape, so a larger limit needs
+    # that much more activation memory at startup.
+    if (not 1792 <= config.max_input_tokens <= 2047 or config.max_context_tokens != 2048
             or not 256 <= config.max_new_tokens <= 2047):
-        raise IntegrationError("INVALID_CONFIG", "Initial token limits must match the approved design")
+        raise IntegrationError("INVALID_CONFIG", "Token limits: input 1792..2047, context 2048, output 256..2047")
     if config.kv_bytes_per_rank < 8192 or config.extra_headroom_bytes_per_rank < 1024**3:
         raise IntegrationError("INVALID_CONFIG", "KV budget or workspace headroom is invalid")
     if len(set(model.model_id for model in models)) != len(models) or not models:

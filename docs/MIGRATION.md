@@ -79,7 +79,7 @@ only within test code. No GPU correctness, capacity or performance claim follows
 
 Historical GPU acceptance belongs to the prior project and its harness. This
 branch has not been clean-installed. Later commits reduce the per-token mapping
-and control overhead. `tools/run_perf_point.sh` with `tools/bench_fixed.py`
+and control overhead. `benchmark/paired/paired_a100.json` with `tools/bench_fixed.py`
 runs the paired four-GPU point (LLaMA 7B/13B/30B, TP4, FP16, 512/128, one
 request in flight per model) on original MuxServe's frozen inputs, checking
 every output against the original's tokens; measured results are kept outside

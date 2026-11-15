@@ -2,7 +2,8 @@
 
     python acceptance/no_vllm_check.py
 
-Scans every Python, shell and requirements file outside third_party/ for a vLLM
+Scans every Python, shell and requirements file outside third_party/, and the
+separate engine checkout's Python files, for a vLLM
 import or install, and imports the MuxServe control and storage modules with
 any `vllm` import made to fail, so that a hidden dependency cannot pass.
 """
@@ -41,8 +42,24 @@ class NoVllmChecks(unittest.TestCase):
                      if IMPORT.search(p.read_text(encoding="utf-8", errors="replace"))]
         self.assertEqual(offenders, [])
 
+    def test_no_vllm_import_in_engine_repository(self):
+        """The separate SGLang engine checkout imports no vLLM either."""
+        from muxserve.engine_source import engine_root
+        try:
+            engine = engine_root(root=ROOT)
+        except ValueError as exc:
+            self.skipTest(str(exc))
+        offenders = []
+        for path in engine.rglob("*.py"):
+            parts = path.relative_to(engine).parts
+            if ".git" in parts or "__pycache__" in parts:
+                continue
+            if IMPORT.search(path.read_text(encoding="utf-8", errors="replace")):
+                offenders.append(path.relative_to(engine).as_posix())
+        self.assertEqual(offenders, [])
+
     def test_no_vllm_requirement_or_install(self):
-        candidates = [ROOT / "requirements.txt", ROOT / "setup.py", *files({".sh"})]
+        candidates = [ROOT / "requirements.txt", ROOT / "setup.py", ROOT / "pyproject.toml", *files({".sh"})]
         offenders = [str(p.relative_to(ROOT)) for p in candidates
                      if p.is_file() and INSTALL.search(p.read_text(encoding="utf-8", errors="replace"))]
         self.assertEqual(offenders, [])

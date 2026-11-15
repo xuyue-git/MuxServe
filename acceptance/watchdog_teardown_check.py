@@ -14,10 +14,13 @@ from unittest.mock import Mock
 import weakref
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from muxserve.engine_source import engine_file
 
 
 def functions(path, names, namespace):
-    tree = ast.parse((ROOT / path).read_text(encoding='utf-8'))
+    source = engine_file(path, root=ROOT) if path.startswith('sglang/') else ROOT / path
+    tree = ast.parse(source.read_text(encoding='utf-8'))
     body = [node for node in tree.body if getattr(node, 'name', None) in names]
     assert len(body) == len(names)
     exec(compile(ast.Module(body=body, type_ignores=[]), path, 'exec'), namespace)
@@ -28,8 +31,8 @@ def native_watchdog():
     namespace = dict(threading=threading, time=time, logger=logging.getLogger(__name__),
         psutil=SimpleNamespace(Process=lambda: SimpleNamespace(parent=lambda: Mock())),
         pyspy_dump_schedulers=Mock(), sys=sys, signal=SimpleNamespace(SIGQUIT=3))
-    functions('third_party/sglang/python/sglang/srt/utils/watchdog.py', {'WatchdogRaw'}, namespace)
-    functions('third_party/sglang/python/sglang/srt/managers/scheduler_components/invariant_checker.py',
+    functions('sglang/srt/utils/watchdog.py', {'WatchdogRaw'}, namespace)
+    functions('sglang/srt/managers/scheduler_components/invariant_checker.py',
               {'create_scheduler_watchdog'}, namespace)
     return namespace
 

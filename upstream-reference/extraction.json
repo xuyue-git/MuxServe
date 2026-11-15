@@ -3,7 +3,7 @@
   "tag": "v0.5.20",
   "files": 9166,
   "archive_sha256": "fcd78d64bcac43c5f31b0a99d7078540858b9c2f5c6782a484e3890c4dc07ae6",
-  "target": "third_party/sglang",
+  "target": "../MuxServe-SGLang-Engine",
   "skipped_links": [
     {
       "path": ".dockerignore",

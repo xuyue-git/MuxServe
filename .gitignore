@@ -172,3 +172,6 @@ log/*
 /.venv*/
 /results/
 /artifacts/
+# Machine-local settings (copy configs/local.example.json)
+/configs/local.json
+/.env

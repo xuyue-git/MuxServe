@@ -28,8 +28,8 @@ muxserve/
   gateway.py       native-SGLang /generate SSE gateway (gateway_proc.py: child process)
 csrc/headwise/     Head-wise CUDA kernels, built as muxserve._headwise
 configs/           deployment configs
-upstream-reference/ pinned SGLang source manifest and the 13 recorded patches
-tools/             bootstrap/patch SGLang, preflight locks, perf runs, CPU checks
+upstream-reference/ separate-engine identity pin and the 13 recorded patch hashes
+tools/             verify the separate engine, preflight locks, perf runs, CPU checks
 acceptance/        CPU checks (storage, control, transport, simulated 24-rank e2e)
 benchmark/         xbench catalogue (standard benchmarks), paired fixed point,
                    original placement/workload tooling
@@ -37,26 +37,43 @@ benchmark/         xbench catalogue (standard benchmarks), paired fixed point,
 
 ## Installation
 
-Linux, Python 3.10, four A100 40 GB GPUs, CUDA 13.2. Use a dedicated environment
-that contains SGLang and no vLLM.
+Linux, four A100 40 GB GPUs, CUDA 13.2 (`nvcc`), [uv](https://docs.astral.sh/uv/).
+The environment contains SGLang and no vLLM.
 
-1. Materialize the pinned SGLang source: `python tools/bootstrap_source.py`
-   (offline: `--archive /path/to/sglang-v0.5.20-source.tar.gz`; size and SHA-256
-   are checked).
-2. Apply the recorded hooks: `python tools/patch_sglang.py`, then install
-   `third_party/sglang/python` and `pip install -r requirements.txt`.
-3. Build this package and its CUDA extension: `pip install -e .`
-4. Fill in model/tokenizer paths and a personal `asset_lock_dir` in
-   `configs/sglang_a100.json`, then lock the assets:
-   `python tools/lock_assets.py configs/sglang_a100.json`.
+1. Clone the two repositories side by side: this MuxServe checkout and
+   `../MuxServe-SGLang-Engine` (the directory name is fixed; `pyproject.toml`
+   refers to it by relative path). See
+   [the repository boundary notes](docs/two-repositories.md).
+2. Verify the engine source: `python tools/bootstrap_source.py`.
+3. Install both, the engine editable and this package with its CUDA extension:
+   `uv sync`. (`pyproject.toml` pins the dependencies; `uv.lock` pins every
+   version. Without uv: `pip install --config-settings editable_mode=compat -e
+   ../MuxServe-SGLang-Engine`, `pip install -r requirements.txt`, then
+   `pip install --no-build-isolation --config-settings editable_mode=compat -e .`.)
+4. Machine-local settings stay out of the deployment configs, as CrossPool keeps
+   them in `xpool.local.toml`: `cp configs/local.example.json configs/local.json`
+   (git-ignored), set your personal `asset_lock_dir` and model paths, and
+   `export MUXSERVE_LOCAL_CONFIG=$PWD/configs/local.json`. The local file accepts
+   only those paths, so it cannot change an experimental condition.
+5. Lock the assets: `uv run python tools/lock_assets.py configs/sglang_a100.json`.
+
+The server imports the installed `sglang` package normally. No source-path
+injection or embedded engine fallback is used. The engine is maintained as
+versioned source; its retained-file projection and reviewed modifications are
+locked by `upstream-reference/engine-repository.json`.
 
 ## Launch
 
 ```bash
 export CUDA_VISIBLE_DEVICES=1,2,3,4
-python -m muxserve.preflight configs/sglang_a100.json
-python -m muxserve.launch configs/sglang_a100.json
+export MUXSERVE_LOCAL_CONFIG=$PWD/configs/local.json
+uv run python -m muxserve.preflight configs/sglang_a100.json
+uv run muxserve configs/sglang_a100.json
 ```
+
+`uv run muxserve CONFIG` is `python -m muxserve.launch CONFIG`. KV pools are sized
+as original MuxServe sizes them: `kv_memory_fraction` x the GPU memory torch reports
+(0.05061 gives 2 GiB per GPU on the A100s used here; the launcher prints `KV_POOL`).
 
 The launcher starts a private MPS controller. The gateway serves `/health` and
 `POST /models/<model_id>/generate` (native SGLang request and SSE stream format)
@@ -68,6 +85,9 @@ on the configured `controller_port`.
   CrossPool xbench catalogue (`benches.toml`) with client-mode cases that state
   the arrival process, rates, duration, input and output lengths, and the one
   command that runs each case against a launched server.
+- [`benchmark/ablation/`](benchmark/ablation/README.md): the cumulative patch
+  ablation, one complete server config per step (`configs/ablation/`), with each
+  patch's motivation and the results table.
 - [`benchmark/paired/`](benchmark/paired/README.md): the fixed 512/128 point paired
   with original MuxServe's frozen inputs and expected outputs.
 - `benchmark/end_to_end`, `benchmark/chatlmsys`, `muxserve/muxsched/workload_utils.py`

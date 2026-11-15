@@ -1,0 +1,86 @@
+# Adapted from CrossPool. Copyright (c) 2026 Yip Coekjan.
+# MIT License: see CROSSPOOL-LICENSE.
+# PENDING / NOT RUNNABLE: MuxServe ATN/FFN topology and Executor Lane support.
+# These preserve the final three CrossPool experiment dimensions as requested.
+# They are deliberately outside benches.toml. The module and deployment paths
+# below are NOT implemented, so they cannot silently launch CrossPool serving.
+# The owned fields/graph modes express the intended experiment, not current support.
+# Reference: Coekjan/CrossPool@0d3267edecfbe67459c1e9edc62ee73ff1f1a63f, final3 catalogue entries.
+
+# CrossPool source case 59: 085f0137-e7ff-411f-a36d-3d29fa8b9fce
+# Missing MuxServe implementation for CrossPool topology: atn1-ffn1-lanes1
+[serving_cases.e7b57cc7-288e-401c-9540-8b418dc41d7c]
+description = "PENDING / NOT RUNNABLE: MuxServe: LLaMA-7B/13B one-Lane comparison against two Lanes on the same device fleet at 4 RPS per model."
+module = "serving.muxserve_topology_pending"
+mode = "owned"
+deployment = "pending-deployments/muxserve-atn1-ffn1-lanes1.toml"
+seed = 0
+
+[serving_cases.e7b57cc7-288e-401c-9540-8b418dc41d7c.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 4.0, "huggyllama/llama-13b" = 4.0 }
+
+[[serving_cases.e7b57cc7-288e-401c-9540-8b418dc41d7c.targets]]
+model_id = "huggyllama/llama-7b"
+graph_mode = "decode-full-prefill-breakable"
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+
+[[serving_cases.e7b57cc7-288e-401c-9540-8b418dc41d7c.targets]]
+model_id = "huggyllama/llama-13b"
+graph_mode = "decode-full-prefill-breakable"
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+
+# CrossPool source case 60: 118215d8-1afb-49e2-aa73-d84f4d135f38
+# Missing MuxServe implementation for CrossPool topology: atn2-ffn1-lanes2
+[serving_cases.7aa80710-e4ed-4afa-aa59-0248edeedab2]
+description = "PENDING / NOT RUNNABLE: MuxServe: LLaMA-7B/13B attention TP2/DP1 comparison with two attention devices and one FFN device at 4 RPS per model."
+module = "serving.muxserve_topology_pending"
+mode = "owned"
+deployment = "pending-deployments/muxserve-atn2-ffn1-lanes2.toml"
+seed = 0
+
+[serving_cases.7aa80710-e4ed-4afa-aa59-0248edeedab2.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 4.0, "huggyllama/llama-13b" = 4.0 }
+
+[[serving_cases.7aa80710-e4ed-4afa-aa59-0248edeedab2.targets]]
+model_id = "huggyllama/llama-7b"
+graph_mode = "decode-full-prefill-breakable"
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+
+[[serving_cases.7aa80710-e4ed-4afa-aa59-0248edeedab2.targets]]
+model_id = "huggyllama/llama-13b"
+graph_mode = "decode-full-prefill-breakable"
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+
+# CrossPool source case 61: 8d4af85e-eac0-44d5-b2c3-2636d85d4b8f
+# Missing MuxServe implementation for CrossPool topology: atn1-ffn2-tp1-lanes2
+[serving_cases.4c4dbb63-7241-4894-8adc-aa9714053812]
+description = "PENDING / NOT RUNNABLE: MuxServe: LLaMA-7B/30B FFN TP1 comparison against the TP2 baseline on the same two-device FFN fleet at 0.5 RPS per model."
+module = "serving.muxserve_topology_pending"
+mode = "owned"
+deployment = "pending-deployments/muxserve-atn1-ffn2-tp1-lanes2.toml"
+seed = 0
+
+[serving_cases.4c4dbb63-7241-4894-8adc-aa9714053812.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 0.5, "huggyllama/llama-30b" = 0.5 }
+
+[[serving_cases.4c4dbb63-7241-4894-8adc-aa9714053812.targets]]
+model_id = "huggyllama/llama-7b"
+graph_mode = "decode-full-prefill-breakable"
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+
+[[serving_cases.4c4dbb63-7241-4894-8adc-aa9714053812.targets]]
+model_id = "huggyllama/llama-30b"
+graph_mode = "decode-full-prefill-breakable"
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }

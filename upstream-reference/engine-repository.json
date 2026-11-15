@@ -1,0 +1,77 @@
+{
+  "directory": "../MuxServe-SGLang-Engine",
+  "upstream_repository": "https://github.com/sgl-project/sglang.git",
+  "upstream_commit": "94602c9c2b7cbdb8efd5c52802dac6a1c180089e",
+  "upstream_tag": "v0.5.20",
+  "archive_sha256": "fcd78d64bcac43c5f31b0a99d7078540858b9c2f5c6782a484e3890c4dc07ae6",
+  "local_git_state": "initialized_from_verified_archive; no authored commit or imported upstream history",
+  "integration_files_sha256": {},
+  "layout": "six-directory-llm-engine",
+  "source_projection": {
+    "prefixes": {
+      "python/sglang/": "sglang/",
+      "rust/": "csrc/rust/",
+      "proto/": "csrc/proto/"
+    },
+    "files": {
+      "python/setup.py": "setup.py",
+      "python/pyproject.toml": "pyproject.toml",
+      "LICENSE": "LICENSE",
+      ".gitignore": ".gitignore",
+      "examples/runtime/engine/offline_batch_inference.py": "examples/offline_batch_inference.py",
+      "examples/runtime/engine/offline_batch_inference_async.py": "examples/offline_batch_inference_async.py",
+      "examples/runtime/engine/fastapi_engine_inference.py": "examples/fastapi_engine_inference.py",
+      "test/registered/unit/test_environ.py": "tests/test_environ.py",
+      "test/registered/unit/test_runtime_context.py": "tests/test_runtime_context.py",
+      "test/registered/unit/test_model_overrides.py": "tests/test_model_overrides.py",
+      "test/registered/unit/test_server_args_cli_metadata.py": "tests/test_server_args_cli_metadata.py",
+      "test/registered/unit/test_quantization_post_load.py": "tests/test_quantization_post_load.py",
+      "test/registered/unit/test_checkpoint_quantization.py": "tests/test_checkpoint_quantization.py",
+      "python/sglang/kernels/ops/diffusion/__init__.py": "sglang/kernels/ops/diffusion/__init__.py",
+      "python/sglang/kernels/ops/diffusion/common/numerics.py": "sglang/kernels/ops/diffusion/common/numerics.py",
+      "python/sglang/kernels/ops/diffusion/common/platform.py": "sglang/kernels/ops/diffusion/common/platform.py",
+      "python/sglang/kernels/ops/diffusion/common/__init__.py": "sglang/kernels/ops/diffusion/common/__init__.py",
+      "README.md": "README.md",
+      "python/MANIFEST.in": "MANIFEST.in"
+    },
+    "exclude": [
+      "python/sglang/multimodal_gen/",
+      "python/sglang/kernels/aot/benchmark/",
+      "python/sglang/cli/generate.py",
+      "python/sglang/kernels/ops/diffusion/",
+      "python/sglang/test/ci/diffusion_suite_bridge.py"
+    ],
+    "overrides_sha256": {
+      "MANIFEST.in": "824fabfcb79f9a093186e1ace8585828f3c669616d6ec219b8079a8c782df97e",
+      "README.md": "bfa8d574d6ba48d322ebbb0573b7d03057c9dda93d8a9b1d9a21094ea1449f7e",
+      "pyproject.toml": "983cc68491960d4bcae6aba65f681ff125edff24f69a32f69690b7719617f3ce",
+      "setup.py": "7251cf8d96ac22c9fc290068a11f48eb90af584e9efd2b61a844c6d35b62e0cb",
+      "sglang/cli/main.py": "c1f2ceb1872632678556d6d23ef9c73ff67e112a2c58942a1c42e64397f7481d",
+      "sglang/cli/serve.py": "0b782df0ec7c5c7d0c944d1e71263c3e1f91c55c222ac2df55befec4dfdeabc8",
+      "sglang/cli/utils.py": "067034b2d8bcadb1d0104412dfba9efa83daf5995b787f2737b654c6875b19e1",
+      "sglang/kernels/ops/diffusion/__init__.py": "2192f9d6e1fcbf663fe7122abc6f6ec3fc7c9eb8864316718df0f5bbe8f86c53",
+      "sglang/kernels/ops/diffusion/common/__init__.py": "0f47cd1d52280e4e601b0a833669f3697eb2b201cb1f12597f369fe6979b4bd1",
+      "sglang/kernels/ops/diffusion/common/platform.py": "5e229a3709015a54ffa4849f75d3b3a8086af2da642efc6fd288c3c04bfdcfa1",
+      "sglang/kernels/ops/quantization/fp8_kernel.py": "762f9cdd84f5d4f9ec02a60eecc0f569a6bdf770d4958d36ff3089bd0cec8c98",
+      "sglang/srt/distributed/parallel_state.py": "53c96f40bd6d0583164713efda2fbb19dad55d643677d370116f78ba5e2e6c78",
+      "sglang/srt/layers/layernorm.py": "ce57b01960b471cac484ff76d111b5e36cb2c5cdceff5d788082309cfc120ad4",
+      "sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py": "0ec975e620f0d7b2a5f66646f6a23f1cdd5a30eb64d9ae8fcb019a2fb2ae4aed",
+      "sglang/srt/layers/rotary_embedding/base.py": "6ff22484428c56fcc8c4072174a530b2744ffdc7de8985a1b4dc8a42677e9312",
+      "sglang/srt/mem_cache/rust_tree_core/extension.py": "21cc7614cb80df1ecbe213a1a00f12a937237e0eb0dda3def1dd882eee92519d",
+      "sglang/srt/model_executor/model_runner_components/load_model_utils.py": "16da124f03a59a1732b502e66e023974272b1919783a1a1959126df469fd8db4",
+      "sglang/srt/model_executor/model_runner_components/startup_weight_load.py": "4ad876ad28c278b4dbae19b05c00a1fd93f194b5624103b9fe44b8323f0c8da3",
+      "sglang/srt/models/bailing_moe_linear.py": "0021b2286acd0da17c89d316e6a1045c0a5a366f8745a4d0f9472c05055084ec",
+      "sglang/srt/models/bailing_moe_v3.py": "d1f55c58b8c8bb1d39ca884b4b53c468beec59ac3d94e7cbe7066170f169fdc5",
+      "sglang/srt/rust_extensions/loader.py": "7c63a82b520e5ef30aa1054716a62960e5213d62ec3fec002361e34dfdb9d38b",
+      "sglang/srt/utils/common.py": "511ebca54b1583eba17090ef667ecc298bd9098ccf62bccb22020263f14bca9d",
+      "sglang/version.py": "c4ca8aa9583670ac3298ac86463afc8be40d9f478ec6f4d477b5c10f30717419"
+    },
+    "additional_files_sha256": {
+      "benchmarks/bench_offline_throughput.py": "fbfb8f6e111dd32413d6624da5c55c7ce1b120d1716a7684002e50d0e864fc13",
+      "benchmarks/bench_one_batch.py": "9877c656e11ee27e4f6228443889b2562028c5380a16e879e6368cb674dbc0a9",
+      "benchmarks/bench_one_batch_server.py": "f26b486f16bfb04521f99c9a51da3ed10105ca5e55e6039c198ad669b633b051",
+      "benchmarks/bench_serving.py": "047d919e2472bea59a91c9b745c84e9c38019214b57313dbb2d7b95318474996",
+      "docs/README.md": "71aa1429387bf1193d643739e7c11b45d6a96117389441653ac759a7fa63ba45"
+    }
+  }
+}

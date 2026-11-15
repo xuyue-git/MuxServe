@@ -31,6 +31,20 @@ def digest(data: bytes) -> str:
 
 
 class BootstrapSourceTests(unittest.TestCase):
+    def test_clean_layout_preserves_declared_source_identity(self):
+        self.assertTrue(hasattr(bootstrap_source, '_project_source'), 'Clean layout projection is not implemented')
+        base = {'python/sglang/srt/a.py': digest(b'a'), 'docs/unrelated.md': digest(b'docs')}
+        projection = {'prefixes': {'python/sglang/': 'sglang/'}, 'files': {}, 'exclude': [],
+                      'overrides_sha256': {}, 'additional_files_sha256': {}}
+        self.assertEqual(bootstrap_source._project_source(base, projection), {'sglang/srt/a.py': digest(b'a')})
+
+    def test_clean_layout_rejects_undeclared_source_override(self):
+        self.assertTrue(hasattr(bootstrap_source, '_project_source'), 'Clean layout projection is not implemented')
+        projection = {'prefixes': {}, 'files': {}, 'exclude': [],
+                      'overrides_sha256': {'sglang/missing.py': digest(b'bad')}, 'additional_files_sha256': {}}
+        with self.assertRaisesRegex(RuntimeError, 'override'):
+            bootstrap_source._project_source({'a.py': digest(b'a')}, projection)
+
     def setUp(self) -> None:
         self.sandbox = tempfile.TemporaryDirectory()
         self.addCleanup(self.sandbox.cleanup)
@@ -125,6 +139,44 @@ class BootstrapSourceTests(unittest.TestCase):
     @property
     def destination(self) -> Path:
         return self.root / "third_party/sglang"
+
+    def external_pin(self, *, create: bool = True) -> Path:
+        engine = self.root.parent / "MuxServe-SGLang-Engine"
+        if create:
+            self.invoke()
+            shutil.copytree(self.destination, engine)
+            (engine / ".git").mkdir()
+            (engine / ".git/HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        pin = {"directory": "../MuxServe-SGLang-Engine", "upstream_commit": self.extraction["commit"],
+               "integration_files_sha256": {}}
+        (self.root / "upstream-reference/engine-repository.json").write_text(json.dumps(pin), encoding="utf-8")
+        return engine
+
+    def invoke_external(self) -> dict:
+        with mock.patch.multiple(bootstrap_source, ARCHIVE_SHA256=self.extraction["archive_sha256"],
+                                 SOURCE_FILE_COUNT=len(self.files)), mock.patch.object(
+            bootstrap_source, "_download_archive", side_effect=AssertionError("External checkout must not download")
+        ):
+            return bootstrap_source.bootstrap(root=self.root)
+
+    def test_external_repository_takes_precedence_over_embedded_copy(self) -> None:
+        engine = self.external_pin()
+        report = self.invoke_external()
+        self.assertEqual(Path(report["destination"]), engine)
+        self.assertEqual(report["repository_layout"], "separate")
+        self.assertEqual(report["status"], "verified")
+
+    def test_external_repository_drift_is_not_hidden_by_embedded_copy(self) -> None:
+        engine = self.external_pin()
+        (engine / "python/sglang/worker.py").write_bytes(b"unreviewed edit")
+        with self.assertRaisesRegex(RuntimeError, "integrity|drift"):
+            self.invoke_external()
+
+    def test_missing_external_repository_does_not_create_embedded_copy(self) -> None:
+        self.external_pin(create=False)
+        with self.assertRaisesRegex(RuntimeError, "engine repository|Engine repository"):
+            self.invoke_external()
+        self.assertFalse(self.destination.exists())
 
     def test_materializes_verified_patched_source_and_is_idempotent(self) -> None:
         report = self.invoke()
