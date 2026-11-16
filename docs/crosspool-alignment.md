@@ -12,7 +12,7 @@ README、`docs/tutorials/quick-start.md`、`docs/tutorials/tooling.md`、`pyproj
 | 依赖与环境 | 根 `pyproject.toml` + `uv.lock`，`uv sync` | 相同 |
 | Python | uv 管理的 Python 3.12（`requires-python = ">=3.12,<3.13"`，`python-preference = "only-managed"`，`python-downloads = "automatic"`） | 相同 |
 | uv 版本 | `required-version = ">=0.12.17"` | 相同 |
-| 机器相关设置 | 被 git 忽略的 `.env` 和 `configs/*.local.toml`，从 `*.example` 复制 | 被 git 忽略的 `.env` 和 `configs/muxserve.local.toml`，从 `.env.example`、`configs/muxserve.example.toml` 复制 |
+| 机器相关设置 | 被 git 忽略的 `.env` 和 `configs/*.local.toml`，从 `*.example` 复制 | 被 git 忽略的 `.env` 和 `configs/muxserve.local.toml`，从 `.env.example`、`configs/muxserve.example.toml` 复制；用哪四张卡写在启动命令里 |
 | 每个终端 | `export UV_ENV_FILE="$PWD/.env"` | 相同 |
 | 配置文件格式 | TOML | TOML（部署配置、本地设置、消融配置；启动器内部写给子进程的解析结果仍是 JSON） |
 | 运行命令形状 | `uv run xpool <子命令>` | `uv run muxserve serve CONFIG.toml` |
@@ -82,8 +82,10 @@ MuxServe 只有一个启动器，它自己拉起 MPS、主控、权重进程和 
 
 原版跑在 Python 3.9、torch 2.0.1 + CUDA 11.8、从源码编译的 MuxServe-vLLM 上。
 它的 `Muxserve-change` 分支只加了 HTTP 入口（按“原版只做最小修改”的要求）；
-改它的安装方式会改变基线本身，所以没有做。它的启动命令是
-`python -m muxserve.launch <yaml> --http-port 18080`，客户端命令和上面完全相同。
+改它的安装方式会改变基线本身，所以没有做，沿用服务器上已验证的旧环境。它的配置和完整启动
+命令在该分支的 `examples/xbench/`：用原版自己的 `python -m muxserve.launch` 加载
+`examples/xbench/fig5-a0.7-s1.0.yaml`，多一个 `--http-port 18080`，启动前先起一个私有 MPS
+（原版的启动器不会自己起）。客户端命令和上面完全相同。
 
 ## 尚未验证
 

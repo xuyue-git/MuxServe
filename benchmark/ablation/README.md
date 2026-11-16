@@ -32,7 +32,7 @@
 
 ```bash
 export UV_ENV_FILE="$PWD/.env"
-uv run muxserve serve configs/ablation/s00-baseline.toml
+CUDA_VISIBLE_DEVICES=1,2,3,4 uv run muxserve serve configs/ablation/s00-baseline.toml
 ```
 
 客户端（`~/xb/CrossPool`，服务 ready 之后）：

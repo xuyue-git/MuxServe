@@ -60,7 +60,7 @@ The environment contains SGLang and no vLLM.
 4. Machine-local settings stay out of the deployment configs, as CrossPool keeps
    them in `configs/xpool.local.toml` and `.env`:
    `cp .env.example .env && cp configs/muxserve.example.toml configs/muxserve.local.toml`
-   (both git-ignored), set your personal `asset_lock_dir`, model paths and GPUs, and
+   (both git-ignored), set your personal `asset_lock_dir`, model paths, and
    `export UV_ENV_FILE="$PWD/.env"` in every terminal. The local settings file accepts
    only those paths, so it cannot change an experimental condition;
    `uv run muxserve config dump CONFIG` prints the effective deployment.
@@ -76,8 +76,10 @@ locked by `upstream-reference/engine-repository.json`.
 ```bash
 export UV_ENV_FILE="$PWD/.env"
 uv run python -m muxserve.preflight configs/sglang_a100.toml
-uv run muxserve serve configs/sglang_a100.toml
+CUDA_VISIBLE_DEVICES=1,2,3,4 uv run muxserve serve configs/sglang_a100.toml
 ```
+
+The four GPUs (TP4) are chosen on the command line with `CUDA_VISIBLE_DEVICES`.
 
 `uv run muxserve serve CONFIG` is `python -m muxserve.launch CONFIG`. KV pools are sized
 as original MuxServe sizes them: `kv_memory_fraction` x the GPU memory torch reports

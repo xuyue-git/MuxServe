@@ -19,7 +19,7 @@ From the repository root, with the four GPUs reserved and
 drive it with the fixed-workload client:
 
 ```bash
-uv run muxserve serve benchmark/paired/paired_a100.toml
+CUDA_VISIBLE_DEVICES=1,2,3,4 uv run muxserve serve benchmark/paired/paired_a100.toml
 uv run python tools/bench_fixed.py --frozen-bundle benchmark/paired/frozen-synthetic-512-128.toml --warmup-total 128 --requests 64 --out bench.json
 ```
 

@@ -114,7 +114,7 @@ uv sync
 ```
 
 在 `configs/muxserve.local.toml` 里填自己的绝对锁目录 `asset_lock_dir`，模型路径按本机修改；
-在 `.env` 里按自己获准使用的四张卡设 `CUDA_VISIBLE_DEVICES`。这两个文件被 git 忽略。
+这两个文件被 git 忽略。用哪四张卡写在启动命令里（`CUDA_VISIBLE_DEVICES=...`），不写进 `.env`。
 本地设置文件只接受锁目录、运行目录和模型路径，写别的字段会被拒绝，所以改不了实验条件。
 `uv run muxserve config dump CONFIG` 打印加上本地设置和全部默认值之后实际生效的配置
 （对应 CrossPool 的 `uv run xpool config dump`）。
@@ -143,7 +143,7 @@ catalog = "../../MuxServe/benchmark/xbench/benches.toml"
 
 ```bash
 export UV_ENV_FILE="$PWD/.env"
-uv run muxserve serve configs/a100_xbench_poisson.toml
+CUDA_VISIBLE_DEVICES=1,2,3,4 uv run muxserve serve configs/a100_xbench_poisson.toml
 ```
 
 看到 ready 后，`curl -s http://127.0.0.1:18080/health` 应返回正常。Ctrl-C 有序关停（排空后关 MPS）。
