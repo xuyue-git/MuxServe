@@ -16,8 +16,12 @@ def main_flexstore(muxserve_config: MuxServeConfig):
     flexstore_manager.deploy()
 
 
-def main_muxsched(muxserve_config: MuxServeConfig):
-    muxscheduler = MuxScheduler(muxserve_config)
+def main_muxsched(muxserve_config: MuxServeConfig, http_port=None):
+    if http_port is None:
+        muxscheduler = MuxScheduler(muxserve_config)
+    else:  # requests arrive over HTTP instead of from the workload file
+        from muxserve.muxsched.http_scheduler import HttpMuxScheduler
+        muxscheduler = HttpMuxScheduler(muxserve_config, http_port)
     muxscheduler.serve_models()
     asyncio.run(muxscheduler.schedule_loop())
 
@@ -30,7 +34,7 @@ def main(args: argparse.Namespace):
         main_flexstore(muxserve_config)
 
     if args.muxscheduler:
-        main_muxsched(muxserve_config)
+        main_muxsched(muxserve_config, args.http_port)
 
 
 if __name__ == '__main__':
@@ -41,6 +45,11 @@ if __name__ == '__main__':
     parser.add_argument("--muxscheduler",
                         action="store_true",
                         help="Launch MuxScheduler process.")
+    parser.add_argument("--http-port",
+                        type=int,
+                        default=None,
+                        help="Serve requests over HTTP on this port instead "
+                        "of replaying the workload file.")
     parser = MuxServeArgs.add_cli_args(parser)
     args = parser.parse_args()
     main(args)
