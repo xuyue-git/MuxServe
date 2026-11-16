@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from controller_check import Fixture
-from muxserve.config import load_config
+from muxserve.config import read_config_file, load_config
 from muxserve import config as deployment_config
 from muxserve.contracts import IntegrationError
 from muxserve.gateway import GatewayServer, GatewayState, OutputRecord
@@ -580,7 +580,7 @@ class DeploymentChecks(unittest.TestCase):
                 server.handle_error.assert_not_called()
 
     def test_timeout_boundaries(self):
-        raw = json.loads((ROOT / "configs/sglang_a100.json").read_text())
+        raw = read_config_file(ROOT / "configs/sglang_a100.toml")
         with TemporaryDirectory() as directory:
             file = Path(directory) / "config.json"
             for request, prepare, valid in ((999, 30000, False), (1000, 120000, True),
@@ -598,7 +598,7 @@ class DeploymentChecks(unittest.TestCase):
                     self.assert_code("INVALID_CONFIG", lambda: load_config(file, require_assets=False))
 
     def test_pool_and_batch_history_boundaries(self):
-        raw = json.loads((ROOT / "configs/sglang_a100.json").read_text())
+        raw = read_config_file(ROOT / "configs/sglang_a100.toml")
         with TemporaryDirectory() as directory:
             file = Path(directory) / "config.json"
             for mode, limit, valid in (("shared", 100000, True), ("static", 4000000, True),

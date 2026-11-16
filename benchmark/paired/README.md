@@ -15,12 +15,12 @@ private MPS with prefill 100% / decode 40%, KV sized by original MuxServe's form
 ## Run the backend
 
 From the repository root, with the four GPUs reserved and
-`MUXSERVE_LOCAL_CONFIG` set (see the top-level README), launch the config and
+`.env` loaded (`export UV_ENV_FILE="$PWD/.env"`, see the top-level README), launch the config and
 drive it with the fixed-workload client:
 
 ```bash
-uv run muxserve benchmark/paired/paired_a100.json
-uv run python tools/bench_fixed.py --frozen-bundle benchmark/paired/frozen-synthetic-512-128.json --warmup-total 128 --requests 64 --out bench.json
+uv run muxserve serve benchmark/paired/paired_a100.toml
+uv run python tools/bench_fixed.py --frozen-bundle benchmark/paired/frozen-synthetic-512-128.toml --warmup-total 128 --requests 64 --out bench.json
 ```
 
 The bench exits with status 2 unless every output equals the bundle's expected tokens.

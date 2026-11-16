@@ -1,0 +1,20 @@
+# Machine-local settings. Copy to configs/muxserve.local.toml (git-ignored) and
+# select it with MUXSERVE_LOCAL_CONFIG in .env, as CrossPool keeps machine
+# settings in configs/xpool.local.toml. Only these paths are accepted, so this
+# file cannot change an experimental condition; models a deployment does not
+# serve are ignored.
+
+asset_lock_dir = "/absolute/path/to/your/personal/lock-directory"
+# runtime_dir = "/absolute/path/for/runtime-files"   # default: a fresh /tmp/mxs-<uid>-* directory
+
+[models.llama7b]
+model_path = "/storage/crosspool-models/huggyllama/llama-7b"
+tokenizer_path = "/storage/crosspool-models/huggyllama/llama-7b"
+
+[models.llama13b]
+model_path = "/storage/crosspool-models/huggyllama/llama-13b"
+tokenizer_path = "/storage/crosspool-models/huggyllama/llama-13b"
+
+[models.llama30b]
+model_path = "/storage/crosspool-models/huggyllama/llama-30b"
+tokenizer_path = "/storage/crosspool-models/huggyllama/llama-30b"

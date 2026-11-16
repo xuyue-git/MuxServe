@@ -2,12 +2,12 @@
 
 量化每个优化补丁对吞吐和延迟的增量贡献。做法是**累加**：第 N 步在第 N−1 步的基础上
 多打开一个提交引入的开关，其余设置在所有步骤中完全相同；第 27 步就是最终配置
-`configs/a100_open_loop.json`。
+`configs/a100_open_loop.toml`。
 
 | 文件 | 内容 |
 |---|---|
 | `steps.json` | 步骤定义：每步对应的提交、开关、类型（性能 / 原版对齐）、动机、对模型适配的影响；基线里常开的改动 |
-| `make_configs.py` | 由 `steps.json` 和最终配置生成 `configs/ablation/sNN-*.json` 与 `RESULTS.md`，结果逐字节可复现 |
+| `make_configs.py` | 由 `steps.json` 和最终配置生成 `configs/ablation/sNN-*.toml` 与 `RESULTS.md`，结果逐字节可复现 |
 | `RESULTS.md` | 结果表（实测后填写）、每个补丁的动机与适配影响、基线常开改动清单 |
 | `../../configs/ablation/` | 28 份完整服务配置，s00（全关）到 s27（最终） |
 
@@ -25,24 +25,24 @@
 
 ## 怎么跑
 
-前提和 `benchmark/xbench/README.md` 一样：已 `uv sync`，`configs/local.json` 已填好，
-CrossPool checkout 已 `uv sync --group dev`。每一步：
+前提和 `benchmark/xbench/README.md` 一样：两个仓库并排，`.env`、`configs/muxserve.local.toml`
+已填好并 `uv sync`；CrossPool 的 `configs/xkit.local.toml` 已指向本项目的 `benches.toml`。每一步：
 
-服务端（MuxServe 仓库根目录）：
-
-```bash
-export CUDA_VISIBLE_DEVICES=1,2,3,4
-export MUXSERVE_LOCAL_CONFIG=$PWD/configs/local.json
-uv run muxserve configs/ablation/s00-baseline.json
-```
-
-客户端（CrossPool checkout 根目录，服务 ready 之后）：
+服务端（`~/xb/MuxServe`）：
 
 ```bash
-uv run xbench run --catalog /absolute/path/to/MuxServe/benchmark/xbench/benches.toml --case 2bdea08f
+export UV_ENV_FILE="$PWD/.env"
+uv run muxserve serve configs/ablation/s00-baseline.toml
 ```
 
-跑完 Ctrl-C 停服务，换下一份配置（`s01-rpc-persistent.json` ……`s27-adbs-step-history.json`）重复。
+客户端（`~/xb/CrossPool`，服务 ready 之后）：
+
+```bash
+export UV_ENV_FILE="$PWD/.env"
+uv run xbench run --case 2bdea08f
+```
+
+跑完 Ctrl-C 停服务，换下一份配置（`s01-rpc-persistent.toml` ……`s27-adbs-step-history.toml`）重复。
 `uv run xbench report RUN_ID` 给出吞吐、TTFT、TPOT 和失败数，填进 `RESULTS.md`。
 
 规则：

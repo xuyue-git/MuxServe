@@ -172,6 +172,6 @@ log/*
 /.venv*/
 /results/
 /artifacts/
-# Machine-local settings (copy configs/local.example.json)
-/configs/local.json
+# Machine-local settings (copy configs/muxserve.example.toml and .env.example)
+/configs/*.local.toml
 /.env

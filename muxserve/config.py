@@ -1,7 +1,9 @@
 """MuxServe configuration.
 
 - ``DeploymentConfig`` / ``ModelDeployment`` / ``load_config``: the frozen deployment
-  that ``python -m muxserve.launch CONFIG`` runs (models, devices, assets, switches).
+  that ``muxserve serve CONFIG.toml`` runs (models, devices, assets, switches).
+  Deployment and local settings files are TOML; the launcher's resolved runtime
+  copy is JSON. ``config_to_toml`` writes the TOML form.
 - ``JobConfig`` / ``MuxServeConfig``: the placement optimizer's model and cluster
   description (``muxserve.muxsched.placement``, ``muxserve.muxsched.resource``).
 """
@@ -13,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import tomllib
 from collections import deque
 import errno
 
@@ -418,6 +421,47 @@ def kv_bytes_from_fraction(fraction: float, total_memory_bytes: int) -> int:
     return blocks * block_mem
 
 
+def read_config_file(path: str | Path) -> dict:
+    """A deployment or local settings file: TOML by suffix, otherwise JSON."""
+    path = safe_path(path)
+    text = path.read_text(encoding="utf-8")
+    return tomllib.loads(text) if path.suffix == ".toml" else json.loads(text)
+
+
+def _toml_key(key: str) -> str:
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key)
+
+
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value != value or value in (float("inf"), float("-inf")):
+            raise IntegrationError("INVALID_CONFIG", "Config values must be finite")
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{_toml_key(k)} = {_toml_value(v)}" for k, v in value.items()) + " }"
+    raise IntegrationError("INVALID_CONFIG", f"Config value cannot be written as TOML: {value!r}")
+
+
+def config_to_toml(raw: dict, header: str = "") -> str:
+    """Deployment mapping -> TOML: scalars first, then one [[models]] table per model."""
+    lines = [f"# {line}" if line else "#" for line in header.splitlines()]
+    if lines:
+        lines.append("")
+    for key, value in raw.items():
+        if key != "models":
+            lines.append(f"{_toml_key(key)} = {_toml_value(value)}")
+    for model in raw.get("models", ()):
+        lines += ["", "[[models]]"]
+        lines += [f"{_toml_key(key)} = {_toml_value(value)}" for key, value in model.items()]
+    return "\n".join(lines) + "\n"
+
+
 LOCAL_KEYS = ("asset_lock_dir", "runtime_dir")
 LOCAL_MODEL_KEYS = ("model_path", "tokenizer_path")
 
@@ -455,9 +499,9 @@ def apply_local_settings(raw: dict, local: dict) -> dict:
 def load_config(path: str | Path, *, require_assets: bool = True,
                 local: str | Path | None = None) -> DeploymentConfig:
     path = safe_path(path)
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = read_config_file(path)
     if local is not None:
-        raw = apply_local_settings(raw, json.loads(safe_path(local).read_text(encoding="utf-8")))
+        raw = apply_local_settings(raw, read_config_file(local))
     fraction = raw.get("kv_memory_fraction")
     if fraction is not None:
         if "kv_bytes_per_rank" in raw:

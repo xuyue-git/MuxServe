@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'acceptance'))
 import deployment_check as fixtures
-from muxserve.config import DeploymentConfig, ModelDeployment
+from muxserve.config import read_config_file, DeploymentConfig, ModelDeployment
 from muxserve.contracts import IntegrationError, KVTarget, RequestIdentity
 from muxserve.flexstore.storage import HeadwiseStore
 from muxserve import startup
@@ -21,7 +21,7 @@ from muxserve.muxsched import driver as controller_driver
 
 class StartupBudgetChecks(unittest.TestCase):
     def test_one_gib_keeps_full_shapes_and_real_single_request_capacity(self):
-        raw = json.loads((ROOT / 'configs/sglang_a100.json').read_text())
+        raw = read_config_file(ROOT / 'configs/sglang_a100.toml')
         models = tuple(ModelDeployment(**item) for item in raw.pop('models'))
         config = replace(DeploymentConfig(models=models, **raw), kv_bytes_per_rank=1024**3)
         store = HeadwiseStore(dict.fromkeys(range(4), config.pool_blocks_per_rank))

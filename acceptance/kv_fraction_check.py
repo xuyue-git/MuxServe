@@ -10,7 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from muxserve.config import kv_bytes_from_fraction, load_config
+from muxserve.config import read_config_file, kv_bytes_from_fraction, load_config
 from muxserve.contracts import IntegrationError
 
 
@@ -38,11 +38,11 @@ class KVFractionChecks(unittest.TestCase):
     def test_shipped_fraction_is_two_gib_on_the_measured_a100(self):
         # torch total_memory of the A100-SXM4-40GB cards used for every result.
         self.assertEqual(kv_bytes_from_fraction(0.05061, 42_436_526_080), 2 * 1024 ** 3)
-        for name in ("configs/a100_open_loop.json", "configs/a100_xbench_poisson.json"):
+        for name in ("configs/a100_open_loop.toml", "configs/a100_xbench_poisson.toml"):
             self.assertEqual(load_config(ROOT / name, require_assets=False).kv_memory_fraction, 0.05061)
 
     def _write(self, directory, **fields):
-        source = json.loads((ROOT / "configs/sglang_a100.json").read_text())
+        source = read_config_file(ROOT / "configs/sglang_a100.toml")
         source.pop("kv_bytes_per_rank", None)
         source.pop("kv_memory_fraction", None)
         source.update(fields)

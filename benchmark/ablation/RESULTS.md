@@ -6,34 +6,34 @@
 
 | 步 | 提交 | 类型 | 打开的开关 | 配置 | 吞吐 tok/s | 相对上一步 | TTFT p50 / p99 ms | TPOT p50 / p99 ms | 完成 / 失败 |
 |---|---|---|---|---|---|---|---|---|---|
-| 0 | — | 基线 | （全部关闭；含常开修复与 capacity_recovery_all_decode） | `configs/ablation/s00-baseline.json` | 待测 | — | 待测 | 待测 | 待测 |
-| 1 | `c4fef51` | 性能 | `rpc_persistent_connections` | `configs/ablation/s01-rpc-persistent.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 2 | `b0a54ca/db6d210` | 性能 | `decode_run_steps` | `configs/ablation/s02-decode-runs.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 3 | `46c2a15` | 性能 | `decode_cuda_graph` | `configs/ablation/s03-decode-graph.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 4 | `39ce0df` | 性能 | `decode_run_park` | `configs/ablation/s04-decode-park.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 5 | `a2ba6da` | 性能 | `prefill_cuda_graph` | `configs/ablation/s05-prefill-graph.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 6 | `a1083db` | 性能 | `inline_start`, `decode_skip_prefill_ranks`, `prefill_early_token` | `configs/ablation/s06-control-fast-paths.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 7 | `749fc99` | 性能 | `cleanup_skip_prefill_ranks`, `cleanup_with_quiesce`, `idle_cache_trim_mib` | `configs/ablation/s07-request-end.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 8 | `ad93739` | 性能 | `handoff_prepare_decode`, `handoff_inline_metadata`, `final_step_in_gpu_done`, `event_pump_thread`, `bootstrap_in_poll` | `configs/ablation/s08-handoff-overlap.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 9 | `110395a` | 性能 | `inline_prepare`, `prepare_own_rank_table` | `configs/ablation/s09-prepare-at-submit.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 10 | `8fa6708` | 性能 | `register_in_ready`, `broker_status_in_poll`, `terminal_before_cleanup`, `slot_free_at_cleanup` | `configs/ablation/s10-fewer-round-trips-1.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 11 | `1b21ef2` | 性能 | `handoff_ack_in_poll`, `handoff_report_with_ready`, `start_in_report_reply`, `targeted_wake` | `configs/ablation/s11-fewer-round-trips-2.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 12 | `8f5f246` | 性能 | `rpc_inline_fast_methods` | `configs/ablation/s12-rpc-inline.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 13 | `9921cd9` | 性能 | `decode_leader_reports`, `handoff_prepare_after_ack`, `decode_prepare_light` | `configs/ablation/s13-decode-leader.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 14 | `00fb8d0` | 性能 | `decode_run_merge`, `prefill_pair_hold_ms` | `configs/ablation/s14-paired-prefill.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 15 | `aefa2f0` | 性能 | `decode_kv_trim` | `configs/ablation/s15-kv-trim.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 16 | `abfb0a0` | 原版对齐 | `decode_step_join`, `decode_kv_per_page` | `configs/ablation/s16-step-join.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 17 | `c9251ba` | 性能 | `decode_step_pipeline` | `configs/ablation/s17-step-pipeline.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 18 | `82bc15f` | 原版对齐 | `decode_step_leave`, `decode_kv_grow_pages` | `configs/ablation/s18-step-leave.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 19 | `ea0d698` | 性能 | `decode_wait_commands`, `prefill_stage_in_gpu_done`, `driver_min_interval_ms` | `configs/ablation/s19-boundary-round-trips.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 20 | `c96e81d` | 性能 | `prefill_graph_tokens` | `configs/ablation/s20-prefill-buckets.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 21 | `c4da5a3` | 性能 | `prefill_start_unparked`, `handoff_local_success` | `configs/ablation/s21-start-unparked.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 22 | `c0b1de5` | 原版对齐 | `policy_arrival_rates` | `configs/ablation/s22-adbs-arrival-rates.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 23 | `76367a7` | 性能 | `prefill_break_slim` | `configs/ablation/s23-break-slim.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 24 | `0e102f3` | 性能 | `prefill_overlap_decode` | `configs/ablation/s24-prefill-overlap.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 25 | `19318e3` | 原版对齐 | `kv_release_at_finish` | `configs/ablation/s25-kv-early-free.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 26 | `8a16781` | 性能 | `gateway_process`, `event_lean_copies`, `driver_lean_locking`, `owner_switch_interval_us` | `configs/ablation/s26-owner-speed.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 27 | `370794c` | 原版对齐 | `policy_step_history`, `policy_log_adjustments` | `configs/ablation/s27-adbs-step-history.json` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 0 | — | 基线 | （全部关闭；含常开修复与 capacity_recovery_all_decode） | `configs/ablation/s00-baseline.toml` | 待测 | — | 待测 | 待测 | 待测 |
+| 1 | `c4fef51` | 性能 | `rpc_persistent_connections` | `configs/ablation/s01-rpc-persistent.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 2 | `b0a54ca/db6d210` | 性能 | `decode_run_steps` | `configs/ablation/s02-decode-runs.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 3 | `46c2a15` | 性能 | `decode_cuda_graph` | `configs/ablation/s03-decode-graph.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 4 | `39ce0df` | 性能 | `decode_run_park` | `configs/ablation/s04-decode-park.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 5 | `a2ba6da` | 性能 | `prefill_cuda_graph` | `configs/ablation/s05-prefill-graph.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 6 | `a1083db` | 性能 | `inline_start`, `decode_skip_prefill_ranks`, `prefill_early_token` | `configs/ablation/s06-control-fast-paths.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 7 | `749fc99` | 性能 | `cleanup_skip_prefill_ranks`, `cleanup_with_quiesce`, `idle_cache_trim_mib` | `configs/ablation/s07-request-end.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 8 | `ad93739` | 性能 | `handoff_prepare_decode`, `handoff_inline_metadata`, `final_step_in_gpu_done`, `event_pump_thread`, `bootstrap_in_poll` | `configs/ablation/s08-handoff-overlap.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 9 | `110395a` | 性能 | `inline_prepare`, `prepare_own_rank_table` | `configs/ablation/s09-prepare-at-submit.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 10 | `8fa6708` | 性能 | `register_in_ready`, `broker_status_in_poll`, `terminal_before_cleanup`, `slot_free_at_cleanup` | `configs/ablation/s10-fewer-round-trips-1.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 11 | `1b21ef2` | 性能 | `handoff_ack_in_poll`, `handoff_report_with_ready`, `start_in_report_reply`, `targeted_wake` | `configs/ablation/s11-fewer-round-trips-2.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 12 | `8f5f246` | 性能 | `rpc_inline_fast_methods` | `configs/ablation/s12-rpc-inline.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 13 | `9921cd9` | 性能 | `decode_leader_reports`, `handoff_prepare_after_ack`, `decode_prepare_light` | `configs/ablation/s13-decode-leader.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 14 | `00fb8d0` | 性能 | `decode_run_merge`, `prefill_pair_hold_ms` | `configs/ablation/s14-paired-prefill.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 15 | `aefa2f0` | 性能 | `decode_kv_trim` | `configs/ablation/s15-kv-trim.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 16 | `abfb0a0` | 原版对齐 | `decode_step_join`, `decode_kv_per_page` | `configs/ablation/s16-step-join.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 17 | `c9251ba` | 性能 | `decode_step_pipeline` | `configs/ablation/s17-step-pipeline.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 18 | `82bc15f` | 原版对齐 | `decode_step_leave`, `decode_kv_grow_pages` | `configs/ablation/s18-step-leave.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 19 | `ea0d698` | 性能 | `decode_wait_commands`, `prefill_stage_in_gpu_done`, `driver_min_interval_ms` | `configs/ablation/s19-boundary-round-trips.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 20 | `c96e81d` | 性能 | `prefill_graph_tokens` | `configs/ablation/s20-prefill-buckets.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 21 | `c4da5a3` | 性能 | `prefill_start_unparked`, `handoff_local_success` | `configs/ablation/s21-start-unparked.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 22 | `c0b1de5` | 原版对齐 | `policy_arrival_rates` | `configs/ablation/s22-adbs-arrival-rates.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 23 | `76367a7` | 性能 | `prefill_break_slim` | `configs/ablation/s23-break-slim.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 24 | `0e102f3` | 性能 | `prefill_overlap_decode` | `configs/ablation/s24-prefill-overlap.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 25 | `19318e3` | 原版对齐 | `kv_release_at_finish` | `configs/ablation/s25-kv-early-free.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 26 | `8a16781` | 性能 | `gateway_process`, `event_lean_copies`, `driver_lean_locking`, `owner_switch_interval_us` | `configs/ablation/s26-owner-speed.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 27 | `370794c` | 原版对齐 | `policy_step_history`, `policy_log_adjustments` | `configs/ablation/s27-adbs-step-history.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
 
 ## 每个补丁的动机与对模型适配的影响
 

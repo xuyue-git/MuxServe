@@ -13,7 +13,7 @@ import numpy
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'acceptance')]
 from metadata_upload_check import Uploads, fixture  # noqa: E402
-from muxserve.config import load_config  # noqa: E402
+from muxserve.config import read_config_file, load_config  # noqa: E402
 from muxserve.contracts import IntegrationError  # noqa: E402
 
 
@@ -28,8 +28,7 @@ def launcher_functions():
 
 class DecodeGraphConfigChecks(unittest.TestCase):
     def config(self, **extra):
-        with open(ROOT / 'configs/sglang_a100.json') as handle:
-            raw = json.load(handle)
+        raw = read_config_file(ROOT / 'configs/sglang_a100.toml')
         raw.update(extra)
         directory = tempfile.mkdtemp()
         raw['asset_lock_dir'] = raw['runtime_dir'] = directory

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from decode_run_check import Sim as _Sim, expect  # noqa: E402
+from muxserve.config import read_config_file  # noqa: E402
 from muxserve.contracts import BatchPlan, IntegrationError, RequestRef  # noqa: E402
 from muxserve.muxsched.driver import ControllerDriver  # noqa: E402
 
@@ -777,7 +778,7 @@ class ProtocolFastPaths(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
 
         def load(**extra):
-            raw = json.loads((root / "configs/sglang_a100.json").read_text())
+            raw = read_config_file(root / "configs/sglang_a100.toml")
             raw.update(extra)
             directory = tempfile.mkdtemp()
             raw["asset_lock_dir"] = raw["runtime_dir"] = directory
@@ -934,7 +935,7 @@ class HandoffRoundTrips(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
 
         def load(**extra):
-            raw = json.loads((root / "configs/sglang_a100.json").read_text())
+            raw = read_config_file(root / "configs/sglang_a100.toml")
             raw.update(extra)
             directory = tempfile.mkdtemp()
             raw["asset_lock_dir"] = raw["runtime_dir"] = directory

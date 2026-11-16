@@ -1,6 +1,6 @@
 {
   "description": "Cumulative patch ablation for MuxServe on SGLang. Step N enables every switch of steps 1..N at its value in the final configuration; every other setting is identical in all steps.",
-  "final_config": "configs/a100_open_loop.json",
+  "final_config": "configs/a100_open_loop.toml",
   "workload": {
     "catalog": "benchmark/xbench/benches.toml",
     "case": "2bdea08f",

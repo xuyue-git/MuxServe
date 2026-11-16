@@ -14,6 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT.parent / "MuxServe-SGLang-Engine"
 sys.path.insert(0, str(ROOT))
+from muxserve.config import read_config_file  # noqa: E402
 
 
 class EngineLayoutTests(unittest.TestCase):
@@ -50,7 +51,7 @@ class EngineLayoutTests(unittest.TestCase):
     def test_unsupported_tensor_parallelism_is_rejected_at_config_boundary(self):
         from muxserve.config import load_config
         from muxserve.contracts import IntegrationError
-        original = json.loads((ROOT / 'configs/sglang_a100.json').read_text())
+        original = read_config_file(ROOT / 'configs/sglang_a100.toml')
         for tp in (1, 2):
             with self.subTest(tp=tp), tempfile.TemporaryDirectory() as directory:
                 original['tp_size'] = tp

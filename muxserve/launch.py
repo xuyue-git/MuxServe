@@ -670,9 +670,9 @@ class Supervisor:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", help="deployment config JSON (the experiment)")
+    parser.add_argument("config", help="deployment config TOML (the experiment)")
     parser.add_argument("--local-config", default=os.environ.get("MUXSERVE_LOCAL_CONFIG") or None,
-                        help="machine-local settings JSON: asset_lock_dir, runtime_dir, model paths "
+                        help="machine-local settings TOML: asset_lock_dir, runtime_dir, model paths "
                              "(default: $MUXSERVE_LOCAL_CONFIG)")
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--manual-control", action="store_true")

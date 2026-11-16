@@ -14,9 +14,9 @@ CrossPool 最后 3 个 ATN/FFN/Lane 拓扑用例在 `pending-topologies.toml`，
 |---|---|
 | `benches.toml` | 61 个用例，每个独立声明：到达过程、到达率、时长、prompt、输出长度、采样、预热、并发上限、端点 |
 | `pending-topologies.toml` | 3 个待实现拓扑用例（不可运行） |
-| `../../configs/a100_xbench_poisson.json`、`../../configs/a100_open_loop.json` | 三模型服务配置 |
-| `../../configs/xbench/*.json` | 8 份双模型 / 单模型服务配置 |
-| `../../configs/local.example.json` | 本机设置模板（锁目录、模型路径），复制为 `configs/local.json` |
+| `../../configs/a100_xbench_poisson.toml`、`../../configs/a100_open_loop.toml` | 三模型服务配置 |
+| `../../configs/xbench/*.toml` | 8 份双模型 / 单模型服务配置 |
+| `../../configs/muxserve.example.toml`、`../../.env.example` | 本机设置模板（锁目录、模型路径、GPU），复制为 `configs/muxserve.local.toml`、`.env` |
 | `inputs/`、`make_inputs.py` | 三模型用例的冻结输入和离线生成器 |
 | `suites/serving/multi_model.py` | CrossPool 的 serving suite，未修改（MIT） |
 | `CROSSPOOL-LICENSE` | 借用 catalogue 结构和 suite 的 MIT 授权 |
@@ -29,9 +29,9 @@ catalogue 写法参考 CrossPool `0d3267edecfbe67459c1e9edc62ee73ff1f1a63f`，
 
 | case 前缀 | 负载 | 请求数 | 服务配置 |
 |---|---|---|---|
-| `55af3ef0` | 固定 512 输入 / 128 输出，xbench Poisson，每模型 0.5 req/s，600 s | 约 900 | `configs/a100_xbench_poisson.json` |
-| `279fe35b` | 同样的长度和到达率，原版 MuxServe `PoissonProcess` 生成的冻结 trace | 903（298 / 290 / 315） | `configs/a100_xbench_poisson.json` |
-| `2bdea08f` | 论文 Figure 5 点：ShareGPT，alpha 0.7，rate scale 1.0，60 s | 257（121 / 76 / 60） | `configs/a100_open_loop.json` |
+| `55af3ef0` | 固定 512 输入 / 128 输出，xbench Poisson，每模型 0.5 req/s，600 s | 约 900 | `configs/a100_xbench_poisson.toml` |
+| `279fe35b` | 同样的长度和到达率，原版 MuxServe `PoissonProcess` 生成的冻结 trace | 903（298 / 290 / 315） | `configs/a100_xbench_poisson.toml` |
+| `2bdea08f` | 论文 Figure 5 点：ShareGPT，alpha 0.7，rate scale 1.0，60 s | 257（121 / 76 / 60） | `configs/a100_open_loop.toml` |
 
 alpha 是幂律热度指数：第 i 个模型（按热度从 0 编号）到达率为
 `2.0 × rate_scale / (i + 1)^alpha`，即 2.0 / 1.2311 / 0.9269 req/s。
@@ -68,14 +68,14 @@ prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fractio
 
 | 原位置 | 服务配置 | 示例 case 前缀 |
 |---|---|---|
-| 01–06 | `configs/xbench/pair-7b-13b.json` | `e81c17dd` |
-| 07–12 | `configs/xbench/pair-7b-30b.json` | `ec7e3f29` |
-| 13–18、57–58 | `configs/xbench/pair-13b-30b.json` | `3c154150`、`21db7577`、`d6a32a09` |
-| 19–24、31–36 | `configs/xbench/isolated-7b.json` | `7609e0a1`、`8c1cf4cb` |
-| 25–30、43–48 | `configs/xbench/isolated-13b.json` | `56d67c30`、`aac946e0` |
-| 37–42、49–54 | `configs/xbench/isolated-30b.json` | `841c8993`、`6af191c5` |
-| 55 | `configs/xbench/pair-7b-30b-asymmetric-08-02.json` | `39b65602` |
-| 56 | `configs/xbench/pair-7b-30b-asymmetric-02-08.json` | `d230a248` |
+| 01–06 | `configs/xbench/pair-7b-13b.toml` | `e81c17dd` |
+| 07–12 | `configs/xbench/pair-7b-30b.toml` | `ec7e3f29` |
+| 13–18、57–58 | `configs/xbench/pair-13b-30b.toml` | `3c154150`、`21db7577`、`d6a32a09` |
+| 19–24、31–36 | `configs/xbench/isolated-7b.toml` | `7609e0a1`、`8c1cf4cb` |
+| 25–30、43–48 | `configs/xbench/isolated-13b.toml` | `56d67c30`、`aac946e0` |
+| 37–42、49–54 | `configs/xbench/isolated-30b.toml` | `841c8993`、`6af191c5` |
+| 55 | `configs/xbench/pair-7b-30b-asymmetric-08-02.toml` | `39b65602` |
+| 56 | `configs/xbench/pair-7b-30b-asymmetric-02-08.toml` | `d230a248` |
 
 ## 所有服务配置共同的条件
 
@@ -89,47 +89,71 @@ prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fractio
 
 ## 怎么跑
 
-服务器上两个仓库并排 clone，固定到要测的 commit：
+做法和 CrossPool 的 quick-start 一样：仓库 checkout，机器相关的设置放在被 git 忽略的
+本地文件里，每个终端 `export UV_ENV_FILE="$PWD/.env"`，然后 `uv sync` / `uv run`。
+
+**0. 代码（只做一次）。** 三个仓库并排放在同一个目录（下面用 `~/xb`），固定到要测的 commit：
 
 ```bash
+mkdir -p ~/xb && cd ~/xb
 git clone -b Muxserve-SGLang https://github.com/xuyue-git/MuxServe.git
 git clone https://github.com/xuyue-git/Muxserve-SGLang-Engine.git MuxServe-SGLang-Engine
+git clone https://github.com/Coekjan/CrossPool.git
+git -C CrossPool checkout 3c1f976cdd1069756314ecb7142581fad2367272
 ```
 
-目录名必须是 `MuxServe-SGLang-Engine`，且和 `MuxServe` 同级（`pyproject.toml` 按相对路径引用）。
+引擎目录名必须是 `MuxServe-SGLang-Engine`，且和 `MuxServe` 同级（`pyproject.toml` 按相对路径引用）。
+需要 uv 0.12.17 以上和 CUDA Toolkit 13.2（`nvcc`），两个项目都用 uv 管理的 Python 3.12。
 
-**1. 本机设置（只做一次）。** 在 MuxServe 仓库根目录：
-
-```bash
-cp configs/local.example.json configs/local.json
-```
-
-把 `asset_lock_dir` 改成自己的绝对锁目录，模型路径按本机实际位置修改。
-`configs/local.json` 被 git 忽略；它只接受锁目录、运行目录和模型路径，写别的字段会被拒绝，
-所以改不了实验条件。
-
-**2. 安装（只做一次）。** 需要 uv、CUDA 13.2（`nvcc`）：
+**1. MuxServe 服务端（只做一次）**，在 `~/xb/MuxServe`：
 
 ```bash
+cp .env.example .env
+cp configs/muxserve.example.toml configs/muxserve.local.toml
 uv sync
 ```
 
-**3. 启动服务**（仓库根目录，选好自己获准使用的四张卡）：
+在 `configs/muxserve.local.toml` 里填自己的绝对锁目录 `asset_lock_dir`，模型路径按本机修改；
+在 `.env` 里按自己获准使用的四张卡设 `CUDA_VISIBLE_DEVICES`。这两个文件被 git 忽略。
+本地设置文件只接受锁目录、运行目录和模型路径，写别的字段会被拒绝，所以改不了实验条件。
+`uv run muxserve config dump CONFIG` 打印加上本地设置和全部默认值之后实际生效的配置
+（对应 CrossPool 的 `uv run xpool config dump`）。
+
+**2. CrossPool 客户端（只做一次）**，在 `~/xb/CrossPool`，照它 quick-start 的做法：
 
 ```bash
-export CUDA_VISIBLE_DEVICES=1,2,3,4
-export MUXSERVE_LOCAL_CONFIG=$PWD/configs/local.json
-uv run muxserve configs/a100_xbench_poisson.json
+cp .env.example .env
+cp configs/xpool.example.toml configs/xpool.local.toml
+cp configs/xkit.example.toml configs/xkit.local.toml
+uv sync --group dev
 ```
 
-`uv run muxserve CONFIG` 就是 `python -m muxserve.launch CONFIG`。看到 ready 后，
-`curl -s http://127.0.0.1:18080/health` 应返回正常。Ctrl-C 有序关停（排空后关 MPS）。
+再把 `configs/xkit.local.toml` 里 `[xbench]` 的 `catalog` 改成本项目的目录（路径相对于这个文件）：
 
-**4. 客户端**（另一个终端，在锁定版本的 CrossPool checkout 根目录，首次 `uv sync --group dev`）：
+```toml
+[xbench]
+catalog = "../../MuxServe/benchmark/xbench/benches.toml"
+```
+
+这样客户端命令就和 CrossPool 自己的一样，不用每次写 `--catalog`。
+
+**3. 每个 case：两个终端。**
+
+终端 1，`~/xb/MuxServe`，启动 case 对应的服务配置：
 
 ```bash
-uv run xbench list --catalog /absolute/path/to/MuxServe/benchmark/xbench/benches.toml
-uv run xbench run --catalog /absolute/path/to/MuxServe/benchmark/xbench/benches.toml --case 55af3ef0
+export UV_ENV_FILE="$PWD/.env"
+uv run muxserve serve configs/a100_xbench_poisson.toml
+```
+
+看到 ready 后，`curl -s http://127.0.0.1:18080/health` 应返回正常。Ctrl-C 有序关停（排空后关 MPS）。
+
+终端 2，`~/xb/CrossPool`：
+
+```bash
+export UV_ENV_FILE="$PWD/.env"
+uv run xbench list
+uv run xbench run --case 55af3ef0
 uv run xbench report RUN_ID
 ```
 
@@ -140,8 +164,8 @@ uv run xbench report RUN_ID
 - 每个 case 用它对应的服务配置；换配置前先 Ctrl-C 停掉旧服务。不要用 `--all`。
 - client 模式不会自动重启服务。要比较的多轮之间重启服务，避免 ADBS 历史、缓存、CUDA Graph 带到下一轮。
 - 性能实验不开 `MXS_TRACE_DIR` / `PROFILE`。
-- xbench 不能装进 MuxServe 的环境：它依赖 PyPI 上的原版 `sglang==0.5.20` 和 CrossPool 的 `xpool`，
-  会覆盖本项目打过补丁的 SGLang。两个环境分开。
+- xbench 留在 CrossPool 自己的环境里，不装进 MuxServe 的环境，原因见
+  `docs/crosspool-alignment.md`。
 
 ## 输入文件
 
@@ -149,7 +173,7 @@ uv run xbench report RUN_ID
 uv run python benchmark/xbench/make_inputs.py --sharegpt-bundle /path/to/open-a07s1.json
 ```
 
-固定 prompt 来自 `benchmark/paired/frozen-synthetic-512-128.json`；固定 trace 来自原版
+固定 prompt 来自 `benchmark/paired/frozen-synthetic-512-128.toml`；固定 trace 来自原版
 `PoissonProcess`，7B/13B/30B 分别用 seed 0/1/2；ShareGPT 输入来自冻结 bundle
 `959024cce558`（source trace `d1d735cc3909`，原版 `sample_requests`，llama-7b tokenizer，seed 42）。
 重新生成的文件逐字节相同。

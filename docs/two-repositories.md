@@ -26,8 +26,8 @@ python tools/bootstrap_source.py
 python -m pip install --config-settings editable_mode=compat -e ../MuxServe-SGLang-Engine
 python -m pip install -r requirements.txt
 python -m pip install --no-build-isolation --config-settings editable_mode=compat -e .
-python -m muxserve.preflight configs/sglang_a100.json
-python -m muxserve.launch configs/sglang_a100.json
+python -m muxserve.preflight configs/sglang_a100.toml
+python -m muxserve.launch configs/sglang_a100.toml
 ```
 
 引擎显式声明 0.5.20，不再靠尚不存在的 Git tag 推导版本。

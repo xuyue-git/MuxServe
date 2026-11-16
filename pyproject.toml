@@ -10,7 +10,7 @@ description = "Flexible spatial-temporal multiplexing for multiple LLM serving, 
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [{ name = "MuxServe Team" }]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     # The pinned SGLang fork, from the sibling engine repository (tool.uv.sources).
     "sglang==0.5.20",
@@ -27,19 +27,22 @@ dependencies = [
 ]
 
 [project.scripts]
-# uv run muxserve CONFIG.json   is   python -m muxserve.launch CONFIG.json
-muxserve = "muxserve.launch:main"
+# uv run muxserve serve CONFIG.toml   (python -m muxserve.launch CONFIG.toml)
+# uv run muxserve config dump CONFIG.toml
+muxserve = "muxserve.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["muxserve", "muxserve.*"]
 
 [tool.uv]
-required-version = ">=0.11"
+required-version = ">=0.12.17"
 environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # Editable installs as plain path entries: preflight accepts only filesystem
 # imports, and the SGLang fork's hooks import muxserve from this checkout.
 config-settings = { editable_mode = "compat" }
-python-preference = "managed"
+# Same interpreter policy as CrossPool: a uv-managed Python 3.12.
+python-preference = "only-managed"
+python-downloads = "automatic"
 
 [tool.uv.sources]
 sglang = { path = "../MuxServe-SGLang-Engine", editable = true }

@@ -15,19 +15,20 @@ module inside the `muxserve` package (see [docs/MIGRATION.md](docs/MIGRATION.md)
 
 ```text
 muxserve/
-  launch.py        python -m muxserve.launch CONFIG: private MPS, weight owners,
+  cli.py           uv run muxserve serve CONFIG.toml | config dump CONFIG.toml
+  launch.py        the launcher behind `serve`: private MPS, weight owners,
                    per-model prefill/decode ranks, owner RPC, HTTP gateway
   config.py        DeploymentConfig (what launch runs) and the placement configs
   muxsched/        scheduling: controller (request/batch lifecycle, decode runs),
                    policy (ADBS: quotas, 8 s re-sizing, SM credits), driver,
                    events, placement optimizer, SM accounting, workload generator
   flexstore/       unified memory: Head-wise KV store, CUDA storage, shared model
-                   weights (one owner process per model), owner RPC
+                   weights (one owner process per model and GPU), owner RPC
   flexserver/      execution on SGLang: rank runtime, Head-wise attention and
                    memory pool, P/D handoff, hooks used by the patched SGLang
   gateway.py       native-SGLang /generate SSE gateway (gateway_proc.py: child process)
 csrc/headwise/     Head-wise CUDA kernels, built as muxserve._headwise
-configs/           deployment configs
+configs/           deployment configs (TOML), ablation steps, local settings template
 upstream-reference/ separate-engine identity pin and the 13 recorded patch hashes
 tools/             verify the separate engine, preflight locks, perf runs, CPU checks
 acceptance/        CPU checks (storage, control, transport, simulated 24-rank e2e)
@@ -57,11 +58,13 @@ The environment contains SGLang and no vLLM.
    ../MuxServe-SGLang-Engine`, `pip install -r requirements.txt`, then
    `pip install --no-build-isolation --config-settings editable_mode=compat -e .`.)
 4. Machine-local settings stay out of the deployment configs, as CrossPool keeps
-   them in `xpool.local.toml`: `cp configs/local.example.json configs/local.json`
-   (git-ignored), set your personal `asset_lock_dir` and model paths, and
-   `export MUXSERVE_LOCAL_CONFIG=$PWD/configs/local.json`. The local file accepts
-   only those paths, so it cannot change an experimental condition.
-5. Lock the assets: `uv run python tools/lock_assets.py configs/sglang_a100.json`.
+   them in `configs/xpool.local.toml` and `.env`:
+   `cp .env.example .env && cp configs/muxserve.example.toml configs/muxserve.local.toml`
+   (both git-ignored), set your personal `asset_lock_dir`, model paths and GPUs, and
+   `export UV_ENV_FILE="$PWD/.env"` in every terminal. The local settings file accepts
+   only those paths, so it cannot change an experimental condition;
+   `uv run muxserve config dump CONFIG` prints the effective deployment.
+5. Lock the assets: `uv run python tools/lock_assets.py configs/sglang_a100.toml`.
 
 The server imports the installed `sglang` package normally. No source-path
 injection or embedded engine fallback is used. The engine is maintained as
@@ -71,13 +74,12 @@ locked by `upstream-reference/engine-repository.json`.
 ## Launch
 
 ```bash
-export CUDA_VISIBLE_DEVICES=1,2,3,4
-export MUXSERVE_LOCAL_CONFIG=$PWD/configs/local.json
-uv run python -m muxserve.preflight configs/sglang_a100.json
-uv run muxserve configs/sglang_a100.json
+export UV_ENV_FILE="$PWD/.env"
+uv run python -m muxserve.preflight configs/sglang_a100.toml
+uv run muxserve serve configs/sglang_a100.toml
 ```
 
-`uv run muxserve CONFIG` is `python -m muxserve.launch CONFIG`. KV pools are sized
+`uv run muxserve serve CONFIG` is `python -m muxserve.launch CONFIG`. KV pools are sized
 as original MuxServe sizes them: `kv_memory_fraction` x the GPU memory torch reports
 (0.05061 gives 2 GiB per GPU on the A100s used here; the launcher prints `KV_POOL`).
 

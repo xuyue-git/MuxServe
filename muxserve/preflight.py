@@ -410,9 +410,9 @@ def inspect_gpus(tp_size: int) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config", help="Frozen deployment JSON")
+    parser.add_argument("config", help="Frozen deployment TOML")
     parser.add_argument("--local-config", default=os.environ.get("MUXSERVE_LOCAL_CONFIG") or None,
-                        help="machine-local settings JSON (default: $MUXSERVE_LOCAL_CONFIG)")
+                        help="machine-local settings TOML (default: $MUXSERVE_LOCAL_CONFIG)")
     args = parser.parse_args()
     config = load_config(args.config, local=args.local_config)
     software = inspect_software()
