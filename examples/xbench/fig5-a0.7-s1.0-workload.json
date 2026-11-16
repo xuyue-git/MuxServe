@@ -1,0 +1,13 @@
+{
+  "arrivals": [],
+  "requests": [],
+  "info": {
+    "alpha": 0.7,
+    "rate_scale": 1.0,
+    "duration": 60,
+    "distribution": "poisson",
+    "dataset": "ShareGPT_V3_unfiltered_cleaned_split.json",
+    "rates": [["llama-13b", 1.2311444133449163], ["llama-30b", 0.9269261135439395], ["llama-7b", 2.0]],
+    "note": "ADBS inputs only (rates, as the earlier original Figure 5 run declared them). With --http-port, requests come from xbench case 2bdea08f, not from this file."
+  }
+}

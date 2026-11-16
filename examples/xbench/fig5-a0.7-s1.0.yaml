@@ -1,0 +1,38 @@
+# Original MuxServe for the xbench case 2bdea08f (paper Figure 5 point:
+# ShareGPT, alpha 0.7, rate scale 1.0, 60 s, 257 requests), served over HTTP.
+# Same settings as the earlier original Figure 5 run on these A100s, with the KV
+# fraction that gives exactly 2 GiB per GPU there (torch total memory
+# 42,436,526,080 bytes), as MuxServe-SGLang uses.
+#
+# From the repository root (see examples/xbench/README.md for the full commands):
+#   python -m muxserve.launch --nproc_per_node 4 examples/xbench/fig5-a0.7-s1.0.yaml \
+#     --workload-file examples/xbench/fig5-a0.7-s1.0-workload.json --mps-dir $MPS \
+#     --schedule-approach adbs --max-num-batched-tokens 2048 --http-port 18080
+num_gpus: 4
+max_num_seqs: 16
+overload_threshold: 3
+gpu_memory_utilization: 0.05061
+workloads:
+  workload_file: null
+models:
+  - name: llama-7b
+    model: /storage/crosspool-models/huggyllama/llama-7b
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    placement: [[0, 1, 2, 3]]
+    mps_percentage: [100, 40]
+    model_dtype: fp16
+  - name: llama-13b
+    model: /storage/crosspool-models/huggyllama/llama-13b
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    placement: [[0, 1, 2, 3]]
+    mps_percentage: [100, 40]
+    model_dtype: fp16
+  - name: llama-30b
+    model: /storage/crosspool-models/huggyllama/llama-30b
+    tensor_parallel_size: 4
+    pipeline_parallel_size: 1
+    placement: [[0, 1, 2, 3]]
+    mps_percentage: [100, 40]
+    model_dtype: fp16
