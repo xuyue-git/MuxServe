@@ -1,10 +1,9 @@
 # 两仓库目录与安装
 
 主仓库保留 MuxServe 调度、FlexStore、flexserver 集成、网关和 xbench。
-旁边的 `MuxServe-SGLang-Engine` 对应原 `MuxServe-vLLM` 的引擎角色，仅有六个业务目录：
+旁边的 `MuxServe-SGLang-Engine` 对应原 `MuxServe-vLLM` 的引擎角色，只有五个业务目录（没有被实验用到的 benchmark 入口已删除；压测用主仓库的 xbench 配置）：
 
 ```text
-benchmarks/   扁平 Python 基准入口；调用原生 SGLang CLI，参数不二次封装
 csrc/         Rust 与 protobuf 构建源
 docs/        引擎接口说明
 examples/     上游离线、异步和服务代码示例

@@ -6,7 +6,7 @@
   "archive_sha256": "fcd78d64bcac43c5f31b0a99d7078540858b9c2f5c6782a484e3890c4dc07ae6",
   "local_git_state": "initialized_from_verified_archive; no authored commit or imported upstream history",
   "integration_files_sha256": {},
-  "layout": "six-directory-llm-engine",
+  "layout": "five-directory-llm-engine",
   "source_projection": {
     "prefixes": {
       "python/sglang/": "sglang/",
@@ -43,7 +43,7 @@
     ],
     "overrides_sha256": {
       "MANIFEST.in": "824fabfcb79f9a093186e1ace8585828f3c669616d6ec219b8079a8c782df97e",
-      "README.md": "bfa8d574d6ba48d322ebbb0573b7d03057c9dda93d8a9b1d9a21094ea1449f7e",
+      "README.md": "32d545680c9fd79f353440de258a39abb9e1310cba1f48426261e791ba71fece",
       "pyproject.toml": "983cc68491960d4bcae6aba65f681ff125edff24f69a32f69690b7719617f3ce",
       "setup.py": "7251cf8d96ac22c9fc290068a11f48eb90af584e9efd2b61a844c6d35b62e0cb",
       "sglang/cli/main.py": "c1f2ceb1872632678556d6d23ef9c73ff67e112a2c58942a1c42e64397f7481d",
@@ -67,10 +67,6 @@
       "sglang/version.py": "c4ca8aa9583670ac3298ac86463afc8be40d9f478ec6f4d477b5c10f30717419"
     },
     "additional_files_sha256": {
-      "benchmarks/bench_offline_throughput.py": "fbfb8f6e111dd32413d6624da5c55c7ce1b120d1716a7684002e50d0e864fc13",
-      "benchmarks/bench_one_batch.py": "9877c656e11ee27e4f6228443889b2562028c5380a16e879e6368cb674dbc0a9",
-      "benchmarks/bench_one_batch_server.py": "f26b486f16bfb04521f99c9a51da3ed10105ca5e55e6039c198ad669b633b051",
-      "benchmarks/bench_serving.py": "047d919e2472bea59a91c9b745c84e9c38019214b57313dbb2d7b95318474996",
       "docs/README.md": "71aa1429387bf1193d643739e7c11b45d6a96117389441653ac759a7fa63ba45"
     }
   }

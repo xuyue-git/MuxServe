@@ -18,10 +18,9 @@ from muxserve.config import read_config_file  # noqa: E402
 
 
 class EngineLayoutTests(unittest.TestCase):
-    def test_six_functional_directories_and_flat_benchmark_entries(self):
+    def test_functional_directories_only(self):
         actual = {p.name for p in ENGINE.iterdir() if p.is_dir() and not p.name.startswith('.')}
-        self.assertEqual(actual, {'benchmarks', 'csrc', 'docs', 'examples', 'tests', 'sglang'})
-        self.assertFalse(any(p.is_dir() for p in (ENGINE / 'benchmarks').iterdir()))
+        self.assertEqual(actual, {'csrc', 'docs', 'examples', 'tests', 'sglang'})
         self.assertTrue((ENGINE / 'sglang/srt/managers/scheduler.py').is_file())
 
     def test_package_identity_and_native_source_distribution(self):
