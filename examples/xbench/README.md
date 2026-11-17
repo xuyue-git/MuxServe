@@ -6,8 +6,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `fig5-a0.7-s1.0.yaml` | 原版模型配置：三个 LLaMA 模型、TP4、MPS 100/40、`max_num_seqs` 16、KV 每卡 2 GiB（0.05061）。所有负载点共用 |
-| `fig5-a0.7-s1.0-workload.json` | 旧写法：只给 ADBS 提供 alpha 0.7 / rate scale 1.0 的到达率。改用 `--alpha`、`--rate-scale` 后不再需要 |
+| `fig5-a0.7-s1.0.yaml` | 原版模型配置：三个 LLaMA 模型、TP4、MPS 100/40、`max_num_seqs` 16、KV 每卡 2 GiB（0.05061）。所有负载点共用，负载点由启动命令的 `--alpha`、`--rate-scale` 决定 |
 
 请求由 xbench 发来：MuxServe-SGLang 仓库 `benchmark/xbench/benches.toml` 里的用例
 （alpha 0.7 / 1.0 是 `2bdea08f`，其余 Figure 5 网格的点见那份 README）。两边用同一个用例、同一个 xbench 客户端。
@@ -18,8 +17,8 @@
 （`benchmark/end_to_end/bench_end_to_end_muxserve.py` 的 `get_real_rate` × `gen_power_law_dis`）算出
 `--base-rate × S / (排名 + 1)^A`，排名按 yaml 里 `models` 的顺序；把结果写进
 `/tmp/mxo-$USER-load/workload-a<A>-s<S>-b<base>.json`，再按原来的方式交给原版（文件里只有到达率，没有请求）。
-`--alpha` 和 `--workload-file` 只能二选一。alpha 0.7 / rate scale 1.0 算出的到达率和
-`fig5-a0.7-s1.0-workload.json` 里的完全相同。
+`--alpha` 和 `--workload-file` 只能二选一。alpha 0.7 / rate scale 1.0 时三个到达率是
+2.0 / 1.2311 / 0.9269 req/s，与之前 Figure 5 那次原版运行的完全相同。
 
 ## 启动（在本仓库根目录，用原版自己的 Python 3.9 / CUDA 11.8 环境）
 
