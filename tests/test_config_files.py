@@ -1,5 +1,5 @@
 """Deployment and local settings files: TOML form, local overlay, `muxserve config dump`."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
@@ -46,6 +46,26 @@ class ConfigFileTests(unittest.TestCase):
         self.assertEqual(dumped["kv_memory_fraction"], 0.05061)
         self.assertEqual(dumped["rpc_persistent_connections"], True)  # defaults are shown
         self.assertEqual([model["model_id"] for model in dumped["models"]], ["llama7b", "llama13b", "llama30b"])
+
+    def test_load_point_options_set_the_power_law_rates(self):
+        path = ROOT / "configs/a100_open_loop.toml"
+        from_file = load_config(path, require_assets=False)
+        # alpha 0.7 / scale 1.0 is the file's own point: same rates, same fingerprint.
+        same = load_config(path, require_assets=False, arrival=(0.7, 1.0, 2.0))
+        self.assertEqual(same.policy_arrival_rates, from_file.policy_arrival_rates)
+        self.assertEqual(same.fingerprint, from_file.fingerprint)
+        other = dict(load_config(path, require_assets=False, arrival=(2.1, 2.0, 2.0)).policy_arrival_rates)
+        self.assertEqual(other["llama7b"], 4.0)
+        self.assertAlmostEqual(other["llama13b"], 4.0 / 2 ** 2.1)
+        self.assertAlmostEqual(other["llama30b"], 4.0 / 3 ** 2.1)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli(["config", "dump", str(path), "--alpha", "2.1", "--rate-scale", "2.0"])
+        self.assertIn("load point:     alpha 2.1, rate scale 2, base rate 2 req/s", out.getvalue())
+        self.assertEqual(dict(tomllib.loads(out.getvalue())["policy_arrival_rates"]), other)
+        with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()):
+            cli(["config", "dump", str(path), "--alpha", "2.1"])
 
 
 if __name__ == "__main__":

@@ -2,8 +2,9 @@
 # MIT License: see CROSSPOOL-LICENSE.
 # MuxServe multi-model serving catalogue, following CrossPool's full case structure.
 # Source: Coekjan/CrossPool@0d3267edecfbe67459c1e9edc62ee73ff1f1a63f, benches/benches.toml (MIT).
-# 61 active workload declarations: 3 three-model cases on the default 7B/13B/30B
-# deployment first, then CrossPool's 58 pair/isolated declarations. CrossPool's
+# 80 active workload declarations: 3 three-model cases on the default 7B/13B/30B
+# deployment first, then CrossPool's 58 pair/isolated declarations, then the other
+# 19 points of the paper's Figure 5 grid (written by make_inputs.py --fig5). CrossPool's
 # final 3 topology declarations are in pending-topologies.toml and cannot run.
 # Models/endpoints/native server configs are MuxServe-specific. Source UUIDs below
 # identify the reference only; each migrated condition has its own UUIDv4.
@@ -1544,3 +1545,673 @@ base_url = "http://127.0.0.1:18080/models/llama30b"
 model_metadata_path = "/storage/crosspool-models/huggyllama/llama-30b"
 output_tokens = { kind = "lognormal", median_fraction = 0.0625, sigma = 1.0, max_output_input_ratio = 2.0 }
 prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+
+# --- Figure 5 grid: written by make_inputs.py --fig5; regenerate, do not edit by hand ---
+# Serve each point with: muxserve serve CONFIG --alpha A --rate-scale S (original: the same
+# two options on muxserve.launch). The alpha 0.7 / scale 1.0 point is case 2bdea08f above.
+
+[serving_cases.e9867899-5e46-4aeb-ab91-b4437da52680]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 0.7 rate scale 1.5: ShareGPT prompts, power-law Poisson trace, 60 s, 382 requests. Serve with --alpha 0.7 --rate-scale 1.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.e9867899-5e46-4aeb-ab91-b4437da52680.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a0.7-s1.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.e9867899-5e46-4aeb-ab91-b4437da52680.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.7-s1.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.e9867899-5e46-4aeb-ab91-b4437da52680.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.7-s1.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.e9867899-5e46-4aeb-ab91-b4437da52680.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.7-s1.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.401a4222-ac91-4ed9-8803-86c80dc86048]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 0.7 rate scale 2.0: ShareGPT prompts, power-law Poisson trace, 60 s, 499 requests. Serve with --alpha 0.7 --rate-scale 2.0."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.401a4222-ac91-4ed9-8803-86c80dc86048.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a0.7-s2.0/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.401a4222-ac91-4ed9-8803-86c80dc86048.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.7-s2.0/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.401a4222-ac91-4ed9-8803-86c80dc86048.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.7-s2.0/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.401a4222-ac91-4ed9-8803-86c80dc86048.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.7-s2.0/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.7c29c076-d852-491e-a847-b0f790038dcf]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 0.7 rate scale 2.5: ShareGPT prompts, power-law Poisson trace, 60 s, 618 requests. Serve with --alpha 0.7 --rate-scale 2.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.7c29c076-d852-491e-a847-b0f790038dcf.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a0.7-s2.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.7c29c076-d852-491e-a847-b0f790038dcf.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.7-s2.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.7c29c076-d852-491e-a847-b0f790038dcf.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.7-s2.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.7c29c076-d852-491e-a847-b0f790038dcf.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.7-s2.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.5883efb6-dabc-4cfa-b66f-e2f7402d0d13]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 0.9 rate scale 1.0: ShareGPT prompts, power-law Poisson trace, 60 s, 232 requests. Serve with --alpha 0.9 --rate-scale 1.0."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.5883efb6-dabc-4cfa-b66f-e2f7402d0d13.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a0.9-s1.0/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.5883efb6-dabc-4cfa-b66f-e2f7402d0d13.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s1.0/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.5883efb6-dabc-4cfa-b66f-e2f7402d0d13.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s1.0/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.5883efb6-dabc-4cfa-b66f-e2f7402d0d13.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s1.0/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.993fb53d-5552-4d10-b66a-720afb6c91fa]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 0.9 rate scale 1.5: ShareGPT prompts, power-law Poisson trace, 60 s, 359 requests. Serve with --alpha 0.9 --rate-scale 1.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.993fb53d-5552-4d10-b66a-720afb6c91fa.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a0.9-s1.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.993fb53d-5552-4d10-b66a-720afb6c91fa.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s1.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.993fb53d-5552-4d10-b66a-720afb6c91fa.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s1.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.993fb53d-5552-4d10-b66a-720afb6c91fa.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s1.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.10f8e6ce-3644-4353-8d97-428adc2c7217]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 0.9 rate scale 2.0: ShareGPT prompts, power-law Poisson trace, 60 s, 487 requests. Serve with --alpha 0.9 --rate-scale 2.0."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.10f8e6ce-3644-4353-8d97-428adc2c7217.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a0.9-s2.0/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.10f8e6ce-3644-4353-8d97-428adc2c7217.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s2.0/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.10f8e6ce-3644-4353-8d97-428adc2c7217.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s2.0/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.10f8e6ce-3644-4353-8d97-428adc2c7217.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s2.0/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.ed945f2f-a17b-437c-bd67-82ac163783f0]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 0.9 rate scale 2.5: ShareGPT prompts, power-law Poisson trace, 60 s, 604 requests. Serve with --alpha 0.9 --rate-scale 2.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.ed945f2f-a17b-437c-bd67-82ac163783f0.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a0.9-s2.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.ed945f2f-a17b-437c-bd67-82ac163783f0.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s2.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.ed945f2f-a17b-437c-bd67-82ac163783f0.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s2.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.ed945f2f-a17b-437c-bd67-82ac163783f0.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a0.9-s2.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.a8559a20-a801-4f25-a501-47665cb2de63]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 1.3 rate scale 1.0: ShareGPT prompts, power-law Poisson trace, 60 s, 191 requests. Serve with --alpha 1.3 --rate-scale 1.0."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.a8559a20-a801-4f25-a501-47665cb2de63.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a1.3-s1.0/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.a8559a20-a801-4f25-a501-47665cb2de63.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s1.0/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.a8559a20-a801-4f25-a501-47665cb2de63.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s1.0/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.a8559a20-a801-4f25-a501-47665cb2de63.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s1.0/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.d0d084ea-f383-4b32-92cd-5b985efa9155]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 1.3 rate scale 1.5: ShareGPT prompts, power-law Poisson trace, 60 s, 282 requests. Serve with --alpha 1.3 --rate-scale 1.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.d0d084ea-f383-4b32-92cd-5b985efa9155.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a1.3-s1.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.d0d084ea-f383-4b32-92cd-5b985efa9155.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s1.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.d0d084ea-f383-4b32-92cd-5b985efa9155.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s1.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.d0d084ea-f383-4b32-92cd-5b985efa9155.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s1.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.d20de0c3-03d4-4b78-88ac-c0daba54de5f]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 1.3 rate scale 2.0: ShareGPT prompts, power-law Poisson trace, 60 s, 390 requests. Serve with --alpha 1.3 --rate-scale 2.0."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.d20de0c3-03d4-4b78-88ac-c0daba54de5f.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a1.3-s2.0/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.d20de0c3-03d4-4b78-88ac-c0daba54de5f.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s2.0/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.d20de0c3-03d4-4b78-88ac-c0daba54de5f.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s2.0/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.d20de0c3-03d4-4b78-88ac-c0daba54de5f.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s2.0/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.d5c232a4-d531-4151-ae64-1f7eff9d3c4d]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 1.3 rate scale 2.5: ShareGPT prompts, power-law Poisson trace, 60 s, 491 requests. Serve with --alpha 1.3 --rate-scale 2.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.d5c232a4-d531-4151-ae64-1f7eff9d3c4d.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a1.3-s2.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.d5c232a4-d531-4151-ae64-1f7eff9d3c4d.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s2.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.d5c232a4-d531-4151-ae64-1f7eff9d3c4d.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s2.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.d5c232a4-d531-4151-ae64-1f7eff9d3c4d.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.3-s2.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.1a5a552f-bbe6-435f-9f38-e531c11a10b7]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 1.7 rate scale 1.0: ShareGPT prompts, power-law Poisson trace, 60 s, 174 requests. Serve with --alpha 1.7 --rate-scale 1.0."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.1a5a552f-bbe6-435f-9f38-e531c11a10b7.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a1.7-s1.0/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.1a5a552f-bbe6-435f-9f38-e531c11a10b7.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s1.0/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.1a5a552f-bbe6-435f-9f38-e531c11a10b7.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s1.0/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.1a5a552f-bbe6-435f-9f38-e531c11a10b7.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s1.0/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.f55bb9a1-46a5-4b79-be87-5469aa032b37]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 1.7 rate scale 1.5: ShareGPT prompts, power-law Poisson trace, 60 s, 263 requests. Serve with --alpha 1.7 --rate-scale 1.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.f55bb9a1-46a5-4b79-be87-5469aa032b37.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a1.7-s1.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.f55bb9a1-46a5-4b79-be87-5469aa032b37.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s1.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.f55bb9a1-46a5-4b79-be87-5469aa032b37.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s1.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.f55bb9a1-46a5-4b79-be87-5469aa032b37.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s1.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.35866028-002c-4b98-aac5-8bcfaecb5413]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 1.7 rate scale 2.0: ShareGPT prompts, power-law Poisson trace, 60 s, 357 requests. Serve with --alpha 1.7 --rate-scale 2.0."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.35866028-002c-4b98-aac5-8bcfaecb5413.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a1.7-s2.0/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.35866028-002c-4b98-aac5-8bcfaecb5413.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s2.0/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.35866028-002c-4b98-aac5-8bcfaecb5413.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s2.0/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.35866028-002c-4b98-aac5-8bcfaecb5413.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s2.0/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.bde94b52-4321-4458-844f-fbf0d3e328fe]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 1.7 rate scale 2.5: ShareGPT prompts, power-law Poisson trace, 60 s, 442 requests. Serve with --alpha 1.7 --rate-scale 2.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.bde94b52-4321-4458-844f-fbf0d3e328fe.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a1.7-s2.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.bde94b52-4321-4458-844f-fbf0d3e328fe.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s2.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.bde94b52-4321-4458-844f-fbf0d3e328fe.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s2.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.bde94b52-4321-4458-844f-fbf0d3e328fe.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a1.7-s2.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.115748fe-a96e-47e8-a124-d38adc3e21ec]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 2.1 rate scale 1.0: ShareGPT prompts, power-law Poisson trace, 60 s, 161 requests. Serve with --alpha 2.1 --rate-scale 1.0."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.115748fe-a96e-47e8-a124-d38adc3e21ec.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a2.1-s1.0/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.115748fe-a96e-47e8-a124-d38adc3e21ec.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s1.0/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.115748fe-a96e-47e8-a124-d38adc3e21ec.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s1.0/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.115748fe-a96e-47e8-a124-d38adc3e21ec.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s1.0/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.ec9f5989-099a-4f54-987f-3b43d979c894]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 2.1 rate scale 1.5: ShareGPT prompts, power-law Poisson trace, 60 s, 247 requests. Serve with --alpha 2.1 --rate-scale 1.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.ec9f5989-099a-4f54-987f-3b43d979c894.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a2.1-s1.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.ec9f5989-099a-4f54-987f-3b43d979c894.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s1.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.ec9f5989-099a-4f54-987f-3b43d979c894.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s1.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.ec9f5989-099a-4f54-987f-3b43d979c894.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s1.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.b85f7ab5-8a68-4d91-b06a-e07b9ced630d]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 2.1 rate scale 2.0: ShareGPT prompts, power-law Poisson trace, 60 s, 314 requests. Serve with --alpha 2.1 --rate-scale 2.0."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.b85f7ab5-8a68-4d91-b06a-e07b9ced630d.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a2.1-s2.0/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.b85f7ab5-8a68-4d91-b06a-e07b9ced630d.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s2.0/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.b85f7ab5-8a68-4d91-b06a-e07b9ced630d.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s2.0/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.b85f7ab5-8a68-4d91-b06a-e07b9ced630d.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s2.0/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[serving_cases.3c884f3d-3ba0-46b2-b7ce-09c559e5789f]
+description = "MuxServe-SGLang, 3 LLaMA models, paper Figure 5 point alpha 2.1 rate scale 2.5: ShareGPT prompts, power-law Poisson trace, 60 s, 386 requests. Serve with --alpha 2.1 --rate-scale 2.5."
+module = "serving.multi_model"
+mode = "client"
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.3c884f3d-3ba0-46b2-b7ce-09c559e5789f.arrivals]
+kind = "jsonl"
+path = "inputs/fig5-a2.1-s2.5/trace.jsonl"
+duration_seconds = 60.0
+
+[[serving_cases.3c884f3d-3ba0-46b2-b7ce-09c559e5789f.targets]]
+model_id = "huggyllama/llama-7b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama7b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s2.5/prompts-llama-7b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.3c884f3d-3ba0-46b2-b7ce-09c559e5789f.targets]]
+model_id = "huggyllama/llama-13b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama13b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s2.5/prompts-llama-13b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+
+[[serving_cases.3c884f3d-3ba0-46b2-b7ce-09c559e5789f.targets]]
+model_id = "huggyllama/llama-30b"
+api = "sglang"
+base_url = "http://127.0.0.1:18080/models/llama30b"
+prompts = { kind = "jsonl", path = "inputs/fig5-a2.1-s2.5/prompts-llama-30b.jsonl" }
+sampling = { temperature = 0.0, stream_interval = 1, ignore_eos = true }
+# --- end of the Figure 5 grid ---

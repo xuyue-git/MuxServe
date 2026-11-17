@@ -4,6 +4,10 @@
     muxserve config dump CONFIG.toml  print the effective deployment: the file with
                                       the local settings applied and every default
 
+Both take an optional load point, --alpha A --rate-scale S [--base-rate R], which sets
+ADBS's arrival rates to R x S / (rank + 1) ** A (Figure 5's power law) instead of the
+file's policy_arrival_rates.
+
 Both read the local settings file from --local-config or $MUXSERVE_LOCAL_CONFIG
 (set in .env, loaded by ``export UV_ENV_FILE=$PWD/.env``).
 """
@@ -28,12 +32,15 @@ def _without_none(value):
     return value
 
 
-def _dump(args: argparse.Namespace) -> int:
+def _dump(args: argparse.Namespace, arrival) -> int:
     from muxserve.config import config_to_toml, load_config
-    config = load_config(args.config, require_assets=False, local=args.local_config)
+    config = load_config(args.config, require_assets=False, local=args.local_config, arrival=arrival)
+    load = "(from the file)" if arrival is None else \
+        f"alpha {arrival[0]:g}, rate scale {arrival[1]:g}, base rate {arrival[2]:g} req/s"
     header = (f"Effective deployment (defaults included)\n"
               f"deployment:     {args.config}\n"
               f"local settings: {args.local_config or '(none)'}\n"
+              f"load point:     {load}\n"
               f"fingerprint:    {config.fingerprint}")
     sys.stdout.write(config_to_toml(_without_none(asdict(config)), header))
     return 0
@@ -55,8 +62,10 @@ def main(argv: list[str] | None = None) -> int:
     dump = config_commands.add_parser("dump", help="print the effective deployment")
     dump.add_argument("config", help="deployment TOML")
     _local_option(dump)
+    from muxserve.config import add_arrival_options, arrival_from_args
+    add_arrival_options(dump)
     args = parser.parse_args(argv)
-    return _dump(args)
+    return _dump(args, arrival_from_args(dump, args))
 
 
 if __name__ == "__main__":

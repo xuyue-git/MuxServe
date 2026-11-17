@@ -89,6 +89,21 @@ The launcher starts a private MPS controller. The gateway serves `/health` and
 `POST /models/<model_id>/generate` (native SGLang request and SSE stream format)
 on the configured `controller_port`.
 
+`--alpha A --rate-scale S [--base-rate R]` sets ADBS's per-model arrival rates to the
+paper's Figure 5 power law, `R x S / (rank + 1) ** A` (rank = order of `[[models]]`,
+R = 2.0 by default), instead of the file's `policy_arrival_rates`, so one deployment
+file serves every Figure 5 point. `uv run muxserve config dump CONFIG --alpha A --rate-scale S`
+shows the result.
+
+Stop it by sending SIGINT to the launcher alone, from another terminal:
+`pkill -INT -u $USER -f '\.venv/bin/muxserve serve CONFIG'`. It drains, stops its
+processes and its MPS. Ctrl-C in its own terminal signals the whole process group, the
+children exit first, and the launcher then keeps the GPU processes in `PROTECTED_FAILURE`.
+
+If the build machine has no Rust toolchain, run `uv sync` (and later `uv` commands here)
+with `SGLANG_BUILD_RUST_EXTS=none`: SGLang's Rust extensions (gRPC, multimodal, Rust HTTP
+server, Rust radix tree) are not used by this project.
+
 ## Benchmarks
 
 - [`benchmark/xbench/`](benchmark/xbench/README.md): the standard benchmark. A

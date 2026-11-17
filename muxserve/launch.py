@@ -17,7 +17,8 @@ import tempfile
 from threading import Event, Thread
 import time
 
-from muxserve.config import kv_bytes_from_fraction, load_config, read_asset_path, safe_path
+from muxserve.config import (add_arrival_options, arrival_from_args, kv_bytes_from_fraction, load_config,
+                             read_asset_path, safe_path)
 from muxserve.contracts import IntegrationError
 
 logger = logging.getLogger(__name__)
@@ -194,13 +195,17 @@ def _write_json(path, value):
 
 
 class Supervisor:
-    def __init__(self, config_path, *, startup_timeout=1800, manual_control=False, local_config=None):
+    def __init__(self, config_path, *, startup_timeout=1800, manual_control=False, local_config=None,
+                 arrival=None):
         if os.name != "posix" or not 0 < startup_timeout <= 7200:
             raise IntegrationError("DEPLOYMENT_PLATFORM", "Use Linux and a bounded startup timeout")
         from muxserve.preflight import inspect_assets, inspect_gpus, inspect_software
-        config = load_config(config_path, local=local_config)
+        config = load_config(config_path, local=local_config, arrival=arrival)
         if local_config is not None:
             print(f"Local settings: {local_config}", flush=True)
+        if arrival is not None:
+            print("ARRIVAL " + json.dumps({"alpha": arrival[0], "rate_scale": arrival[1], "base_rate": arrival[2],
+                                           "rates": dict(config.policy_arrival_rates)}), flush=True)
         software = inspect_software()
         assets = inspect_assets(config)
         cards = inspect_gpus(config.tp_size)
@@ -676,10 +681,12 @@ def main(argv=None):
                              "(default: $MUXSERVE_LOCAL_CONFIG)")
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--manual-control", action="store_true")
+    add_arrival_options(parser)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     Supervisor(args.config, startup_timeout=args.startup_timeout,
-               manual_control=args.manual_control, local_config=args.local_config).run()
+               manual_control=args.manual_control, local_config=args.local_config,
+               arrival=arrival_from_args(parser, args)).run()
 
 
 if __name__ == "__main__":

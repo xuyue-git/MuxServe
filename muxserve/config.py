@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -496,12 +497,48 @@ def apply_local_settings(raw: dict, local: dict) -> dict:
     return merged
 
 
+DEFAULT_BASE_RATE = 2.0  # req/s of the most popular model at rate scale 1 (Figure 5 traces)
+
+
+def power_law_rates(model_ids, alpha: float, rate_scale: float,
+                    base_rate: float = DEFAULT_BASE_RATE) -> list[list]:
+    """The paper's Figure 5 arrival rates (benchmark/end_to_end/bench_end_to_end_muxserve.py:
+    get_real_rate x gen_power_law_dis): the model at popularity rank r (0 = most popular,
+    the order of [[models]]) gets base_rate x rate_scale / (r + 1) ** alpha req/s."""
+    values = (alpha, rate_scale, base_rate)
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0 for value in values):
+        raise IntegrationError("INVALID_CONFIG", "alpha, rate scale and base rate must be positive and finite")
+    return [[model_id, base_rate * rate_scale / (rank + 1) ** alpha] for rank, model_id in enumerate(model_ids)]
+
+
+def add_arrival_options(parser) -> None:
+    """--alpha/--rate-scale/--base-rate for `muxserve serve` and `muxserve config dump`."""
+    group = parser.add_argument_group(
+        "load point", "Figure 5 power-law arrival rates for ADBS; together they replace the "
+        "config's policy_arrival_rates (popularity follows the order of [[models]])")
+    group.add_argument("--alpha", type=float, help="power-law exponent, e.g. 0.7")
+    group.add_argument("--rate-scale", type=float, help="rate scale, e.g. 1.0")
+    group.add_argument("--base-rate", type=float, default=DEFAULT_BASE_RATE,
+                       help="req/s of the most popular model at rate scale 1 (default: %(default)s)")
+
+
+def arrival_from_args(parser, args) -> tuple | None:
+    if (args.alpha is None) != (args.rate_scale is None):
+        parser.error("--alpha and --rate-scale go together")
+    return None if args.alpha is None else (args.alpha, args.rate_scale, args.base_rate)
+
+
 def load_config(path: str | Path, *, require_assets: bool = True,
-                local: str | Path | None = None) -> DeploymentConfig:
+                local: str | Path | None = None, arrival: tuple | None = None) -> DeploymentConfig:
+    """``arrival`` = (alpha, rate_scale, base_rate) replaces policy_arrival_rates with
+    the Figure 5 power-law rates, so one deployment file serves every load point."""
     path = safe_path(path)
     raw = read_config_file(path)
     if local is not None:
         raw = apply_local_settings(raw, read_config_file(local))
+    if arrival is not None:
+        raw["policy_arrival_rates"] = power_law_rates(
+            [item.get("model_id") for item in raw.get("models", [])], *arrival)
     fraction = raw.get("kv_memory_fraction")
     if fraction is not None:
         if "kv_bytes_per_rank" in raw:
