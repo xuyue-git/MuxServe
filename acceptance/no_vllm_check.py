@@ -2,8 +2,8 @@
 
     python acceptance/no_vllm_check.py
 
-Scans every Python, shell and requirements file outside third_party/, and the
-separate engine checkout's Python files, for a vLLM
+Scans every Python and shell file outside third_party/, the packaging files and
+uv.lock, and the separate engine checkout's Python files, for a vLLM
 import or install, and imports the MuxServe control and storage modules with
 any `vllm` import made to fail, so that a hidden dependency cannot pass.
 """
@@ -59,9 +59,13 @@ class NoVllmChecks(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_no_vllm_requirement_or_install(self):
-        candidates = [ROOT / "requirements.txt", ROOT / "setup.py", ROOT / "pyproject.toml", *files({".sh"})]
+        candidates = [ROOT / "setup.py", ROOT / "pyproject.toml", *files({".sh"})]
         offenders = [str(p.relative_to(ROOT)) for p in candidates
                      if p.is_file() and INSTALL.search(p.read_text(encoding="utf-8", errors="replace"))]
+        # uv.lock resolves every installed package; vllm must not be one of them.
+        lock = ROOT / "uv.lock"
+        if lock.is_file() and re.search(r'^name = "vllm"$', lock.read_text(encoding="utf-8"), re.M):
+            offenders.append("uv.lock")
         self.assertEqual(offenders, [])
 
     def test_modules_import_with_vllm_blocked(self):

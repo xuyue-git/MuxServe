@@ -3,8 +3,8 @@
 No HTTP listener is created here. Sampling reports observed minima, not a
 continuous allocator high-water mark; transients between samples can be missed.
 The configured free-memory reserve is required on every selected physical card.
-Startup defaults to short functional P/D warmup. Set
-MUXSERVE_STARTUP_WARMUP=capacity to explicitly request maximum-load profiles.
+Startup defaults to short functional P/D warmup. The deployment config's
+`startup_warmup = "capacity"` explicitly requests maximum-load profiles.
 """
 from __future__ import annotations
 
@@ -174,7 +174,7 @@ def run_initialization(controller, tokenizers, cards, deadline, observe, stop_re
     from muxserve.muxsched.driver import ControllerDriver
     from muxserve.gateway import GatewayState
     if warmup_profile is None:
-        warmup_profile = os.environ.get("MUXSERVE_STARTUP_WARMUP", "smoke")
+        warmup_profile = getattr(controller.config, "startup_warmup", "smoke")
     if warmup_profile not in ("smoke", "capacity"):
         raise IntegrationError("STARTUP_PROFILE_UNSUPPORTED", "Warmup mode must be smoke or capacity")
     state = GatewayState(_InitializationController(controller, deadline), tokenizers)

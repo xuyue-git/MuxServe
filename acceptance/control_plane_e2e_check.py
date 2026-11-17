@@ -1,7 +1,8 @@
 """End-to-end CPU control-plane check with simulated rank processes.
 
 Real HeadwiseStore, MuxController, StorageRPCServer (persistent connections),
-ControllerDriver, GatewayServer and tools/bench_fixed.py. Each P/D TP rank is
+ControllerDriver and GatewayServer, driven over HTTP by drive_gateway below
+(a closed-loop test client, not a benchmark). Each P/D TP rank is
 a separate process that speaks the controlled command protocol over the real
 authenticated RPC. GPU work is a fixed sleep, so the measured token interval
 minus that sleep is control-plane overhead on this machine. No GPU claims.
@@ -16,7 +17,6 @@ import multiprocessing
 import os
 from pathlib import Path
 import socket
-import subprocess
 import sys
 import tempfile
 import threading
@@ -37,6 +37,113 @@ TP = 4
 
 def token_for(output_count: int) -> int:
     return 10 + (output_count * 7) % 50
+
+
+# --- HTTP driver for this check (test client, not a benchmark) -------------------
+
+def _generate(port: int, model: str, input_ids: list[int], output_len: int, timeout_s: float) -> dict:
+    """One streamed /generate request; client-side timestamps of every token."""
+    import http.client
+    import uuid
+    body = json.dumps({"rid": f"e2e-{uuid.uuid4().hex}", "input_ids": input_ids, "stream": True,
+                       "sampling_params": {"max_new_tokens": output_len, "ignore_eos": True,
+                                           "temperature": 0, "top_k": 1, "top_p": 1,
+                                           "stream_interval": 1}}).encode()
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout_s)
+    sent = time.monotonic()
+    token_times: list[float] = []
+    output_ids: list[int] = []
+    error = None
+    try:
+        connection.request("POST", f"/models/{model}/generate", body,
+                           {"Content-Type": "application/json", "Content-Length": str(len(body))})
+        response = connection.getresponse()
+        if response.status != 200:
+            return {"sent": sent, "token_times": [], "output_ids": [], "done": time.monotonic(),
+                    "error": f"HTTP {response.status}: {response.read()[:300]!r}"}
+        while True:
+            line = response.readline()
+            if not line:  # end of stream
+                break
+            line = line.strip()
+            if not line.startswith(b"data: "):
+                continue
+            data = line[6:]
+            if data == b"[DONE]":
+                break
+            payload = json.loads(data)
+            if "error" in payload:
+                error = payload["error"]
+                break
+            now = time.monotonic()
+            ids = payload["output_ids"]
+            token_times.extend(now for _ in range(len(ids) - len(output_ids)))
+            output_ids = list(ids)
+    except (OSError, ValueError) as exc:
+        error = repr(exc)
+    finally:
+        done = time.monotonic()
+        connection.close()
+    if error is None and len(output_ids) != output_len:
+        error = f"expected {output_len} tokens, got {len(output_ids)}"
+    return {"sent": sent, "token_times": token_times, "output_ids": output_ids, "error": error, "done": done}
+
+
+def _summarize(records: list[dict]) -> dict:
+    import statistics
+    ok = [r for r in records if not r["error"] and len(r["token_times"]) > 1]
+    if not ok:
+        return {"requests": len(records), "completed": 0}
+    start = min(r["sent"] for r in ok)
+    end = max(r["token_times"][-1] for r in ok)
+    tokens = sum(len(r["output_ids"]) for r in ok)
+    ordered = sorted(ok, key=lambda r: r["sent"])
+    cycles = [b["sent"] - a["sent"] for a, b in zip(ordered, ordered[1:])]
+    return {"requests": len(records), "completed": len(ok), "output_tokens": tokens,
+            "output_tokens_per_second": tokens / (end - start),
+            "mean_ttft_s": statistics.mean(r["token_times"][0] - r["sent"] for r in ok),
+            "mean_tpot_s": statistics.mean((r["token_times"][-1] - r["token_times"][0]) / (len(r["token_times"]) - 1)
+                                           for r in ok),
+            # Last token to stream end: completion work a closed loop waits for.
+            "mean_tail_s": statistics.mean(r["done"] - r["token_times"][-1] for r in ok),
+            "mean_cycle_s": statistics.mean(cycles) if cycles else None}
+
+
+def drive_gateway(port: int, models: list[str], *, requests: int, warmup: int, per_model: int,
+                  input_len: int, output_len: int, timeout_s: float) -> dict:
+    """Closed loop: per_model requests in flight per model, one warmup phase first.
+
+    Same synthetic input per model and greedy decoding, so every output of a model
+    must be identical. Returns per-model summaries, first outputs and errors."""
+    import random
+    rng = random.Random(20261107)
+    input_ids = [1] + [rng.randrange(1000, 30000) for _ in range(input_len - 1)]
+
+    def run(count: int, in_flight: int) -> dict:
+        records = {m: [] for m in models}
+        remaining = {m: iter(range(count)) for m in models}
+        def loop(model):
+            for _ in remaining[model]:
+                record = _generate(port, model, input_ids, output_len, timeout_s)
+                records[model].append(record)
+                if record["error"]:
+                    return
+        threads = [threading.Thread(target=loop, args=(m,)) for m in models for _ in range(in_flight)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return records
+
+    if warmup:
+        run(warmup, 1)
+    measured = run(requests, per_model)
+    flat = [r for m in models for r in measured[m]]
+    outputs = {m: [r["output_ids"] for r in measured[m] if not r["error"]] for m in models}
+    return {"summary": {"overall": _summarize(flat), "models": {m: _summarize(measured[m]) for m in models}},
+            "errors": [r["error"] for r in flat if r["error"]],
+            "outputs_consistent": {m: len({tuple(o) for o in outs}) == 1 for m, outs in outputs.items() if outs},
+            "first_output_ids": {m: (outputs[m][0] if outputs[m] else None) for m in models}}
 
 
 def rank_main(address, key, group, model, stage, rank, pid_tag, stop, timing=None, final_step=False,
@@ -607,14 +714,9 @@ def main():
                             if r.state not in ("FINISHED",)}
                     print("MON", rows, reqs, controller.credits.available, flush=True)
         threading.Thread(target=monitor, daemon=True).start()
-    out = Path(directory) / "bench.json"
-    bench = subprocess.run([sys.executable, str(ROOT / "tools/bench_fixed.py"), "--port", str(port),
-                            "--models", args.bench_models, "--requests", str(args.requests), "--warmup", "1",
-                            "--per-model", str(args.clients or args.inflight),
-                            "--input-len", str(args.input_len), "--output-len", str(args.output_len),
-                            "--ready-timeout", "30", "--request-timeout", "120", "--out", str(out)],
-                           capture_output=True, text=True, timeout=600)
-    result = json.loads(out.read_text()) if out.exists() else None
+    result = drive_gateway(port, [m for m in args.bench_models.split(",") if m], requests=args.requests,
+                           warmup=1, per_model=args.clients or args.inflight, input_len=args.input_len,
+                           output_len=args.output_len, timeout_s=120)
     # Graceful drain of every group, exactly like the supervisor's drain path.
     gateway.begin_drain()
     driver.pause()
@@ -631,9 +733,9 @@ def main():
     gateway.server_close()
     server.close()
     server_thread.join(5)
-    if bench.returncode != 0 or result is None or alive:
-        print(bench.stdout[-3000:], bench.stderr[-3000:])
-        raise SystemExit(f"E2E_FAILED bench={bench.returncode} alive_ranks={len(alive)}")
+    if result["errors"] or not all(result["outputs_consistent"].values()) or alive:
+        print("E2E_ERRORS", result["errors"][:5], result["outputs_consistent"])
+        raise SystemExit(f"E2E_FAILED errors={len(result['errors'])} alive_ranks={len(alive)}")
     expected = [token_for(i) for i in range(args.output_len)]
     for m in args.bench_models.split(","):
         assert result["first_output_ids"][m] == expected, (m, result["first_output_ids"][m][:8])

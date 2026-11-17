@@ -222,9 +222,8 @@ class Supervisor:
         self.context = multiprocessing.get_context("spawn")
         requested = os.environ["CUDA_VISIBLE_DEVICES"]
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(card["uuid"] for card in cards)
-        proxy = os.environ.get("PROXY", "http://192.168.1.248:7890")
-        for key in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
-            os.environ[key] = proxy
+        # The processes stay on this host and run offline (HF_HUB_OFFLINE below), so
+        # any proxy from the launching shell is kept as is; local traffic bypasses it.
         no_proxy = os.environ.get("no_proxy", "localhost,127.0.0.1,::1,10.0.0.0/8,192.168.0.0/16")
         os.environ.update(NO_PROXY=no_proxy, no_proxy=no_proxy, CUDA_HOME=software["cuda_home"],
                           HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", TOKENIZERS_PARALLELISM="false",

@@ -14,14 +14,14 @@ from muxserve.cli import main as cli  # noqa: E402
 from muxserve.config import config_to_toml, load_config, read_config_file  # noqa: E402
 
 SHIPPED = sorted([*ROOT.glob("configs/*.toml"), *ROOT.glob("configs/xbench/*.toml"),
-                  *ROOT.glob("configs/ablation/*.toml"), ROOT / "benchmark/paired/paired_a100.toml"])
+                  *ROOT.glob("configs/ablation/*.toml")])
 LOCAL_TEMPLATE = ROOT / "configs/muxserve.example.toml"
 
 
 class ConfigFileTests(unittest.TestCase):
     def test_every_shipped_deployment_loads_and_round_trips(self):
         deployments = [path for path in SHIPPED if path != LOCAL_TEMPLATE]
-        self.assertGreaterEqual(len(deployments), 40)
+        self.assertEqual(len(deployments), 39)  # 3 configs/*.toml + 8 xbench + 28 ablation steps
         for path in deployments:
             with self.subTest(path=path.relative_to(ROOT).as_posix()):
                 raw = read_config_file(path)

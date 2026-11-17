@@ -1,5 +1,4 @@
 """CPU checks: startup does short real-lifecycle warmup; capacity is opt-in."""
-import os
 from pathlib import Path
 import sys
 from threading import Event
@@ -34,12 +33,12 @@ class StartupSmokeChecks(unittest.TestCase):
         owner.config.max_new_tokens = 256
         owner.config.max_context_tokens = 2048
         evidence = []
-        options = {} if mode is None else {'warmup_profile': mode}
+        if mode is not None:  # the deployment config's startup_warmup field
+            owner.config.startup_warmup = mode
         with patch.object(controller_driver, 'ControllerDriver', driver_type), \
-                patch.object(startup, 'MemorySampler', return_value=sampler), patch.dict(os.environ):
-            os.environ.pop('MUXSERVE_STARTUP_WARMUP', None)
+                patch.object(startup, 'MemorySampler', return_value=sampler):
             state, driver = startup.run_initialization(owner, {'m': tokenizer}, [],
-                time.monotonic() + 10, lambda: None, Event(), evidence.append, **options)
+                time.monotonic() + 10, lambda: None, Event(), evidence.append)
         return owner, evidence[-1]
 
     def test_default_initialization_is_short_drained_and_does_not_claim_capacity(self):

@@ -257,7 +257,7 @@ uv run xbench report RUN_ID
 uv run python benchmark/xbench/make_inputs.py --sharegpt-bundle /path/to/open-a07s1.json
 ```
 
-固定 prompt 来自 `benchmark/paired/frozen-synthetic-512-128.toml`；固定 trace 来自原版
+固定 prompt 来自 `inputs/fixed-512/frozen-synthetic-512-128.json`；固定 trace 来自原版
 `PoissonProcess`，7B/13B/30B 分别用 seed 0/1/2；ShareGPT 输入来自冻结 bundle
 `959024cce558`（source trace `d1d735cc3909`，原版 `sample_requests`，llama-7b tokenizer，seed 42）。
 重新生成的文件逐字节相同。

@@ -12,7 +12,7 @@ Deterministic; rerunning rewrites byte-identical files. Formats are xbench's
 Inputs written:
   inputs/fixed-512/prompts-<model>.jsonl
       Original MuxServe's frozen 512-token prompt for each model
-      (benchmark/paired/frozen-synthetic-512-128.json).
+      (inputs/fixed-512/frozen-synthetic-512-128.json).
   inputs/fixed-512/trace-poisson-0.5rps-600s.jsonl
       Arrivals from original MuxServe's own generator
       (muxserve.muxsched.workload_utils.PoissonProcess, seed = model index),
@@ -44,7 +44,7 @@ from muxserve.muxsched.workload_utils import PoissonProcess  # noqa: E402  origi
 
 MODELS = {"llama-7b": "huggyllama/llama-7b", "llama-13b": "huggyllama/llama-13b",
           "llama-30b": "huggyllama/llama-30b"}
-FROZEN = ROOT / "benchmark" / "paired" / "frozen-synthetic-512-128.json"
+FROZEN = HERE / "inputs" / "fixed-512" / "frozen-synthetic-512-128.json"
 FIXED_RATE, FIXED_SECONDS, FIXED_OUTPUT = 0.5, 600.0, 128
 
 

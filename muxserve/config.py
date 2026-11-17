@@ -124,6 +124,9 @@ class DeploymentConfig:
     max_context_tokens: int = 2048
     request_timeout_ms: int = 120000
     prepare_timeout_ms: int = 30000
+    # Startup warmup before READY: "smoke" sends short functional P/D requests;
+    # "capacity" also drives the maximum-load shapes (slower start).
+    startup_warmup: str = "smoke"
     controller_port: int = 18080
     queue_limit: int = 4096
     # Concurrent HTTP streams the gateway accepts. Open-loop load holds one
@@ -573,6 +576,8 @@ def load_config(path: str | Path, *, require_assets: bool = True,
         raise IntegrationError("INVALID_CONFIG", "Request deadline must be 1000..300000 ms for native integer seconds")
     if config.prepare_timeout_ms > 120000:
         raise IntegrationError("INVALID_CONFIG", "Preparation deadline must be at most 120000 ms")
+    if config.startup_warmup not in ("smoke", "capacity"):
+        raise IntegrationError("INVALID_CONFIG", "startup_warmup must be smoke or capacity")
     if type(config.decode_cuda_graph) is not bool:
         raise IntegrationError("INVALID_CONFIG", "decode_cuda_graph must be a boolean")
     if type(config.decode_run_park) is not bool:

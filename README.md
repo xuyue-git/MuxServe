@@ -30,9 +30,9 @@ muxserve/
 csrc/headwise/     Head-wise CUDA kernels, built as muxserve._headwise
 configs/           deployment configs (TOML), ablation steps, local settings template
 upstream-reference/ separate-engine identity pin and the 13 recorded patch hashes
-tools/             verify the separate engine, preflight locks, perf runs, CPU checks
+tools/             verify the separate engine, preflight locks, CPU checks, trace summary
 acceptance/        CPU checks (storage, control, transport, simulated 24-rank e2e)
-benchmark/         xbench catalogue (standard benchmarks), paired fixed point,
+benchmark/         xbench catalogue (the benchmark), patch ablation steps,
                    original placement/workload tooling
 ```
 
@@ -53,10 +53,9 @@ The environment contains SGLang and no vLLM.
    See [the repository boundary notes](docs/two-repositories.md).
 2. Verify the engine source: `python tools/bootstrap_source.py`.
 3. Install both, the engine editable and this package with its CUDA extension:
-   `uv sync`. (`pyproject.toml` pins the dependencies; `uv.lock` pins every
-   version. Without uv: `pip install --config-settings editable_mode=compat -e
-   ../MuxServe-SGLang-Engine`, `pip install -r requirements.txt`, then
-   `pip install --no-build-isolation --config-settings editable_mode=compat -e .`.)
+   `uv sync`. (`pyproject.toml` pins the dependencies and points uv at the sibling
+   engine; `uv.lock` pins every version. uv is the only install path. Without a
+   Rust toolchain, prefix it with `SGLANG_BUILD_RUST_EXTS=none`.)
 4. Machine-local settings stay out of the deployment configs, as CrossPool keeps
    them in `configs/xpool.local.toml` and `.env`:
    `cp .env.example .env && cp configs/muxserve.example.toml configs/muxserve.local.toml`
@@ -113,8 +112,6 @@ server, Rust radix tree) are not used by this project.
 - [`benchmark/ablation/`](benchmark/ablation/README.md): the cumulative patch
   ablation, one complete server config per step (`configs/ablation/`), with each
   patch's motivation and the results table.
-- [`benchmark/paired/`](benchmark/paired/README.md): the fixed 512/128 point paired
-  with original MuxServe's frozen inputs and expected outputs.
 - `benchmark/end_to_end`, `benchmark/chatlmsys`, `muxserve/muxsched/workload_utils.py`
   and `muxserve/muxsched/placement.py`: the paper's workload generator (power-law
   popularity `alpha`, Poisson arrivals, ShareGPT lengths) and placement optimizer.

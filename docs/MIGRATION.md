@@ -79,10 +79,8 @@ only within test code. No GPU correctness, capacity or performance claim follows
 
 Historical GPU acceptance belongs to the prior project and its harness. This
 branch has not been clean-installed. Later commits reduce the per-token mapping
-and control overhead. `benchmark/paired/paired_a100.toml` with `tools/bench_fixed.py`
-runs the paired four-GPU point (LLaMA 7B/13B/30B, TP4, FP16, 512/128, one
-request in flight per model) on original MuxServe's frozen inputs, checking
-every output against the original's tokens; measured results are kept outside
-this repository. SGLang timings are taken at the HTTP client.
+and control overhead. Both this backend and original MuxServe are measured with
+CrossPool's xbench client against their HTTP endpoints (`benchmark/xbench/`), so
+the two sides share one timing boundary.
 The sample D30/D40 configuration is not the all-D40 fixed synthetic comparison.
 The standard xbench catalogue is in `benchmark/xbench/`.

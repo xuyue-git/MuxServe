@@ -25,10 +25,9 @@ ranks read its decision from shared memory). A run yields at the next
 step boundary when a prefill waits for credits, cancellation/timeout arrives,
 or capacity recovery protects another request. Ranks keep one authenticated
 RPC connection, long-poll their commands, and the driver wakes on controller
-activity instead of polling. `tools/bench_fixed.py` reproduces the fixed
-512/128 closed-loop point against the gateway (`/metrics` exposes the
-controller's per-stage totals); `acceptance/control_plane_e2e_check.py` runs
-the full control plane with simulated rank processes on CPU.
+activity instead of polling. The gateway's `/metrics` exposes the controller's
+per-stage totals; `acceptance/control_plane_e2e_check.py` runs the full control
+plane with simulated rank processes on CPU.
 
 `decode_cuda_graph: true` captures D-stage decode forwards as SGLang-native
 full CUDA graphs (batch sizes 1..`max_model_inflight`; P stays eager). Capture
@@ -64,13 +63,11 @@ only (P ranks no longer prepare/quiesce decode batches they never execute);
 `prefill_early_token` publishes the prefill token once every P rank's result
 is committed, as original MuxServe returns it at prefill end (it moves the
 TTFT boundary; the request is not shorter). The former runner's names are
-`INLINE_START=1 SKIP_P=1 EARLY_TOKEN=1`, and `FROZEN_BUNDLE=... WARMUP_TOTAL=128`
-to bench original MuxServe's frozen 512/128 inputs with its 43/43/42 warmup,
-checking every output against the original's tokens.
+`INLINE_START=1 SKIP_P=1 EARLY_TOKEN=1`.
 
 The remaining opt-in paths are grouped by where they act. Each is documented
-where it is defined in `muxserve/config.py`; `benchmark/paired/paired_a100.toml`
-turns them all on.
+where it is defined in `muxserve/config.py`; `configs/a100_open_loop.toml`
+turns on the measured set, and `configs/ablation/` adds them one step at a time.
 
 | Stage | Config keys |
 |---|---|
@@ -79,6 +76,12 @@ turns them all on.
 | Decode steps | `decode_leader_reports`, `final_step_in_gpu_done` |
 | Request end | `cleanup_skip_prefill_ranks`, `cleanup_with_quiesce`, `idle_cache_trim_mib`, `terminal_before_cleanup`, `slot_free_at_cleanup` |
 | Control transport | `event_pump_thread`, `start_in_report_reply`, `targeted_wake`, `rpc_inline_fast_methods` |
+
+`startup_warmup` (default `"smoke"`) chooses the warmup before READY: short
+functional P/D requests, or `"capacity"`, which also drives the maximum-load
+shapes and starts more slowly. Diagnosis-only environment variables, never set
+in performance runs: `MXS_TRACE_DIR` (timing trace, summarised by
+`tools/trace_report.py`) and `MXS_PROFILE_*` (profiler).
 
 Open-loop load (requests sent at trace arrival times, so many wait in the
 queue) uses larger limits and two opt-in KV paths, all off or unchanged by
@@ -176,8 +179,8 @@ STEP_HISTORY=1`.
 Prefill CUDA graphs (unless `prefill_cuda_graph`), overlap scheduling and custom all-reduce remain disabled.
 Each run start still ships and validates the complete multi-rank KV view once
 (as packed int32 tables). The sample
-configuration uses D30 for 7B and D40 for 13B/30B; it is not the all-D40 paired
-experiment configuration. Asset paths now use the common protected resolver,
+configuration (`configs/sglang_a100.toml`) uses D30 for 7B and D40 for 13B/30B;
+the measured configurations (`configs/a100_*.toml`) use D40 for all three. Asset paths now use the common protected resolver,
 with no hardcoded lab model aliases. No original-paper performance reproduction
 or clean-install GPU validation is claimed for this migration.
 
