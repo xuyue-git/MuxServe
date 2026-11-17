@@ -4,10 +4,11 @@
 # fraction that gives exactly 2 GiB per GPU there (torch total memory
 # 42,436,526,080 bytes), as MuxServe-SGLang uses.
 #
+# Shared by every Figure 5 load point; the point is chosen on the command line.
 # From the repository root (see examples/xbench/README.md for the full commands):
 #   python -m muxserve.launch --nproc_per_node 4 examples/xbench/fig5-a0.7-s1.0.yaml \
-#     --workload-file examples/xbench/fig5-a0.7-s1.0-workload.json --mps-dir $MPS \
-#     --schedule-approach adbs --max-num-batched-tokens 2048 --http-port 18080
+#     --mps-dir $MPS --schedule-approach adbs --max-num-batched-tokens 2048 \
+#     --http-port 18080 --alpha 0.7 --rate-scale 1.0
 num_gpus: 4
 max_num_seqs: 16
 overload_threshold: 3
