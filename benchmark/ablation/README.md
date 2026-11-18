@@ -1,7 +1,7 @@
 # 补丁消融实验
 
 量化每个优化补丁对吞吐和延迟的增量贡献。做法是**累加**：第 N 步在第 N−1 步的基础上
-多打开一个提交引入的开关，其余设置在所有步骤中完全相同；第 27 步就是最终配置
+多打开一个提交引入的开关，其余设置在所有步骤中完全相同；第 28 步就是最终配置
 `configs/a100_open_loop.toml`。
 
 | 文件 | 内容 |
@@ -9,7 +9,7 @@
 | `steps.json` | 步骤定义：每步对应的提交、开关、类型（性能 / 原版对齐）、动机、对模型适配的影响；基线里常开的改动 |
 | `make_configs.py` | 由 `steps.json` 和最终配置生成 `configs/ablation/sNN-*.toml` 与 `RESULTS.md`，结果逐字节可复现 |
 | `RESULTS.md` | 结果表（实测后填写）、每个补丁的动机与适配影响、基线常开改动清单 |
-| `../../configs/ablation/` | 28 份完整服务配置，s00（全关）到 s27（最终） |
+| `../../configs/ablation/` | 29 份完整服务配置，s00（全关）到 s28（最终） |
 
 ## 实验条件
 
@@ -42,13 +42,15 @@ export UV_ENV_FILE="$PWD/.env"
 uv run xbench run --case 2bdea08f
 ```
 
-跑完 Ctrl-C 停服务，换下一份配置（`s01-rpc-persistent.toml` ……`s27-adbs-step-history.toml`）重复。
+跑完在另一个终端停服务（不要在服务终端按 Ctrl-C，见仓库 README 的停止说明）：
+`pkill -INT -u $USER -f '\.venv/bin/muxserve serve configs/ablation/'`，
+再换下一份配置（`s01-rpc-persistent.toml` ……`s28-adbs-slot-history.toml`）重复。
 `uv run xbench report RUN_ID` 给出吞吐、TTFT、TPOT 和失败数，填进 `RESULTS.md`。
 
 规则：
 
 - 每步一次运行，服务每步重新启动；不开 TRACE / PROFILE。
-- 第 0、27 步建议各跑 3 轮，给出噪声范围；相邻两步的差小于这个范围时，不能说该补丁有贡献。
+- 第 0、28 步建议各跑 3 轮，给出噪声范围；相邻两步的差小于这个范围时，不能说该补丁有贡献。
 - 早期步骤（尤其第 0–2 步）可能很慢，部分请求可能超过 300 s 截止而失败；
   失败数照实填写，不要只用成功请求算吞吐。
 - 累加的增量包含与前面补丁的交互；某一步需要单独说明时，再从最终配置只关掉该步的开关测一次（去除对照）。

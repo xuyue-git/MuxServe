@@ -401,6 +401,17 @@
       ],
       "motivation": "ADBS 每个 decode 步记录一次 batch 大小，对应原版每个 decode batch 追加 hist_num_seqs；按 run 记录会低估繁忙模型。policy_log_adjustments 只打日志。",
       "adaptation": "与模型无关。"
+    },
+    {
+      "id": 28,
+      "slug": "adbs-slot-history",
+      "commit": "pending",
+      "kind": "original-parity",
+      "switches": [
+        "policy_slot_history"
+      ],
+      "motivation": "ADBS 每个 decode 步记录该模型过了 prefill 的全部占用名额（交接中、等待加入 decode、decode 中、等待清理），对应原版 decode batch 取走全部 running 请求；只记 run 的成员会把名额已满的模型（重负载下的 30B）当成没用满，8 秒重分配把它的名额给了 7B。",
+      "adaptation": "与模型无关。"
     }
   ]
 }

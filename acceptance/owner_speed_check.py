@@ -123,6 +123,38 @@ class StepHistoryChecks(unittest.TestCase):
     def test_without_the_switch_a_run_is_one_entry(self):
         self.assertEqual(self.run_two_steps(**self.join_flags()), [1])
 
+    def run_with_a_waiting_slot(self, **flags):
+        """r decodes a two-step run while s, prefilled, holds a slot outside it (no step
+        join, so s cannot enter the run; with join it waits for its handoff instead)."""
+        sim = Sim(run_steps=2, policy_step_history=True, max_model_inflight=2, **flags)
+        for rid in ("r", "s"):
+            sim.submit("a", rid, max_new=10)
+            sim.prefill("a", rid, 11)
+        plan, reservation = sim.prepare_decode("a", "r", 2)
+        sim.controller._snapshot_policy()  # the driver's snapshot before the steps
+        for step, token in ((1, 12), (2, 13)):
+            for rank in range(sim.tp):
+                self.step(sim, plan.batch_id, rank, step, {"r": token})
+        return list(sim.controller.policy.histories["a"])[:2]
+
+    def test_slot_history_counts_slots_held_past_prefill(self):
+        # The source's decode batch would hold both running requests.
+        self.assertEqual(self.run_with_a_waiting_slot(policy_slot_history=True), [2, 2])
+
+    def test_without_slot_history_only_the_run_members_count(self):
+        self.assertEqual(self.run_with_a_waiting_slot(), [1, 1])
+
+    def test_slot_history_requires_step_history(self):
+        import tempfile
+        from muxserve.config import config_to_toml, load_config, read_config_file
+        raw = read_config_file(Path(__file__).resolve().parents[1] / "configs/a100_open_loop.toml")
+        raw.update(policy_step_history=False, policy_slot_history=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deployment.toml"
+            path.write_text(config_to_toml(raw), encoding="utf-8")
+            with self.assertRaises(IntegrationError):
+                load_config(path, require_assets=False)
+
     def test_adjustment_line_is_printed_only_with_the_switch(self):
         import contextlib, io
         for flag, expected in ((True, 1), (False, 0)):

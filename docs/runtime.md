@@ -153,8 +153,13 @@ starting request limit from its arrival rate exactly as the source's
 re-sizing one batch size per decode-run step, as the source appends
 `hist_num_seqs` per decode batch (without it a run is one entry, which
 understates busy models under `decode_step_join`/`decode_step_leave`);
-`policy_log_adjustments` (`ADBS_LOG=1`) prints one `POLICY_ADJUST` line per
-re-sizing.
+`policy_slot_history` makes each step's entry every slot the model holds past
+prefill (handing off, waiting to join a run, decoding, awaiting cleanup), the
+count the source's decode batch takes (`schedule_decode` takes every running
+request); the run's members alone read a model with every slot taken as partly
+idle, and the re-sizing gives its slots away (30B at the heaviest Figure 5
+points). `policy_log_adjustments` (`ADBS_LOG=1`) prints one `POLICY_ADJUST`
+line per re-sizing.
 
 Owner process, all off by default: `gateway_process` (`GATEWAY_PROC=1`) runs
 the HTTP gateway (sockets, SSE, tokenizer) in a child process fed by one pipe;

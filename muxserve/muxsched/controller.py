@@ -310,6 +310,9 @@ class MuxController:
             maximum_batch=config.max_model_inflight, clock=clock)
         self.policy = ADBS(**self._policy_parameters)
         self.policy.log_adjustments = config.policy_log_adjustments
+        # policy_slot_history: per model, the slots held past prefill at the last
+        # policy snapshot (the driver takes one every few ms while work is pending).
+        self._post_prefill_slots = {m.model_id: 0 for m in config.models}
         self._tick_count = 0
         self._tick_duration_ms = 0.0
         # inline_start: allowed only while a scheduling driver owns grants
@@ -921,6 +924,13 @@ class MuxController:
         return (request.allocation_id is not None or self._active(request) is not None
                 or any(cleanup.identity == request.identity for cleanup in group.cleanups.values()))
 
+    def _past_prefill(self, request: _Request) -> bool:
+        """A slot holder the source would count as running: not in a prefill whose
+        GPU work is still going (the source moves a request to running when its
+        prefill returns)."""
+        active = self._active(request)
+        return active is None or active.plan.stage != "P" or active.gpu_completed_at is not None
+
     def _active_index(self) -> dict:
         """(model, request, attempt) -> the batch _active would return. One pass over every
         unfinished batch, in each group's order (driver_min_interval_ms)."""
@@ -967,7 +977,17 @@ class MuxController:
             busy.update((model.model_id, b.plan.stage) for b in active)
             if self._merging and not self.config.decode_step_join and self._prefill_needs_d(group):
                 busy.add((model.model_id, "D"))
-            counts[model.model_id] = sum(self._occupies_slot(r) for r in rows)
+            if self.config.policy_slot_history:
+                occupied = post_prefill = 0
+                for r in rows:
+                    if self._occupies_slot(r):
+                        occupied += 1
+                        if self._past_prefill(r):
+                            post_prefill += 1
+                counts[model.model_id] = occupied
+                self._post_prefill_slots[model.model_id] = post_prefill
+            else:
+                counts[model.model_id] = sum(self._occupies_slot(r) for r in rows)
         rank_free = {rank: data["free_blocks"] for rank, data in self.store.rank_usage().items()}
         # With decode_run_park a prefill prepares without credits (it takes
         # them at START), so it is always credit-admissible.
@@ -2890,7 +2910,12 @@ class MuxController:
         batch.run_applied = step
         if self.config.policy_step_history:
             # The source's ADBS learns each model's batch size from every decode step.
-            self.policy.record_step(group.model_id, len(batch.members(step)))
+            size = len(batch.members(step))
+            if self.config.policy_slot_history:
+                # The source's decode batch stops at the model's limit (schedule_decode).
+                size = max(size, min(self._post_prefill_slots[group.model_id],
+                                     self.policy.limits[group.model_id]))
+            self.policy.record_step(group.model_id, size)
         for ref, result in zip(batch.members(step), results):
             request = self._request(group.model_id, ref.request_id)
             published = batch.run_published[ref.request_id]

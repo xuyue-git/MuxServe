@@ -65,6 +65,7 @@ driver_lean_locking = true
 owner_switch_interval_us = 500
 policy_step_history = true
 policy_log_adjustments = true
+policy_slot_history = true
 policy_arrival_rates = [["llama13b", 0.5], ["llama30b", 0.5]]
 prefill_graph_tokens = [16, 32, 64, 128, 256, 512, 1024, 2048]
 prefill_pair_hold_ms = 10

@@ -21,7 +21,7 @@ LOCAL_TEMPLATE = ROOT / "configs/muxserve.example.toml"
 class ConfigFileTests(unittest.TestCase):
     def test_every_shipped_deployment_loads_and_round_trips(self):
         deployments = [path for path in SHIPPED if path != LOCAL_TEMPLATE]
-        self.assertEqual(len(deployments), 39)  # 3 configs/*.toml + 8 xbench + 28 ablation steps
+        self.assertEqual(len(deployments), 40)  # 3 configs/*.toml + 8 xbench + 29 ablation steps
         for path in deployments:
             with self.subTest(path=path.relative_to(ROOT).as_posix()):
                 raw = read_config_file(path)

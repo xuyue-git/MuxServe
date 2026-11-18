@@ -34,6 +34,7 @@
 | 25 | `19318e3` | 原版对齐 | `kv_release_at_finish` | `configs/ablation/s25-kv-early-free.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
 | 26 | `8a16781` | 性能 | `gateway_process`, `event_lean_copies`, `driver_lean_locking`, `owner_switch_interval_us` | `configs/ablation/s26-owner-speed.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
 | 27 | `370794c` | 原版对齐 | `policy_step_history`, `policy_log_adjustments` | `configs/ablation/s27-adbs-step-history.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 28 | `pending` | 原版对齐 | `policy_slot_history` | `configs/ablation/s28-adbs-slot-history.toml` | 待测 | 待测 | 待测 | 待测 | 待测 |
 
 ## 每个补丁的动机与对模型适配的影响
 
@@ -66,6 +67,7 @@
 | 25 | `19318e3` | 原版对齐 | 完成的请求立即归还 KV，对应原版释放已完成请求的缓存，不再等 CLEANUP 往返。 | 与模型无关。 |
 | 26 | `8a16781` | 性能 | 开环负载下每次 rank 汇报要等 owner 锁 8–16 ms：网关移到子进程、事件少拷贝、driver 少加锁、缩短解释器切换间隔。 | 与模型无关。 |
 | 27 | `370794c` | 原版对齐 | ADBS 每个 decode 步记录一次 batch 大小，对应原版每个 decode batch 追加 hist_num_seqs；按 run 记录会低估繁忙模型。policy_log_adjustments 只打日志。 | 与模型无关。 |
+| 28 | `pending` | 原版对齐 | ADBS 每个 decode 步记录该模型过了 prefill 的全部占用名额（交接中、等待加入 decode、decode 中、等待清理），对应原版 decode batch 取走全部 running 请求；只记 run 的成员会把名额已满的模型（重负载下的 30B）当成没用满，8 秒重分配把它的名额给了 7B。 | 与模型无关。 |
 
 ## 基线里常开、不在表中单独计量的改动
 

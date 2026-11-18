@@ -368,6 +368,14 @@ class DeploymentConfig:
     # one entry per run holding the members left at the run's end. With step join/leave
     # those entries understate busy models, and the 8 s re-sizing moves their share away.
     policy_step_history: bool = False
+    # Each step's history entry is every slot the model holds past prefill: requests
+    # whose prefill GPU work is done (handing off), waiting to join a decode run,
+    # decoding, or awaiting cleanup. The source's decode batch takes every running
+    # request (schedule_decode), so its entry is the same count. The run's members
+    # alone read a model with every slot taken as partly idle, and the 8 s re-sizing
+    # gives its slots away (30B at the heaviest Figure 5 points). Needs
+    # policy_step_history.
+    policy_slot_history: bool = False
     # Print one POLICY_ADJUST line per 8 s ADBS re-sizing (limits before/after, average
     # batch, waiting and running), like the source's "Model ... util ... max_bs" lines.
     policy_log_adjustments: bool = False
@@ -611,9 +619,11 @@ def load_config(path: str | Path, *, require_assets: bool = True,
                  "prefill_start_unparked", "handoff_local_success", "prefill_break_slim",
                  "prefill_overlap_decode", "kv_release_at_finish", "gateway_process",
                  "event_lean_copies", "driver_lean_locking", "policy_step_history",
-                 "policy_log_adjustments"):
+                 "policy_log_adjustments", "policy_slot_history"):
         if type(getattr(config, name)) is not bool:
             raise IntegrationError("INVALID_CONFIG", name + " must be a boolean")
+    if config.policy_slot_history and not config.policy_step_history:
+        raise IntegrationError("INVALID_CONFIG", "policy_slot_history requires policy_step_history")
     if config.decode_kv_per_page and not config.decode_step_join:
         raise IntegrationError("INVALID_CONFIG", "decode_kv_per_page requires decode_step_join")
     if config.decode_step_pipeline and not config.decode_leader_reports:
