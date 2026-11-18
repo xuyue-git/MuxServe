@@ -405,7 +405,7 @@
     {
       "id": 28,
       "slug": "adbs-slot-history",
-      "commit": "pending",
+      "commit": "0cd8b55",
       "kind": "original-parity",
       "switches": [
         "policy_slot_history"
