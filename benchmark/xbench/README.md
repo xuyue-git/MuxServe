@@ -1,22 +1,38 @@
 # MuxServe 的 xbench 基准配置（CrossPool 写法）
 
 所有实验条件写在 `benches.toml` 里，服务端和客户端各用一条原生命令启动，
-中间没有包装脚本。`benches.toml` 共 20 个用例，就是论文 Figure 5 的网格，
-全部跑在默认的三模型部署上（LLaMA-7B/13B/30B，四张 A100 40 GB）。
+中间没有包装脚本。`benches.toml` 共 22 个用例，全部跑在默认的三模型部署上
+（LLaMA-7B/13B/30B，四张 A100 40 GB）：
+
+- 前 2 个是固定 512 输入 / 128 输出的负载，保留原 case ID；
+- 后 20 个是论文 Figure 5 的网格。
 
 ## 文件
 
 | 文件 | 内容 |
 |---|---|
-| `benches.toml` | 20 个用例，每个独立声明：到达 trace、时长、prompt、采样、预热、并发上限、端点 |
-| `../../configs/a100_open_loop.toml` | 三模型服务配置 |
+| `benches.toml` | 22 个用例，每个独立声明：到达过程、到达率、时长、prompt、输出长度、采样、预热、并发上限、端点 |
+| `../../configs/a100_xbench_poisson.toml`、`../../configs/a100_open_loop.toml` | 三模型服务配置（前者给固定 512/128 用例，后者给 Figure 5 用例） |
 | `../../configs/muxserve.example.toml`、`../../.env.example` | 本机设置模板（锁目录、模型路径、GPU），复制为 `configs/muxserve.local.toml`、`.env` |
-| `inputs/fig5-a<alpha>-s<scale>/`、`make_inputs.py` | 每个点的冻结输入（`trace.jsonl` 和三个 `prompts-<model>.jsonl`）及离线生成器 |
+| `inputs/fixed-512/` | 固定 512/128 用例的冻结 prompt 和原版生成器的到达 trace |
+| `inputs/fig5-a<alpha>-s<scale>/`、`make_inputs.py` | Figure 5 每个点的冻结输入（`trace.jsonl` 和三个 `prompts-<model>.jsonl`）及离线生成器 |
 | `suites/serving/multi_model.py` | CrossPool 的 serving suite，未修改（MIT） |
 | `CROSSPOOL-LICENSE` | 借用 catalogue 结构和 suite 的 MIT 授权 |
 
 catalogue 写法参考 CrossPool `0d3267edecfbe67459c1e9edc62ee73ff1f1a63f`，
 它的声明与严格 case schema 和客户端锁定版本 `3c1f976cdd1069756314ecb7142581fad2367272` 相同。
+
+## 固定 512/128 用例
+
+| case 前缀 | 负载 | 请求数 | 服务配置 |
+|---|---|---|---|
+| `55af3ef0` | 固定 512 输入 / 128 输出，xbench Poisson，每模型 0.5 req/s，600 s | 约 900 | `configs/a100_xbench_poisson.toml` |
+| `279fe35b` | 同样的长度和到达率，原版 MuxServe `PoissonProcess` 生成的冻结 trace | 903（298 / 290 / 315） | `configs/a100_xbench_poisson.toml` |
+
+两个用例都是贪心解码、忽略 EOS（每个请求正好输出 128 个 token），每个模型预热 2 个请求，
+全局最多 128 个活动 HTTP 请求，客户端超时 330 s。固定 prompt 来自
+`inputs/fixed-512/frozen-synthetic-512-128.json`；`279fe35b` 的 trace 来自原版 `PoissonProcess`，
+7B/13B/30B 分别用 seed 0/1/2。
 
 ## 论文 Figure 5 网格
 
@@ -195,8 +211,9 @@ uv run xbench report RUN_ID
 
 - **一条命令只跑一个 case。** client 用例不占设备租约，同一条命令里写多个 `--case`
   会同时打到同一个服务上，负载叠加。
-- 每个 case 的服务端都要带它的 `--alpha`、`--rate-scale`；换点前先按上面的方法停掉旧服务。
-  不要用 `--all`。
+- 每个 case 用它对应的服务配置（固定 512/128 用 `configs/a100_xbench_poisson.toml`；Figure 5
+  用 `configs/a100_open_loop.toml`，还要加这一点的 `--alpha`、`--rate-scale`）；换 case 前先按上面的方法
+  停掉旧服务。不要用 `--all`。
 - client 模式不会自动重启服务。要比较的多轮之间重启服务，避免 ADBS 历史、缓存、CUDA Graph 带到下一轮。
 - 性能实验不开 `MXS_TRACE_DIR` / `PROFILE`。
 - xbench 留在 CrossPool 自己的环境里，不装进 MuxServe 的环境，原因见
@@ -209,6 +226,7 @@ uv run python benchmark/xbench/make_inputs.py --sharegpt-bundle /path/to/open-a0
 uv run python benchmark/xbench/make_inputs.py --fig5 DIR
 ```
 
+每次运行都会写出 `inputs/fixed-512/` 下固定 512/128 用例的 prompt 和 trace；
 `--sharegpt-bundle` 写出 alpha 0.7 / 1.0 那一点，来自冻结 bundle `959024cce558`
 （source trace `d1d735cc3909`，原版 `sample_requests`，llama-7b tokenizer，seed 42）；
 `--fig5` 写出全部 20 个点（见上文）。重新生成的文件逐字节相同。

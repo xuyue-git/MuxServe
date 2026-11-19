@@ -105,9 +105,10 @@ server, Rust radix tree) are not used by this project.
 ## Benchmarks
 
 - [`benchmark/xbench/`](benchmark/xbench/README.md): the standard benchmark. A
-  CrossPool xbench catalogue (`benches.toml`) with the 20 client-mode cases of the
-  paper's Figure 5 grid; each states its arrival trace, duration, input and output
-  lengths, and the one command that runs it against a launched server.
+  CrossPool xbench catalogue (`benches.toml`) with 22 client-mode cases (two fixed
+  512/128 loads and the 20 points of the paper's Figure 5 grid); each states its
+  arrival process, rates, duration, input and output lengths, and the one command
+  that runs it against a launched server.
 - [`benchmark/ablation/`](benchmark/ablation/README.md): the cumulative patch
   ablation, one complete server config per step (`configs/ablation/`), with each
   patch's motivation and the results table.
