@@ -21,6 +21,5 @@ avg rate from 2 to 11 (req/s)
  - muxserve2spatial.py: translate the muxserve config into spatial config
  - muxserve2temporal.py: translate the muxserve config into temporal config
  - cmd_gen.py: generate the running command for muxserve,spatial and temporal
- - profile.sh: script for run
  - merge.py: merge the file into `merged` folder
 ```

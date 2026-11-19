@@ -38,9 +38,9 @@ git diff 2f7172a..HEAD -- muxserve     # the three original files changed for re
 | Original module (vLLM-based, removed) | Replacement in `muxserve` | Change |
 |---|---|---|
 | `flexserver/llm_runtime.py`, `pipeworker.py`, `muxserve_server.py`, `models/`, `sampler.py`, `model_loader.py`, `dist_utils.py`, `p2p_communication.py` | `flexserver/sglang_runtime.py`, `sglang_hooks.py`, `sglang_memory.py`, `sglang_attention.py`, `sglang_pd.py`, `step_box.py`, `ops.py` | Native SGLang execution with explicit forward grants; Head-wise attention and P/D handoff on SGLang |
-| `flexstore/manager.py`, `weight_utils.py`, `csrc/memory_manager.*`, `zmq_utils.py` | `flexstore/storage.py`, `gpu_storage.py`, `weight_owner.py`, `weight_loader.py`, `ipc.py` | Head-wise KV store in the owner process; one weight owner per model shares weights with its P/D ranks over CUDA IPC; authenticated local RPC instead of ZMQ |
+| `flexstore/manager.py`, `weight_utils.py`, `csrc/memory_manager.*`, `zmq_utils.py` | `flexstore/storage.py`, `gpu_storage.py`, `weight_owner.py`, `weight_loader.py`, `ipc.py` | Head-wise KV store in the launcher/controller process (block tables in `HeadwiseStore`, GPU tensors in `GPUStorage`); one weight owner per model shares weights with its P/D ranks over CUDA IPC; authenticated local RPC instead of ZMQ |
 | `muxsched/scheduler.py`, `csrc/batch_scheduler.*`, `shm_utils.py`, `constants.py`, `tracer.py` | `muxsched/controller.py`, `policy.py`, `driver.py`, `events.py`; `muxserve/trace.py` | ADBS rules from the original scheduler (quotas, 8 s re-sizing, SM credits); request/batch lifecycle and decode runs |
-| `launch.py`, `entrypoint.py`, `arg_utils.py`, `muxsched/launcher.py`, `scripts/*.sh` | `launch.py`, `startup.py`, `preflight.py`, `mps_shutdown.py`, `config.py` (`DeploymentConfig`) | One launch command with a JSON config; private MPS; explicit assets/devices; ordered shutdown |
+| `launch.py`, `entrypoint.py`, `arg_utils.py`, `muxsched/launcher.py`, `scripts/*.sh` | `launch.py`, `startup.py`, `preflight.py`, `mps_shutdown.py`, `config.py` (`DeploymentConfig`) | One launch command with a TOML config (`uv run muxserve serve CONFIG.toml`); private MPS; explicit assets/devices; ordered shutdown |
 | in-process workload replay | `gateway.py`, `gateway_proc.py` | Native SGLang `/generate` SSE gateway |
 | `vllm.transformers_utils.tokenizer.get_tokenizer` | `sglang.srt.utils.hf_transformers.tokenizer.get_tokenizer` | Same signature; imported on use in `muxsched/workload_utils.py` |
 
@@ -52,7 +52,8 @@ sampling), `config.py` `JobConfig`/`MuxServeConfig`, `logger.py`.
 `config.kv_bytes_from_fraction` takes its block count from `num_gpu_blocks`.
 
 Removed with the vLLM runtime: the spatial/temporal baseline launch scripts and the
-vLLM profiling benchmark (`benchmark/parallelism/benchmark_parallelism.py`); their
+vLLM profiling benchmarks (`benchmark/parallelism/benchmark_parallelism.py`,
+`benchmark/chatlmsys/profile.sh` and its driver `scan.py`); their
 placement configs and plotting tools remain. The Head-wise CUDA sources in
 `csrc/headwise` derive from MuxServe-vLLM and keep their notices; they build into
 `muxserve._headwise` without linking any vLLM package.
