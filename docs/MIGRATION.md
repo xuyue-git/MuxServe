@@ -4,7 +4,7 @@ Original MuxServe executes on a modified vLLM. In this repository every vLLM-bas
 module was replaced inside the `muxserve` package by an SGLang-based module with
 the same role; the package keeps MuxServe's structure (`muxsched` scheduling,
 `flexstore` unified memory, `flexserver` execution). No module imports vLLM and
-vLLM is not a dependency (`acceptance/no_vllm_check.py`). Original MuxServe itself
+vLLM is not a dependency. Original MuxServe itself
 is run from its own repository and environment when it is needed as a baseline.
 
 ## History and source
@@ -66,16 +66,10 @@ patches; the downloaded upstream tree is not committed.
 Historical machine-specific model alias exceptions were removed from `config.py`.
 Explicit asset paths now use `safe_path`, including its forbidden-directory and
 symlink-hop checks. Personal lock names use the canonical asset root. The two
-alias-related deployment cases were updated and a focused regression covers
-canonical resolution, external locks and rejection before prohibited access.
+alias-related deployment cases were updated.
 Other migrated runtime behavior is unchanged, apart from text line endings.
 
 ## Validation boundary
-
-CPU checks cover allocation/ownership, scheduling, grants and replay,
-transport deadlines, startup/shutdown, native-channel closure and pinned-source
-bootstrap contracts. They use temporary fixtures and simulated rank reports
-only within test code. No GPU correctness, capacity or performance claim follows.
 
 Historical GPU acceptance belongs to the prior project and its harness. This
 branch has not been clean-installed. Later commits reduce the per-token mapping

@@ -26,8 +26,7 @@ step boundary when a prefill waits for credits, cancellation/timeout arrives,
 or capacity recovery protects another request. Ranks keep one authenticated
 RPC connection, long-poll their commands, and the driver wakes on controller
 activity instead of polling. The gateway's `/metrics` exposes the controller's
-per-stage totals; `acceptance/control_plane_e2e_check.py` runs the full control
-plane with simulated rank processes on CPU.
+per-stage totals.
 
 `decode_cuda_graph: true` captures D-stage decode forwards as SGLang-native
 full CUDA graphs (batch sizes 1..`max_model_inflight`; P stays eager). Capture
@@ -138,8 +137,7 @@ driver passes and builds the policy snapshot from one batch index.
 Prefill and decode overlap, all off by default: `prefill_graph_tokens`
 (`PREFILL_GRAPH_TOKENS=16,32,...`) sets the token counts captured for prefill
 CUDA graphs; `prefill_break_slim` (`BREAK_SLIM=1`) makes each layer's graph
-break lighter (same results, checked on GPU by
-`acceptance/graph_break_slim_gpu_check.py`); `prefill_start_unparked`
+break lighter (same results); `prefill_start_unparked`
 (`START_UNPARKED=1`) starts a READY prefill before every decode run parked;
 `handoff_local_success` (`HANDOFF_LOCAL=1`) lets a waiting D rank pop a
 validated handoff at once; `prefill_overlap_decode` (`OVERLAP=1`, requires
@@ -166,8 +164,7 @@ the HTTP gateway (sockets, SSE, tokenizer) in a child process fed by one pipe;
 `event_lean_copies` (`LEAN_EVENTS=1`) passes runtime events on without deep
 copies; `driver_lean_locking` (`DRIVER_LEAN=1`) takes the owner lock fewer
 times per driver pass; `owner_switch_interval_us` (`OWNER_SWITCH_US=500`) sets
-the owner's interpreter switch interval. `acceptance/owner_speed_check.py`
-covers them on CPU.
+the owner's interpreter switch interval.
 
 The fastest open-loop ShareGPT configuration so far (alpha 0.7, rate scale 1.0,
 257 requests; three rounds 510-525 tok/s against the original's 480.56) is the

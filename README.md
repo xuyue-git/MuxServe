@@ -30,8 +30,7 @@ muxserve/
 csrc/headwise/     Head-wise CUDA kernels, built as muxserve._headwise
 configs/           deployment configs (TOML), ablation steps, local settings template
 upstream-reference/ separate-engine identity pin and the 13 recorded patch hashes
-tools/             verify the separate engine, preflight locks, CPU checks, trace summary
-acceptance/        CPU checks (storage, control, transport, simulated 24-rank e2e)
+tools/             verify the separate engine, preflight locks, trace summary
 benchmark/         xbench catalogue (the benchmark), patch ablation steps,
                    original placement/workload tooling
 ```
@@ -118,17 +117,6 @@ server, Rust radix tree) are not used by this project.
 
 Runtime switches and their measured effects are documented in
 [docs/runtime.md](docs/runtime.md).
-
-## CPU checks
-
-```bash
-python -I -B tools/check_cpu.py
-```
-
-Linux Python 3.10+ (WSL works) with `numpy` and `pyzmq`. Without the materialized
-SGLang source, three checks are skipped (`--require-source` makes that an error).
-`acceptance/no_vllm_check.py` fails if any vLLM import or requirement appears.
-These checks do not load weights or validate CUDA execution or performance.
 
 ## Citation
 

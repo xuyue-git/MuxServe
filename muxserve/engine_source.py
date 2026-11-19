@@ -1,7 +1,7 @@
 """Locate the separate engine checkout for source checks, never for imports.
 
 Serving imports the installed ``sglang`` package normally. These helpers are
-only for build tools and CPU checks which inspect the engine's source files.
+only for build tools and tests which inspect the engine's source files.
 """
 from __future__ import annotations
 
