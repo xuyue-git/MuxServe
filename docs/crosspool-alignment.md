@@ -17,7 +17,7 @@ README、`docs/tutorials/quick-start.md`、`docs/tutorials/tooling.md`、`pyproj
 | 配置文件格式 | TOML | TOML（部署配置、本地设置、消融配置；启动器内部写给子进程的解析结果仍是 JSON） |
 | 运行命令形状 | `uv run xpool <子命令>` | `uv run muxserve serve CONFIG.toml` |
 | 查看实际生效的配置 | `uv run xpool config dump` | `uv run muxserve config dump CONFIG.toml` |
-| 基准用例 | `benches.toml`，严格 schema | 同一 schema（已用 CrossPool 的 `case.py` 校验 80 个用例） |
+| 基准用例 | `benches.toml`，严格 schema | 同一 schema（现有 20 个 Figure 5 用例；删减前的 80 个已用 CrossPool 的 `case.py` 校验，保留的 20 个内容未改） |
 | 跑基准 | `uv run xbench run --case <前缀>` | 相同：在 CrossPool 的 `configs/xkit.local.toml` 设 `[xbench] catalog = "../../MuxServe/benchmark/xbench/benches.toml"` 后，命令完全一样 |
 | 报告 | `uv run xbench report RUN_ID` | 相同 |
 
