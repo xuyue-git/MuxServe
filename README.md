@@ -28,10 +28,10 @@ muxserve/
                    memory pool, P/D handoff, hooks used by the patched SGLang
   gateway.py       native-SGLang /generate SSE gateway (gateway_proc.py: child process)
 csrc/headwise/     Head-wise CUDA kernels, built as muxserve._headwise
-configs/           deployment configs (TOML), ablation steps, local settings template
+configs/           deployment configs (TOML), local settings template
 upstream-reference/ separate-engine identity pin and the 13 recorded patch hashes
 tools/             verify the separate engine, preflight locks, trace summary
-benchmark/         xbench catalogue (the benchmark), patch ablation steps,
+benchmark/         xbench catalogue (the benchmark),
                    original placement/workload tooling
 ```
 
@@ -109,9 +109,6 @@ server, Rust radix tree) are not used by this project.
   512/128 loads and the 20 points of the paper's Figure 5 grid); each states its
   arrival process, rates, duration, input and output lengths, and the one command
   that runs it against a launched server.
-- [`benchmark/ablation/`](benchmark/ablation/README.md): the cumulative patch
-  ablation, one complete server config per step (`configs/ablation/`), with each
-  patch's motivation and the results table.
 - `benchmark/end_to_end`, `benchmark/chatlmsys`, `muxserve/muxsched/workload_utils.py`
   and `muxserve/muxsched/placement.py`: the paper's workload generator (power-law
   popularity `alpha`, Poisson arrivals, ShareGPT lengths) and placement optimizer.

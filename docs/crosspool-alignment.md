@@ -14,7 +14,7 @@ README、`docs/tutorials/quick-start.md`、`docs/tutorials/tooling.md`、`pyproj
 | uv 版本 | `required-version = ">=0.12.17"` | 相同 |
 | 机器相关设置 | 被 git 忽略的 `.env` 和 `configs/*.local.toml`，从 `*.example` 复制 | 被 git 忽略的 `.env` 和 `configs/muxserve.local.toml`，从 `.env.example`、`configs/muxserve.example.toml` 复制；用哪四张卡写在启动命令里 |
 | 每个终端 | `export UV_ENV_FILE="$PWD/.env"` | 相同 |
-| 配置文件格式 | TOML | TOML（部署配置、本地设置、消融配置；启动器内部写给子进程的解析结果仍是 JSON） |
+| 配置文件格式 | TOML | TOML（部署配置、本地设置；启动器内部写给子进程的解析结果仍是 JSON） |
 | 运行命令形状 | `uv run xpool <子命令>` | `uv run muxserve serve CONFIG.toml` |
 | 查看实际生效的配置 | `uv run xpool config dump` | `uv run muxserve config dump CONFIG.toml` |
 | 基准用例 | `benches.toml`，严格 schema | 同一 schema（现有 22 个用例：2 个固定 512/128，20 个 Figure 5；删减前的 80 个已用 CrossPool 的 `case.py` 校验，保留的 22 个内容未改） |

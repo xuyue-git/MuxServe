@@ -1,8 +1,8 @@
 # Runtime switches and control-plane behaviour
 
 All switches below are deployment-config fields (see `muxserve/config.py`), off by
-default. Experiments set them in a complete config file (`configs/`,
-`configs/ablation/`) launched with `uv run muxserve serve CONFIG`. Upper-case names in
+default. Experiments set them in a complete config file (`configs/`)
+launched with `uv run muxserve serve CONFIG`. Upper-case names in
 the text are those of the former `tools/run_perf_point.sh`, kept only so that
 older reports can be matched; the runner has been removed.
 
@@ -10,8 +10,8 @@ older reports can be matched; the runner has been removed.
 
 `rpc_persistent_connections` (default on) keeps one authenticated connection per
 rank to the owner and reuses it for every call. Off, every call connects and
-runs the two-way challenge again, as before persistent connections; that is the
-ablation baseline (`configs/ablation/s00-baseline.toml`), not a deployment mode.
+runs the two-way challenge again, as before persistent connections; that is not
+a deployment mode.
 
 ## Decode runs and control-plane performance
 
@@ -66,7 +66,7 @@ TTFT boundary; the request is not shorter). The former runner's names are
 
 The remaining opt-in paths are grouped by where they act. Each is documented
 where it is defined in `muxserve/config.py`; `configs/a100_open_loop.toml`
-turns on the measured set, and `configs/ablation/` adds them one step at a time.
+turns on the measured set.
 
 | Stage | Config keys |
 |---|---|

@@ -257,7 +257,7 @@ class DeploymentConfig:
     rpc_inline_fast_methods: bool = False
     # Each rank keeps one authenticated RPC connection to the owner and reuses
     # it for every call. False reconnects and repeats the two-way challenge on
-    # every call, as before persistent connections (ablation baseline only).
+    # every call, as before persistent connections.
     rpc_persistent_connections: bool = True
     # Only D rank 0 reports a continuing decode step; the other ranks read its
     # decision from shared memory and report only when it is not "continue".
