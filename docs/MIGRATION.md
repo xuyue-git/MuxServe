@@ -16,7 +16,7 @@ is run from its own repository and environment when it is needed as a baseline.
   commit `a512d05496122521fb16fa620aa44d8f4d4d3d18`.
 - SGLang: `94602c9c2b7cbdb8efd5c52802dac6a1c180089e`, v0.5.20.
 - Imported CUDA code: MuxServe-vLLM `eaca02eb1a8c3654fa086594e271f4e1e09dede4`.
-  Its notices, license and source manifest are retained in `native/headwise`.
+  Its notices, license and source manifest are retained in `csrc/headwise`.
 
 The fork retains its original commits. New commits separate build, storage,
 scheduling, native execution, startup, portable asset paths and validation.

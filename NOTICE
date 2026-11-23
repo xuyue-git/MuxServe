@@ -6,8 +6,9 @@ Scheduling rules derive from MuxServe
 9fb0fa555bb4051bee612b72938e5d85796dffec.
 Head-wise CUDA sources derive from MuxServe-vLLM
 eaca02eb1a8c3654fa086594e271f4e1e09dede4; existing NVIDIA, vLLM and
-FasterTransformer source notices and native/headwise/LICENSE are retained.
+FasterTransformer source notices and csrc/headwise/LICENSE are retained.
 The external SGLang source is v0.5.20,
 94602c9c2b7cbdb8efd5c52802dac6a1c180089e, under Apache-2.0.
 The parent fork retains its upstream LICENSE.txt.
-No CrossPool source is included in this core preview.
+benchmark/xbench includes CrossPool's serving suite unmodified and adapts its
+catalogue, under the MIT license in benchmark/xbench/CROSSPOOL-LICENSE.
