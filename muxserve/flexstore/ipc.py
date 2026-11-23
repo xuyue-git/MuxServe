@@ -408,57 +408,12 @@ class StorageRPCClient:
             raise IntegrationError(response["code"], response["message"])
         return response["result"]
 
-    # Explicit methods match the logical store, convenient for controller use.
-    def register_model(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("register_model", *args, **kwargs)
-
-    def reserve_kv(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("reserve_kv", *args, **kwargs)
-
-    def bind_kv(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("bind_kv", *args, **kwargs)
-
-    def start_kv_batch(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("start_kv_batch", *args, **kwargs)
-
-    def finish_kv_batch(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("finish_kv_batch", *args, **kwargs)
-
-    def abort_kv_batch(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("abort_kv_batch", *args, **kwargs)
-
-    def release_kv(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("release_kv", *args, **kwargs)
-
-    def fence_batch(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("fence_batch", *args, **kwargs)
-
-    def retire_history(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("retire_history", *args, **kwargs)
-
-    def snapshot(self) -> dict:
-        return self.call("snapshot")
-
-    def assert_integrity(self) -> dict:
-        return self.call("assert_integrity")
-
-    def export_pool(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("export_pool", *args, **kwargs)
-
-    def release_consumer(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call("release_consumer", *args, **kwargs)
-
-    def close_owner(self) -> None:
-        return self.call("close_owner")
-
 
 class StorageRPCServer:
     def __init__(self, store: HeadwiseStore, gpu_storage: Any, address: str,
                  authkey: bytes, timeout_s: float = 30.0,
                  extra_methods: dict[str, Callable[..., Any]] | None = None,
-                 allow_owner_shutdown: bool = False,
                  owner_close: Callable[[], None] | None = None,
-                 failure_event: Any = None,
                  inline_methods: tuple[str, ...] = (),
                  eager_io: bool = False):
         # If the keeper cannot start, this constructor thread itself must be
@@ -468,7 +423,6 @@ class StorageRPCServer:
         self.gpu_storage = gpu_storage
         self.failure_status: str | None = None
         self.failure_event = Event()
-        self._external_failure_event = failure_event
         self._failure_hold = Event()  # Never set while ownership is uncertain.
         self._serving = Event()
         self._failure_thread: Thread | None = None
@@ -485,7 +439,7 @@ class StorageRPCServer:
                                           name="storage-owner-lifetime-keeper")
             self._failure_thread.start()
             self._initialize(store, address, authkey, timeout_s,
-                             extra_methods, allow_owner_shutdown, inline_methods, eager_io)
+                             extra_methods, inline_methods, eager_io)
         except BaseException:
             self._mark_failure("RPC_INIT_FAILED")
             self._retain_until_safe()
@@ -493,7 +447,7 @@ class StorageRPCServer:
 
     def _initialize(self, store: HeadwiseStore, address: str, authkey: bytes,
                     timeout_s: float, extra_methods: dict[str, Callable[..., Any]] | None,
-                    allow_owner_shutdown: bool, inline_methods: tuple[str, ...] = (),
+                    inline_methods: tuple[str, ...] = (),
                     eager_io: bool = False) -> None:
         _validate_options(authkey, timeout_s)
         self.address = _validate_endpoint(address, create=True)
@@ -503,14 +457,9 @@ class StorageRPCServer:
         self._methods = {name: getattr(store, name) for name in (
             "register_model", "reserve_kv", "bind_kv", "start_kv_batch", "finish_kv_batch",
             "abort_kv_batch", "release_kv", "fence_batch", "retire_history",
-            "snapshot", "assert_integrity")}
+            "snapshot")}
         self._methods.update({"export_pool": self.gpu_storage.export_pool,
-                              "release_consumer": self.gpu_storage.release_consumer,
-                              "owner_snapshot": self.gpu_storage.owner_snapshot})
-        # A composite owner must also protect its weight exports. Shutdown is
-        # opt-in; enable it only for KV-only owners or a combined owner facade.
-        if allow_owner_shutdown:
-            self._methods["close_owner"] = self._request_shutdown
+                              "release_consumer": self.gpu_storage.release_consumer})
         # Extensions are explicitly supplied by trusted owner code, never named
         # dynamically by an RPC client. Root may add weight-export endpoints.
         for name, method in (extra_methods or {}).items():
@@ -542,8 +491,6 @@ class StorageRPCServer:
         # text, request payloads, or the authentication key.
         self.failure_status = status
         self.failure_event.set()
-        if self._external_failure_event is not None:
-            self._external_failure_event.set()
 
     def _hold_failure(self) -> None:
         # Bound target retains this server and its GPU owner strongly until an
@@ -722,33 +669,3 @@ class StorageRPCServer:
         # If serving has begun, serve_forever releases it after handlers drain.
         if not self._serving.is_set():
             self._failure_hold.set()
-
-
-def spawn_storage_owner(pool_blocks_by_rank: dict[int, int], rank_devices: dict[int, int],
-                        address: str, authkey: bytes, timeout_s: float = 30.0):
-    """Spawn a non-daemon CUDA owner; caller must keep it alive and drain it.
-
-    The process is intentionally not automatically terminated on timeout. Its
-    live/fenced allocations and CUDA consumers may still depend on its buffers.
-    """
-    from multiprocessing import get_context
-    _validate_options(authkey, timeout_s)
-    _validate_endpoint(address, create=True)
-    context = get_context("spawn")
-    failure_event = context.Event()
-    process = context.Process(target=_owner_main,
-        args=(dict(pool_blocks_by_rank), dict(rank_devices), address, authkey, timeout_s, failure_event),
-        daemon=False, name="muxserve-headwise-owner")
-    process.storage_failure_event = failure_event
-    process.start()
-    return process
-
-
-def _owner_main(pools: dict[int, int], devices: dict[int, int], address: str,
-                authkey: bytes, timeout_s: float, failure_event: Any = None) -> None:
-    from muxserve.flexstore.gpu_storage import GPUStorage
-    store = HeadwiseStore(pools)
-    gpu = GPUStorage(store, devices)
-    server = StorageRPCServer(store, gpu, address, authkey, timeout_s,
-                              allow_owner_shutdown=True, failure_event=failure_event)
-    server.serve_forever()

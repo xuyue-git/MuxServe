@@ -50,9 +50,6 @@ class _FreeBlocks:
         self.data[self.top:self.top + count] = blocks[::-1]
         self.top += count
 
-    def as_set(self) -> set[int]:
-        return set(self.data[:self.top].tolist())
-
 
 @dataclass
 class _Allocation:
@@ -621,57 +618,6 @@ class HeadwiseStore:
                     "lifetime_batch_limit": self._batch_history_limit},
             }
 
-    def assert_integrity(self) -> dict:
-        """Raise INVARIANT_VIOLATION on ownership/mapping corruption; no CUDA use."""
-        with self._lock:
-            owned: dict[int, set[int]] = {r: set() for r in self._pool}
-            model_owned = {mid: {r: set() for r in self._pool} for mid in self._model_ids}
-            def check(condition: bool, message: str) -> None:
-                if not condition:
-                    raise IntegrationError("INVARIANT_VIOLATION", message)
-            for aid, a in self._allocations.items():
-                check(self._identities.get(a.identity) == aid, "Identity index mismatch")
-                check(0 <= a.valid <= min(a.capacity, self._max_context), "Invalid valid length")
-                check(bool(a.holders) or a.active is not None, "Unprotected allocation")
-                if a.active is not None:
-                    batch = self._batches.get(a.active)
-                    check(batch is not None and batch.state in {"PREPARING", "RUNNING", "FENCED"}
-                          and aid in batch.old_capacity, "Batch access mismatch")
-                check(set(a.arrays) == set(a.layout.ranks), "Rank mapping mismatch")
-                groups = a.capacity // a.layout.block_size
-                for r, table in a.arrays.items():
-                    check(table.dtype == np.int32 and table.ndim == 3, "Block table type mismatch")
-                    check(table.shape[0] == a.layout.num_layers, "Layer count mismatch")
-                    check(table.shape[1] == a.layout.kv_heads_per_rank, "Head count mismatch")
-                    check(table.shape[2] >= groups, "Ceil token mapping mismatch")
-                    for block in a.mapped(r).reshape(-1).tolist():
-                        check(0 <= block < self._pool[r] and block not in owned[r], "Duplicate/invalid block")
-                        owned[r].add(block)
-                        if self._pool_mode == "static":
-                            check(block in self._model_ranges[a.identity.model_id][r],
-                                  "Allocation escaped its static model partition")
-                            model_owned[a.identity.model_id][r].add(block)
-            for r, blocks in owned.items():
-                free = self._free_set(r)
-                check(len(free) == self._free_count(r), "Duplicate free block")
-                check(not (blocks & free), "Live block marked free")
-                check(blocks | free == set(range(self._pool[r])), "Pool accounting mismatch")
-            if self._pool_mode == "static":
-                for mid in self._model_ids:
-                    for rank in self._pool:
-                        partition = set(self._model_ranges[mid][rank])
-                        free = self._model_free[mid][rank].as_set()
-                        check(len(free) == len(self._model_free[mid][rank]), "Duplicate free block")
-                        check(not (model_owned[mid][rank] & free), "Live model block marked free")
-                        check(model_owned[mid][rank] | free == partition,
-                              "Static model partition accounting mismatch")
-            for rid, b in self._batches.items():
-                if b.state in {"PREPARING", "RUNNING", "FENCED"}:
-                    check(all(aid in self._allocations and self._allocations[aid].active == rid
-                              for aid in b.old_capacity), "Reservation allocation mismatch")
-            return {"ok": True, "allocations": len(self._allocations),
-                    "used_blocks_by_rank": {r: len(bs) for r, bs in owned.items()}}
-
     def begin_teardown(self) -> dict:
         """Freeze new ownership before GPU owner teardown, atomically with store mutations."""
         with self._lock:
@@ -701,11 +647,6 @@ class HeadwiseStore:
         if self._pool_mode == "static":
             return sum(len(self._model_free[mid][rank]) for mid in self._model_ids)
         return len(self._free[rank])
-
-    def _free_set(self, rank: int) -> set[int]:
-        if self._pool_mode == "static":
-            return set().union(*(self._model_free[mid][rank].as_set() for mid in self._model_ids))
-        return self._free[rank].as_set()
 
     def _free_source(self, allocation: _Allocation, rank: int) -> _FreeBlocks:
         if self._pool_mode == "static":

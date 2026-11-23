@@ -168,10 +168,6 @@ class HeadwiseTokenToKVPool(KVCache):
         self.graph: GraphBuffers | None = None
 
     @property
-    def bound_req_pool_indices(self) -> tuple[int, ...]:
-        return self.bound_forward.req_pool_indices
-
-    @property
     def bound_forward(self) -> BoundForward:
         _require(self._bound is not None, "No externally granted forward is bound", "UNBOUND_FORWARD")
         return self._bound
@@ -568,6 +564,3 @@ class HeadwiseTokenToKVPool(KVCache):
 
     def move_kv_cache(self, *args, **kwargs):
         raise IntegrationError("UNSUPPORTED", "Native cache mutation is unsupported for shared Head-wise storage")
-
-    def delete_buffers(self):
-        raise IntegrationError("UNSUPPORTED", "Only the authoritative storage owner may release shared buffers")

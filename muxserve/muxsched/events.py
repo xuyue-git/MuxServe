@@ -54,11 +54,6 @@ class RuntimeOutbox:
         with self.lock:
             self.reserved.pop(owner, None)
 
-    @property
-    def grants_allowed(self) -> bool:
-        with self.lock:
-            return len(self.pending) + sum(self.reserved.values()) < self.maximum_pending
-
     def owner_can_complete(self, owner: str) -> bool:
         """A prepared batch may start using slots it already guaranteed."""
         with self.lock:

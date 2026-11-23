@@ -246,10 +246,6 @@ class ADBS:
             return ()
         return tuple(result)
 
-    def suggest(self, snapshot: PolicySnapshot) -> BatchSuggestion | None:
-        suggestions = self.suggestions(snapshot)
-        return suggestions[0] if suggestions else None
-
     def admitted(self, suggestion: BatchSuggestion) -> None:
         self.cursors[suggestion.stage] = self.models.index(suggestion.model_id)
 

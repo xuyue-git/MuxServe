@@ -193,15 +193,6 @@ class GPUStorage:
             self._released[consumer_id] = ranks
             del self._consumers[consumer_id]
 
-    def owner_snapshot(self) -> dict:
-        with self._lock:
-            return {"owner_id": self.owner_id, "closing": self._closing, "closed": self._closed,
-                "rank_devices": dict(self._devices),
-                "consumers": {c: {"ranks": sorted(ls),
-                    "fenced_exports": sorted(r for r, value in ls.items() if value is None)}
-                    for c, ls in self._consumers.items()},
-                "store": self._store.snapshot()}
-
     def sharing_evidence(self) -> dict:
         """Describe existing exports without creating another CUDA refcounter."""
         with self._lock:
