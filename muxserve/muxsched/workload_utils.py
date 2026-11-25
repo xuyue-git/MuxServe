@@ -9,7 +9,14 @@ import dataclasses
 import json
 import random
 import numpy as np
-from vllm.transformers_utils.tokenizer import get_tokenizer
+try:
+    from vllm.transformers_utils.tokenizer import get_tokenizer
+except ImportError:  # SGLang engine environment: no vLLM. Only offline
+    # workload generation (sample_request_datas) uses a tokenizer.
+    from transformers import AutoTokenizer
+
+    def get_tokenizer(tokenizer_name, *args, **kwargs):
+        return AutoTokenizer.from_pretrained(tokenizer_name, *args, **kwargs)
 from transformers import PreTrainedTokenizerBase
 from typing import Any, List, Tuple, Sequence, Dict, Optional
 

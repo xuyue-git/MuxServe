@@ -18,7 +18,7 @@ from muxserve.zmq_utils import ZMQClient
 from muxserve.config import MuxServeConfig
 from muxserve.constants import (SM_HOLD_NAME_FMT, ADD_REQ_NAME_FMT,
                               RET_REQ_NAME_FMT, PREEMPT_REQ_NAME_FMT)
-from muxserve.flexserver.pipeworker import PipeWorker
+from muxserve.flexserver.partition import pipeline_split
 from muxserve.muxsched.launcher import launch_flexserver_process
 from muxserve.muxsched.resource import SMResource, SMPart
 from muxserve.muxsched.workload_utils import get_workload, Workload, Request
@@ -242,7 +242,7 @@ class MuxScheduler:
             model_config = AutoConfig.from_pretrained(job_config.model)
             tensor_parallel_size = job_config.tensor_parallel_size
             num_heads = model_config.num_attention_heads // tensor_parallel_size
-            partition = PipeWorker.pipeline_split(
+            partition = pipeline_split(
                 model_config.num_hidden_layers,
                 job_config.pipeline_parallel_size)
             num_hidden_layers = max(partition)

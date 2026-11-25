@@ -15,7 +15,7 @@ from muxserve.flexstore.weight_utils import hf_model_weights_iterator
 from muxserve.zmq_utils import ZMQServer
 
 from muxserve.memory_manager import KVStorage
-from muxserve.flexserver.pipeworker import PipeWorker
+from muxserve.flexserver.partition import pipeline_split
 
 logger = get_logger()
 
@@ -79,7 +79,7 @@ class WeightStorage:
             pre_process_weights = ["model.embed_tokens.weight"]
             post_process_weights = ["model.norm.weight", "lm_head.weight"]
             # pipeline_partition to save the num of hidden layer of every pipeline stage
-            pipeline_partition: List[int] = PipeWorker.pipeline_split(
+            pipeline_partition: List[int] = pipeline_split(
                 model_config.num_hidden_layers, pp_size)
 
         else:
@@ -403,7 +403,7 @@ class FlexStoreManager:
             model_config = AutoConfig.from_pretrained(job_config.model)
             tensor_parallel_size = job_config.tensor_parallel_size
             num_heads = model_config.num_attention_heads // tensor_parallel_size
-            pipeline_partition = PipeWorker.pipeline_split(
+            pipeline_partition = pipeline_split(
                 model_config.num_hidden_layers,
                 job_config.pipeline_parallel_size)
             num_hidden_layers = max(pipeline_partition)
@@ -522,7 +522,7 @@ class FlexStoreManager:
             model_config = AutoConfig.from_pretrained(job_config.model)
             tensor_parallel_size = job_config.tensor_parallel_size
             num_heads = model_config.num_attention_heads // tensor_parallel_size
-            partition = PipeWorker.pipeline_split(
+            partition = pipeline_split(
                 model_config.num_hidden_layers,
                 job_config.pipeline_parallel_size)
             num_hidden_layers = max(partition)

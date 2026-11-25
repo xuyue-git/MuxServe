@@ -1,3 +1,7 @@
+# The engine imports (vLLM, LLMRuntime) live in main(), so that the SGLang
+# engine (sglang_server.py) reuses MuxServeEngine below without vLLM installed.
+from __future__ import annotations
+
 import os
 import argparse
 import asyncio
@@ -7,19 +11,10 @@ from typing import Dict, Set
 
 import torch
 
-from vllm.sampling_params import SamplingParams
-from vllm.engine.arg_utils import EngineArgs
-from vllm.outputs import RequestOutput
-from vllm.model_executor.parallel_utils import parallel_state
-from vllm.zmq_tool import ZMQClient
-
 from typing import List, Optional, Union
 
 from muxserve.constants import (SM_HOLD_NAME_FMT, ADD_REQ_NAME_FMT,
                               RET_REQ_NAME_FMT, PREEMPT_REQ_NAME_FMT)
-from muxserve.flexserver.dist_utils import (_init_distributed_environment,
-                                          _setup_env)
-from muxserve.flexserver.llm_runtime import LLMRuntime
 from muxserve.muxsched.workload_utils import Workload, Request
 from muxserve.shm_utils import (create_shared_var, read_shared_var,
                               write_shared_var, dump_to_shared_var,
@@ -242,6 +237,13 @@ class MuxServeEngine:
 
 
 def main(args: argparse.Namespace):
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.zmq_tool import ZMQClient
+    from vllm.model_executor.parallel_utils import parallel_state
+    from muxserve.flexserver.dist_utils import (_init_distributed_environment,
+                                              _setup_env)
+    from muxserve.flexserver.llm_runtime import LLMRuntime
+
     # Parse the CLI argument and initialize the MuxServe Runtime.
     model_id = args.model_id
     model_name = args.model_name
@@ -288,6 +290,7 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == '__main__':
+    from vllm.engine.arg_utils import EngineArgs
     parser = argparse.ArgumentParser(description='MuxServe Runtime Server')
     parser.add_argument("--model-id",
                         type=int,
