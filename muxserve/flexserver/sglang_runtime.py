@@ -159,6 +159,7 @@ class SGLangRuntime:
         self.workers = [
             SGLangWorker(model, self.model_name, tensor_parallel_size,
                          local_rank, self.tcp_client,
+                         self.scheduler_config.max_num_batched_tokens,
                          decode_graphs=not self.is_prefill,
                          prefill_graphs=self.is_prefill)
         ]

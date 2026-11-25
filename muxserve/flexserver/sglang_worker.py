@@ -17,7 +17,8 @@ This file replaces what MuxServe-vLLM did inside one P/D rank and nothing else:
     parameter, mapped into SGLang's model.
 
 Everything SGLang decides is left to SGLang: its ServerArgs get only what the
-original's command line fixes (the model, the TP size, ports) and are resolved
+original's command line fixes (the model, the TP size, the per-batch token
+limit as SGLang's chunked prefill size, ports) and are resolved
 by SGLang for this machine. The CUDA-graph configuration (decode FULL graphs at
 SGLang's batch sizes, prefill BREAKABLE graphs at SGLang's token buckets), the
 attention backend and the TP all-reduce are read from that resolution. A prefill
@@ -511,7 +512,8 @@ class SGLangWorker:
 
     def __init__(self, model_path: str, model_name: str,
                  tensor_parallel_size: int, local_rank: int, tcp_client,
-                 decode_graphs: bool = False, prefill_graphs: bool = False) -> None:
+                 max_num_batched_tokens: int, decode_graphs: bool = False,
+                 prefill_graphs: bool = False) -> None:
         torch.cuda.set_device(local_rank)
         os.environ["MUXSERVE_EXECUTION_GROUP"] = EXECUTION_GROUP
         # torch.distributed.launch already serves the rendezvous store on
@@ -536,9 +538,13 @@ class SGLangWorker:
         master_port = int(os.environ["MASTER_PORT"])
         tp_rank = int(os.environ["RANK"])
         # Only what the original's command line fixes; SGLang resolves the rest
-        # for this machine. Each model group has its own MASTER_PORT, so the
-        # ports derived from it never collide between groups.
+        # for this machine. The original's per-batch token limit
+        # (--max-num-batched-tokens, 2048: the scheduler never sends a larger
+        # prefill) is SGLang's chunked prefill size, from which SGLang derives
+        # its prefill CUDA-graph buckets. Each model group has its own
+        # MASTER_PORT, so the ports derived from it never collide between groups.
         server_args = ServerArgs(model_path=model_path, tp_size=tensor_parallel_size,
+                                 chunked_prefill_size=max_num_batched_tokens,
                                  port=master_port + 1000, nccl_port=master_port)
         server_args.resolve_once()
         server_args.check_server_args()
