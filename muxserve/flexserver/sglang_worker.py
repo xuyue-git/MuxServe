@@ -519,6 +519,12 @@ class SGLangWorker:
         # torch.distributed.launch already serves the rendezvous store on
         # MASTER_ADDR:MASTER_PORT; SGLang joins it like the original (env://).
         os.environ["SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE"] = "env://"
+        # SGLang's FlashInfer workspace (default 384 MB per process) at 128 MB,
+        # FlashInfer's own recommended size: six rank processes share the
+        # ~12.6 GB FlexStore leaves on each 40 GB GPU, and 6 x 384 MB does not
+        # fit next to the CUDA graphs. Only the temporary space shrinks; the
+        # kernels and the computation are SGLang's default ones.
+        os.environ.setdefault("SGLANG_FLASHINFER_WORKSPACE_SIZE", str(128 * 1024 * 1024))
 
         from sglang.srt.arg_groups.overrides import (attention_backends_of,
                                                      resolved_view, resolving_view)
