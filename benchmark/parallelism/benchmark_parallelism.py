@@ -5,7 +5,7 @@ import subprocess
 import time
 from typing import List
 
-from vllm.zmq_tool import ZMQClient
+from muxserve.zmq_utils import ZMQClient
 
 from muxserve.arg_utils import MuxServeArgs
 from muxserve.config import MuxServeConfig

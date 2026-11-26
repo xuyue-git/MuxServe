@@ -1,5 +1,5 @@
 from transformers import PreTrainedTokenizerBase
-from vllm.transformers_utils.tokenizer import get_tokenizer
+from transformers import AutoTokenizer
 from typing import AsyncGenerator, List, Tuple
 from typing import Dict
 import yaml
@@ -159,7 +159,7 @@ def sample_dataset(
 
 
 def translate(args: argparse.Namespace):
-    tokenizer = get_tokenizer(args.tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
     dataset_path = args.dataset_path
     filter_out_data_path = args.filter_out_data_path

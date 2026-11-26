@@ -32,20 +32,13 @@ def launch_flexserver_process(model_id,
     prefill_option = "--is-prefill" if is_prefill else ""
     split_option = f"--split-by-model {split_by_model}" if split_by_model else ""
     runtime_profile_option = "--runtime-profile" if runtime_profile else ""
-    # The execution engine of the P/D processes: MuxServe-vLLM (default) or
-    # SGLang (sglang_server.py). Everything else is the same code either way.
-    engine = os.environ.get("MUXSERVE_ENGINE", "vllm")
-    if engine not in ("vllm", "sglang"):
-        raise ValueError(f"MUXSERVE_ENGINE must be vllm or sglang, not {engine}")
-    server_script = ("muxserve/flexserver/sglang_server.py" if engine == "sglang"
-                     else "muxserve/flexserver/muxserve_server.py")
 
     cmd = f"python -m torch.distributed.launch " \
           f"--nnodes={nnodes} " \
           f"--nproc-per-node={nproc_per_node} " \
           f"--master-addr {master_addr} " \
           f"--master-port {master_port} " \
-          f"{server_script} " \
+          f"muxserve/flexserver/muxserve_server.py " \
           f"--model-id {model_id} --model-name {name} " \
           f"--model {model} --tensor-parallel-size {tensor_parallel_size} " \
           f"--pipeline-parallel-size {pipeline_parallel_size} " \

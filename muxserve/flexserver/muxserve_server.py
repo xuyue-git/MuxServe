@@ -1,7 +1,3 @@
-# The engine imports (vLLM, LLMRuntime) live in main(), so that the SGLang
-# engine (sglang_server.py) reuses MuxServeEngine below without vLLM installed.
-from __future__ import annotations
-
 import os
 import argparse
 import asyncio
@@ -11,10 +7,13 @@ from typing import Dict, Set
 
 import torch
 
+from muxserve.zmq_utils import ZMQClient
+
 from typing import List, Optional, Union
 
 from muxserve.constants import (SM_HOLD_NAME_FMT, ADD_REQ_NAME_FMT,
                               RET_REQ_NAME_FMT, PREEMPT_REQ_NAME_FMT)
+from muxserve.flexserver.sglang_runtime import SGLangRuntime
 from muxserve.muxsched.workload_utils import Workload, Request
 from muxserve.shm_utils import (create_shared_var, read_shared_var,
                               write_shared_var, dump_to_shared_var,
@@ -27,7 +26,7 @@ logger = init_logger("MuxServe")
 
 class MuxServeEngine:
 
-    def __init__(self, llm_runtime: LLMRuntime, workload: Workload,
+    def __init__(self, llm_runtime: SGLangRuntime, workload: Workload,
                  mps_percentage: int, is_prefill: bool):
         self.llm_runtime = llm_runtime
         self.workload = workload
@@ -237,70 +236,65 @@ class MuxServeEngine:
 
 
 def main(args: argparse.Namespace):
-    from vllm.engine.arg_utils import EngineArgs
-    from vllm.zmq_tool import ZMQClient
-    from vllm.model_executor.parallel_utils import parallel_state
-    from muxserve.flexserver.dist_utils import (_init_distributed_environment,
-                                              _setup_env)
-    from muxserve.flexserver.llm_runtime import LLMRuntime
-
-    # Parse the CLI argument and initialize the MuxServe Runtime.
-    model_id = args.model_id
-    model_name = args.model_name
-    engine_args = EngineArgs.from_cli_args(args)
-    engine_configs = engine_args.create_engine_configs()
-    model_config = engine_configs[0]
-    parallel_config = engine_configs[2]
-
-    # setup env variables
-    _setup_env()
-
     # build zmq client
-    tcp_client = None
-    if model_config.flexstore_port is not None:
-        tcp_client = ZMQClient('localhost', model_config.flexstore_port)
-        local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        tcp_client.send_pyobj(["get_rank", local_rank])
-        rank = tcp_client.recv_pyobj()
-        os.environ["RANK"] = str(rank)
+    tcp_client = ZMQClient('localhost', args.flexstore_port)
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    tcp_client.send_pyobj(["get_rank", local_rank])
+    rank = tcp_client.recv_pyobj()
+    os.environ["RANK"] = str(rank)
+    if args.pipeline_parallel_size != 1:
+        raise SystemExit("The SGLang engine runs pipeline_parallel_size 1")
 
-    _init_distributed_environment(parallel_config, model_config.seed)
+    llm_runtime = SGLangRuntime(
+        model_id=args.model_id,
+        model_name=args.model_name,
+        model=args.model,
+        tp_rank=rank % args.tensor_parallel_size,
+        stage_id=0,
+        tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
+        block_size=args.block_size,
+        mps_percentage=args.mps_percentage,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        local_rank=local_rank,
+        tcp_client=tcp_client,
+        runtime_profile=args.runtime_profile,
+        is_prefill=args.is_prefill)
 
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    stage_id = parallel_state.get_pipeline_model_parallel_rank()
-    llm_runtime = LLMRuntime(model_id,
-                             model_name,
-                             tp_rank,
-                             stage_id,
-                             *engine_configs,
-                             tcp_client=tcp_client,
-                             runtime_profile=args.runtime_profile)
-
-    # workload = Workload.from_workload_file(engine_args.workload_file)
     workload = None
-    if engine_args.split_by_model is not None and workload is not None:
-        workload = workload.split_by_models(
-            engine_args.split_by_model.split(","))
-
     muxserve_engine = MuxServeEngine(llm_runtime, workload,
-                                 engine_args.mps_percentage,
-                                 engine_args.is_prefill)
+                                 args.mps_percentage,
+                                 args.is_prefill)
     # Start the engine loop.
     muxserve_engine.serve()
 
 
 if __name__ == '__main__':
-    from vllm.engine.arg_utils import EngineArgs
     parser = argparse.ArgumentParser(description='MuxServe Runtime Server')
     parser.add_argument("--model-id",
                         type=int,
                         default=0,
                         help="The index of served model.")
-    parser.add_argument("--local-rank", type=int)
+    parser.add_argument("--local-rank", "--local_rank", type=int)
     parser.add_argument('--runtime-profile', action='store_true')
-    parser = EngineArgs.add_cli_args(parser)
+    # The arguments muxsched/launcher.py passes.
+    parser.add_argument("--model-name", type=str, required=True)
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--swap-space", type=float, default=4)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    parser.add_argument("--max-num-seqs", type=int, default=256)
+    parser.add_argument("--flexstore-port", type=int, required=True)
+    parser.add_argument("--workload-file", type=str, default=None)
+    parser.add_argument("--mps-percentage", type=int, required=True)
+    parser.add_argument("--is-prefill", action="store_true")
+    parser.add_argument("--split-by-model", type=str, default=None)
     args = parser.parse_args()
 
-    os.environ["LOCAL_RANK"] = str(args.local_rank)
+    if args.local_rank is not None:
+        os.environ["LOCAL_RANK"] = str(args.local_rank)
 
     main(args)

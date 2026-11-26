@@ -9,14 +9,7 @@ import dataclasses
 import json
 import random
 import numpy as np
-try:
-    from vllm.transformers_utils.tokenizer import get_tokenizer
-except ImportError:  # SGLang engine environment: no vLLM. Only offline
-    # workload generation (sample_request_datas) uses a tokenizer.
-    from transformers import AutoTokenizer
-
-    def get_tokenizer(tokenizer_name, *args, **kwargs):
-        return AutoTokenizer.from_pretrained(tokenizer_name, *args, **kwargs)
+from transformers import AutoTokenizer
 from transformers import PreTrainedTokenizerBase
 from typing import Any, List, Tuple, Sequence, Dict, Optional
 
@@ -574,7 +567,7 @@ def sample_request_datas(
 ):
     # sample requests to fill the workload
     if tokenizer is None and tokenized_cache_path is None:
-        tokenizer = get_tokenizer(DEFAULT_TOKENIZER_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(DEFAULT_TOKENIZER_PATH)
     requests = sample_requests(num_requests,
                                tokenizer,
                                dataset_path,
@@ -647,7 +640,7 @@ def get_workload(
 
     if sampled_requests is None:
         # sample requests to fill the workload
-        tokenizer = get_tokenizer(tokenizer_path)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         requests = sample_requests(len(workload),
                                    tokenizer,
                                    dataset_path,
@@ -666,7 +659,7 @@ def replace_long_workloads(workload,
                            prompt_len,
                            output_len,
                            distribution: str = "fixed"):
-    tokenizer = get_tokenizer(tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     num_requests = len(workload)
     workload_reqs = generate_workload_requests(num_requests,
                                                prompt_len,
