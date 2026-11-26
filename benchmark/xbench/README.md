@@ -35,47 +35,60 @@ ADBS 启动时要知道各模型的到达率。用 `--alpha A --rate-scale S` �
 
 ## 跑一个点
 
-**1. 服务端**，在本仓库根目录。用装了 SGLang 的 Python 环境，第一次先编译扩展：`python tools/build_sglang_ext.py`。
+用 uv 启动，和 CrossPool 一样。uv 只负责运行启动脚本 `server.py`（只用 Python 标准库）；
+服务端本身还是在 `.env` 里写的那个 SGLang 环境里跑，uv 不装、不改这个环境。
+
+**第一次**（每台机器做一次），在本仓库根目录：
+
+1. 把本目录的 `.env.example` 复制成 `.env`（git 不收），填两项：
+   `MUXSERVE_ENV` = 装了 SGLang 分支的 Python 环境，`CUDA_HOME` = CUDA 13.2。
+2. 编译扩展：`uv run benchmark/xbench/server.py build`
+
+**终端 1：服务端**，在本仓库根目录。`--alpha`、`--rate-scale` 选 20 个点中的哪一个（见上表，
+或 `uv run benchmark/xbench/server.py points`），`--gpus` 选哪四张卡：
 
 ```bash
-export PATH=<SGLang 环境>/bin:/usr/local/cuda-13.2/bin:$PATH PYTHONPATH=$PWD SGLANG_BUILD_RUST_EXTS=none
-export MPS=/tmp/mxo-$USER-mps CUDA_MPS_PIPE_DIRECTORY=/tmp/mxo-$USER-mps/nvidia-mps CUDA_MPS_LOG_DIRECTORY=/tmp/mxo-$USER-mps/nvidia-log
-export CUDA_VISIBLE_DEVICES=$(nvidia-smi -i 3,4,5,6 --query-gpu=uuid --format=csv,noheader | paste -sd,)
-mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
-nvidia-cuda-mps-control -d
-python -m muxserve.launch --nproc_per_node 4 --master-port 39335 \
-  benchmark/xbench/fig5-a0.7-s1.0.yaml --server-port 29702 --flexstore-port 33651 --mps-dir $MPS \
-  --schedule-approach adbs --max-num-batched-tokens 2048 --http-port 18080 \
-  --alpha 0.7 --rate-scale 1.0
+uv run benchmark/xbench/server.py start --alpha 0.7 --rate-scale 2.0 --gpus 0,1,2,3
 ```
 
-- 原版用同样的 `python -m muxserve.launch ...` 命令和参数，在原版仓库（`Muxserve-change` 分支）里、用原版自己的
-  Python 3.9 / CUDA 11.8 环境启动，见那边的 `examples/xbench/README.md`。原版的 yaml 放在它的 `examples/xbench/` 下，
-  和本目录的 `fig5-a0.7-s1.0.yaml` 逐字节相同（sha256 `7134a3df…`）；这份 yaml 里的注释也是原版那份的原文，所以写的是 `examples/xbench`。
-- 用哪四张卡写在 `nvidia-smi -i` 后面。**`CUDA_VISIBLE_DEVICES` 必须用 GPU UUID，不能用编号**：
-  私有 MPS 也在这个变量下启动，写编号会被当成 MPS 那几张卡里的相对编号。
-- 换负载点只改最后一行的 `--alpha`、`--rate-scale`，客户端换成对应的用例。
+出现 `Server ready` 后，屏幕上会写出这个点对应的 xbench 命令。调度器空闲 240 秒会自己退出（原版行为），
+所以就绪后要尽快开始测。
 
-**2. 客户端**，日志出现 `MuxScheduler HTTP entry on http://127.0.0.1:18080` 后，在 CrossPool 目录：
+**终端 2：客户端**，在 CrossPool 目录：
 
 ```bash
-uv run xbench run --case 2bdea08f
-uv run xbench report <运行编号>
+uv run xbench run --case 401a4222
+uv run xbench report --list | tail -1     # 最新的运行编号
+uv run xbench report <运行编号>            # 生成 report.md 和图
 ```
 
 CrossPool 的 `configs/xkit.local.toml` 里 `[xbench]` 的 `catalog` 指向要用的 `benches.toml`。
 2026-11-25/26 那次 20 个点的实验，catalog 指的是 `Muxserve-SGLang` 分支 `benchmark/xbench/benches.toml`，
-其中这 20 个用例和输入与本目录逐字节相同。一条命令只跑一个用例；调度器空闲 240 秒会自己退出（原版行为），
-入口开放后要尽快开始测。
+其中这 20 个用例和输入与本目录逐字节相同。一条命令只跑一个用例。
 
-## 停止
-
-先在启动终端按 Ctrl-C（原版自己的停止方式），再执行：
+**停止**：终端 1 按 Ctrl-C。终端关了或不在手边，就在本仓库根目录运行：
 
 ```bash
-echo quit | CUDA_MPS_PIPE_DIRECTORY=/tmp/mxo-$USER-mps/nvidia-mps nvidia-cuda-mps-control
-pgrep -u $USER -af "muxserve.entrypoint|muxserve_server.py|torch.distributed.launch"
+uv run benchmark/xbench/server.py stop
 ```
 
-第一条关掉本次的 MPS，第二条确认没有残留进程；
-如有残留，只结束这些进程：`pkill -TERM -u $USER -f "muxserve.entrypoint|muxserve_server.py|torch.distributed.launch"`。
+两种方式一样：先像 Ctrl-C 那样停服务端（等 30 秒，还没停再发 TERM、HUP，不发 kill -9），
+再关掉这次的 MPS。只停本仓库启动的进程。
+
+### start 具体做了什么
+
+和以前手动启动完全一样，只是不用自己敲：
+
+1. 把 `--gpus` 的编号换成 GPU UUID：私有 MPS 也在 `CUDA_VISIBLE_DEVICES` 下启动，写编号会被当成
+   MPS 那几张卡里的相对编号；
+2. 在 `/tmp/mxo-$USER-mps` 起私有 MPS，并确认环境里看得到 4 张卡；
+3. 用 `.env` 里的环境运行
+   `python -m muxserve.launch --nproc_per_node 4 --master-port 39335 benchmark/xbench/fig5-a0.7-s1.0.yaml --server-port 29702 --flexstore-port 33651 --mps-dir /tmp/mxo-$USER-mps --schedule-approach adbs --max-num-batched-tokens 2048 --http-port 18080 --alpha A --rate-scale S`。
+
+每次的日志在 `log/xbench/a<alpha>-s<scale>-<时间>/`：`server.log`（服务端输出）、`proc/`（各进程日志）、
+`command.txt`（实际用的环境变量、命令和代码版本）。加 `--dry-run` 只打印这些，不启动。
+
+- 原版用同样的方式启动：在原版仓库（`Muxserve-change` 分支）运行 `uv run examples/xbench/server.py start ...`，
+  见那边的 `examples/xbench/README.md`。原版的 yaml 放在它的 `examples/xbench/` 下，
+  和本目录的 `fig5-a0.7-s1.0.yaml` 逐字节相同（sha256 `7134a3df…`）；这份 yaml 里的注释也是原版那份的原文，所以写的是 `examples/xbench`。
+- 同一时间只能跑一个服务端：原版和 baseline 用同样的端口和 MPS 目录。另一个还在跑时，`start` 会提示先 `stop`。
