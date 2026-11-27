@@ -50,7 +50,7 @@ YAML = "benchmark/xbench/fig5-a0.7-s1.0.yaml"
 ENV_HELP = "the SGLang environment (Python 3.12, SGLang fork xuyue-git/sglang-engine muxserve-v0.5.20)"
 # Extensions built by tools/build_sglang_ext.py (`build`); start checks they exist.
 EXTENSIONS = ("memory_manager", "batch_scheduler")
-# Kernels the SGLang fork compiles on first use; `build` compiles them ahead of time.
+# The SGLang fork's kernels, built ahead by `build` (the server imports them prebuilt).
 PREBUILD = ("sglang.kernels.ops.attention.headwise",)
 
 
