@@ -1,0 +1,739 @@
+# Adapted from CrossPool. Copyright (c) 2026 Yip Coekjan.
+# MIT License: see CROSSPOOL-LICENSE.
+# xbench cases for the paper's Figure 5 grid, in CrossPool's hosted case format
+# (Coekjan/CrossPool@987b2d5777725494d56ebbaaa1f918c90b9cfbd4, docs/tutorials/xbench.md, MIT):
+# alpha {0.7, 0.9, 1.3, 1.7, 2.1} x rate scale {1.0, 1.5, 2.0, 2.5}, 20 cases. The original's
+# copy (Muxserve-change, examples/xbench/benches.toml) and the baseline's copy
+# (benchmark/xbench/benches.toml) are the same file; each case starts the server.py next to it.
+#
+# xbench starts and stops the server (mode "hosted"): it runs server.py with the point's alpha
+# and rate scale (launch_settings) on four GPUs it leases from CUDA_VISIBLE_DEVICES, on an HTTP
+# port it picks, and sends OpenAI Completions requests (README.md). The requests are generated
+# as in CrossPool's own cases (benches/benches.toml there):
+#   arrivals  Poisson over 60 s at the paper's power-law rates, 2.0 * S / (rank + 1)^alpha req/s
+#             for 7B / 13B / 30B (rank 0 / 1 / 2), the rates the server's ADBS is given;
+#   prompts   random token ids, log-normal length (median 1/8 of the legal range, sigma 1);
+#   outputs   log-normal length (median 1/32 of the legal range, sigma 1, at most 2x the input),
+#             greedy, EOS ignored (MuxServe always generates the full length).
+# Seed 0 for every case, so both versions get identical requests; the request counts below are
+# xbench's for that seed. No warmup, as in the original's Figure 5 replay.
+
+# --- p01: alpha 0.7, rate scale 1.0 ----------------------------------------------------
+# 2.0 / 1.2311 / 0.9269 req/s -> 234 requests (106 / 72 / 56), 77519 input and
+# 7276 output tokens.
+[serving_cases.596bb910-2d15-4ce8-a3bd-8bd4805641ff]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 0.7 rate scale 1.0: Poisson arrivals at 2.0 / 1.2311 / 0.9269 req/s over 60 s (234 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 0.7, rate_scale = 1.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.596bb910-2d15-4ce8-a3bd-8bd4805641ff.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 2.0, "huggyllama/llama-13b" = 1.2311444133449163, "huggyllama/llama-30b" = 0.9269261135439395 }
+
+[[serving_cases.596bb910-2d15-4ce8-a3bd-8bd4805641ff.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.596bb910-2d15-4ce8-a3bd-8bd4805641ff.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.596bb910-2d15-4ce8-a3bd-8bd4805641ff.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p02: alpha 0.7, rate scale 1.5 ----------------------------------------------------
+# 3.0 / 1.8467 / 1.3904 req/s -> 372 requests (172 / 113 / 87), 129270 input and
+# 13032 output tokens.
+[serving_cases.c02fa7c4-1de4-4047-a581-121111f2e525]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 0.7 rate scale 1.5: Poisson arrivals at 3.0 / 1.8467 / 1.3904 req/s over 60 s (372 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 0.7, rate_scale = 1.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.c02fa7c4-1de4-4047-a581-121111f2e525.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 3.0, "huggyllama/llama-13b" = 1.8467166200173746, "huggyllama/llama-30b" = 1.3903891703159093 }
+
+[[serving_cases.c02fa7c4-1de4-4047-a581-121111f2e525.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.c02fa7c4-1de4-4047-a581-121111f2e525.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.c02fa7c4-1de4-4047-a581-121111f2e525.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p03: alpha 0.7, rate scale 2.0 ----------------------------------------------------
+# 4.0 / 2.4623 / 1.8539 req/s -> 497 requests (238 / 143 / 116), 178028 input and
+# 16043 output tokens.
+[serving_cases.2868bf58-3150-4582-a692-b840506c7bf4]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 0.7 rate scale 2.0: Poisson arrivals at 4.0 / 2.4623 / 1.8539 req/s over 60 s (497 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 0.7, rate_scale = 2.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.2868bf58-3150-4582-a692-b840506c7bf4.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 4.0, "huggyllama/llama-13b" = 2.4622888266898326, "huggyllama/llama-30b" = 1.853852227087879 }
+
+[[serving_cases.2868bf58-3150-4582-a692-b840506c7bf4.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.2868bf58-3150-4582-a692-b840506c7bf4.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.2868bf58-3150-4582-a692-b840506c7bf4.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p04: alpha 0.7, rate scale 2.5 ----------------------------------------------------
+# 5.0 / 3.0779 / 2.3173 req/s -> 624 requests (291 / 184 / 149), 227146 input and
+# 20427 output tokens.
+[serving_cases.e8508945-ce25-4652-857a-3a3e105e7e1e]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 0.7 rate scale 2.5: Poisson arrivals at 5.0 / 3.0779 / 2.3173 req/s over 60 s (624 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 0.7, rate_scale = 2.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.e8508945-ce25-4652-857a-3a3e105e7e1e.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 5.0, "huggyllama/llama-13b" = 3.077861033362291, "huggyllama/llama-30b" = 2.3173152838598488 }
+
+[[serving_cases.e8508945-ce25-4652-857a-3a3e105e7e1e.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.e8508945-ce25-4652-857a-3a3e105e7e1e.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.e8508945-ce25-4652-857a-3a3e105e7e1e.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p05: alpha 0.9, rate scale 1.0 ----------------------------------------------------
+# 2.0 / 1.0718 / 0.7441 req/s -> 216 requests (106 / 63 / 47), 72867 input and
+# 5807 output tokens.
+[serving_cases.d9dc6559-06cd-4f4a-aed7-656ea8294724]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 0.9 rate scale 1.0: Poisson arrivals at 2.0 / 1.0718 / 0.7441 req/s over 60 s (216 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 0.9, rate_scale = 1.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.d9dc6559-06cd-4f4a-aed7-656ea8294724.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 2.0, "huggyllama/llama-13b" = 1.0717734625362931, "huggyllama/llama-30b" = 0.744082116022603 }
+
+[[serving_cases.d9dc6559-06cd-4f4a-aed7-656ea8294724.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.d9dc6559-06cd-4f4a-aed7-656ea8294724.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.d9dc6559-06cd-4f4a-aed7-656ea8294724.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p06: alpha 0.9, rate scale 1.5 ----------------------------------------------------
+# 3.0 / 1.6077 / 1.1161 req/s -> 344 requests (172 / 102 / 70), 119661 input and
+# 12267 output tokens.
+[serving_cases.97cb9b08-f4e0-4437-9ac2-50c436821496]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 0.9 rate scale 1.5: Poisson arrivals at 3.0 / 1.6077 / 1.1161 req/s over 60 s (344 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 0.9, rate_scale = 1.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.97cb9b08-f4e0-4437-9ac2-50c436821496.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 3.0, "huggyllama/llama-13b" = 1.6076601938044397, "huggyllama/llama-30b" = 1.1161231740339044 }
+
+[[serving_cases.97cb9b08-f4e0-4437-9ac2-50c436821496.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.97cb9b08-f4e0-4437-9ac2-50c436821496.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.97cb9b08-f4e0-4437-9ac2-50c436821496.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p07: alpha 0.9, rate scale 2.0 ----------------------------------------------------
+# 4.0 / 2.1435 / 1.4882 req/s -> 453 requests (238 / 119 / 96), 162772 input and
+# 15083 output tokens.
+[serving_cases.3c0ec869-94d8-45b2-82ff-60252cca4946]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 0.9 rate scale 2.0: Poisson arrivals at 4.0 / 2.1435 / 1.4882 req/s over 60 s (453 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 0.9, rate_scale = 2.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.3c0ec869-94d8-45b2-82ff-60252cca4946.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 4.0, "huggyllama/llama-13b" = 2.1435469250725863, "huggyllama/llama-30b" = 1.488164232045206 }
+
+[[serving_cases.3c0ec869-94d8-45b2-82ff-60252cca4946.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.3c0ec869-94d8-45b2-82ff-60252cca4946.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.3c0ec869-94d8-45b2-82ff-60252cca4946.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p08: alpha 0.9, rate scale 2.5 ----------------------------------------------------
+# 5.0 / 2.6794 / 1.8602 req/s -> 564 requests (291 / 157 / 116), 202427 input and
+# 18340 output tokens.
+[serving_cases.265f3d0f-9fa9-4193-b994-f5fe461e726e]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 0.9 rate scale 2.5: Poisson arrivals at 5.0 / 2.6794 / 1.8602 req/s over 60 s (564 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 0.9, rate_scale = 2.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.265f3d0f-9fa9-4193-b994-f5fe461e726e.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 5.0, "huggyllama/llama-13b" = 2.679433656340733, "huggyllama/llama-30b" = 1.8602052900565074 }
+
+[[serving_cases.265f3d0f-9fa9-4193-b994-f5fe461e726e.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.265f3d0f-9fa9-4193-b994-f5fe461e726e.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.265f3d0f-9fa9-4193-b994-f5fe461e726e.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p09: alpha 1.3, rate scale 1.0 ----------------------------------------------------
+# 2.0 / 0.8123 / 0.4795 req/s -> 183 requests (106 / 47 / 30), 57847 input and
+# 4546 output tokens.
+[serving_cases.5f5d389e-ce61-478b-8bd1-d92c207a3515]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 1.3 rate scale 1.0: Poisson arrivals at 2.0 / 0.8123 / 0.4795 req/s over 60 s (183 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 1.3, rate_scale = 1.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.5f5d389e-ce61-478b-8bd1-d92c207a3515.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 2.0, "huggyllama/llama-13b" = 0.8122523963562355, "huggyllama/llama-30b" = 0.47948206221657624 }
+
+[[serving_cases.5f5d389e-ce61-478b-8bd1-d92c207a3515.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.5f5d389e-ce61-478b-8bd1-d92c207a3515.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.5f5d389e-ce61-478b-8bd1-d92c207a3515.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p10: alpha 1.3, rate scale 1.5 ----------------------------------------------------
+# 3.0 / 1.2184 / 0.7192 req/s -> 289 requests (172 / 71 / 46), 98601 input and
+# 10577 output tokens.
+[serving_cases.00167f40-f769-43ac-9b52-8cb282c32483]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 1.3 rate scale 1.5: Poisson arrivals at 3.0 / 1.2184 / 0.7192 req/s over 60 s (289 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 1.3, rate_scale = 1.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.00167f40-f769-43ac-9b52-8cb282c32483.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 3.0, "huggyllama/llama-13b" = 1.2183785945343533, "huggyllama/llama-30b" = 0.7192230933248643 }
+
+[[serving_cases.00167f40-f769-43ac-9b52-8cb282c32483.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.00167f40-f769-43ac-9b52-8cb282c32483.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.00167f40-f769-43ac-9b52-8cb282c32483.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p11: alpha 1.3, rate scale 2.0 ----------------------------------------------------
+# 4.0 / 1.6245 / 0.959 req/s -> 399 requests (238 / 104 / 57), 138392 input and
+# 13741 output tokens.
+[serving_cases.0f63505d-8740-4949-88fb-f25b05d41f28]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 1.3 rate scale 2.0: Poisson arrivals at 4.0 / 1.6245 / 0.959 req/s over 60 s (399 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 1.3, rate_scale = 2.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.0f63505d-8740-4949-88fb-f25b05d41f28.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 4.0, "huggyllama/llama-13b" = 1.624504792712471, "huggyllama/llama-30b" = 0.9589641244331525 }
+
+[[serving_cases.0f63505d-8740-4949-88fb-f25b05d41f28.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.0f63505d-8740-4949-88fb-f25b05d41f28.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.0f63505d-8740-4949-88fb-f25b05d41f28.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p12: alpha 1.3, rate scale 2.5 ----------------------------------------------------
+# 5.0 / 2.0306 / 1.1987 req/s -> 484 requests (291 / 118 / 75), 173692 input and
+# 16063 output tokens.
+[serving_cases.fb14e827-2c10-4ffe-80d9-df6fb3709904]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 1.3 rate scale 2.5: Poisson arrivals at 5.0 / 2.0306 / 1.1987 req/s over 60 s (484 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 1.3, rate_scale = 2.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.fb14e827-2c10-4ffe-80d9-df6fb3709904.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 5.0, "huggyllama/llama-13b" = 2.0306309908905886, "huggyllama/llama-30b" = 1.1987051555414405 }
+
+[[serving_cases.fb14e827-2c10-4ffe-80d9-df6fb3709904.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.fb14e827-2c10-4ffe-80d9-df6fb3709904.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.fb14e827-2c10-4ffe-80d9-df6fb3709904.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p13: alpha 1.7, rate scale 1.0 ----------------------------------------------------
+# 2.0 / 0.6156 / 0.309 req/s -> 163 requests (106 / 38 / 19), 51709 input and
+# 4124 output tokens.
+[serving_cases.6b5b616f-e384-4953-9e7a-380bc8999781]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 1.7 rate scale 1.0: Poisson arrivals at 2.0 / 0.6156 / 0.309 req/s over 60 s (163 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 1.7, rate_scale = 1.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.6b5b616f-e384-4953-9e7a-380bc8999781.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 2.0, "huggyllama/llama-13b" = 0.6155722066724582, "huggyllama/llama-30b" = 0.3089753711813132 }
+
+[[serving_cases.6b5b616f-e384-4953-9e7a-380bc8999781.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.6b5b616f-e384-4953-9e7a-380bc8999781.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.6b5b616f-e384-4953-9e7a-380bc8999781.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p14: alpha 1.7, rate scale 1.5 ----------------------------------------------------
+# 3.0 / 0.9234 / 0.4635 req/s -> 259 requests (172 / 57 / 30), 85771 input and
+# 8376 output tokens.
+[serving_cases.ccaeeca5-8022-4b7c-85a2-e9849c7a4a9e]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 1.7 rate scale 1.5: Poisson arrivals at 3.0 / 0.9234 / 0.4635 req/s over 60 s (259 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 1.7, rate_scale = 1.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.ccaeeca5-8022-4b7c-85a2-e9849c7a4a9e.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 3.0, "huggyllama/llama-13b" = 0.9233583100086873, "huggyllama/llama-30b" = 0.46346305677196975 }
+
+[[serving_cases.ccaeeca5-8022-4b7c-85a2-e9849c7a4a9e.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.ccaeeca5-8022-4b7c-85a2-e9849c7a4a9e.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.ccaeeca5-8022-4b7c-85a2-e9849c7a4a9e.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p15: alpha 1.7, rate scale 2.0 ----------------------------------------------------
+# 4.0 / 1.2311 / 0.618 req/s -> 353 requests (238 / 72 / 43), 124524 input and
+# 12305 output tokens.
+[serving_cases.12dfe781-d5b8-417b-a20e-7ee21fa0668b]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 1.7 rate scale 2.0: Poisson arrivals at 4.0 / 1.2311 / 0.618 req/s over 60 s (353 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 1.7, rate_scale = 2.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.12dfe781-d5b8-417b-a20e-7ee21fa0668b.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 4.0, "huggyllama/llama-13b" = 1.2311444133449163, "huggyllama/llama-30b" = 0.6179507423626264 }
+
+[[serving_cases.12dfe781-d5b8-417b-a20e-7ee21fa0668b.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.12dfe781-d5b8-417b-a20e-7ee21fa0668b.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.12dfe781-d5b8-417b-a20e-7ee21fa0668b.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p16: alpha 1.7, rate scale 2.5 ----------------------------------------------------
+# 5.0 / 1.5389 / 0.7724 req/s -> 435 requests (291 / 97 / 47), 153754 input and
+# 14781 output tokens.
+[serving_cases.586cf3a9-a016-4ce0-ae66-2ddcb3a164a2]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 1.7 rate scale 2.5: Poisson arrivals at 5.0 / 1.5389 / 0.7724 req/s over 60 s (435 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 1.7, rate_scale = 2.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.586cf3a9-a016-4ce0-ae66-2ddcb3a164a2.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 5.0, "huggyllama/llama-13b" = 1.5389305166811456, "huggyllama/llama-30b" = 0.772438427953283 }
+
+[[serving_cases.586cf3a9-a016-4ce0-ae66-2ddcb3a164a2.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.586cf3a9-a016-4ce0-ae66-2ddcb3a164a2.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.586cf3a9-a016-4ce0-ae66-2ddcb3a164a2.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p17: alpha 2.1, rate scale 1.0 ----------------------------------------------------
+# 2.0 / 0.4665 / 0.1991 req/s -> 149 requests (106 / 30 / 13), 47270 input and
+# 3815 output tokens.
+[serving_cases.95bf0bd1-9293-4603-ae47-47bf1ac503c9]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 2.1 rate scale 1.0: Poisson arrivals at 2.0 / 0.4665 / 0.1991 req/s over 60 s (149 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 2.1, rate_scale = 1.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.95bf0bd1-9293-4603-ae47-47bf1ac503c9.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 2.0, "huggyllama/llama-13b" = 0.4665164957684037, "huggyllama/llama-30b" = 0.19910187996461381 }
+
+[[serving_cases.95bf0bd1-9293-4603-ae47-47bf1ac503c9.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.95bf0bd1-9293-4603-ae47-47bf1ac503c9.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.95bf0bd1-9293-4603-ae47-47bf1ac503c9.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p18: alpha 2.1, rate scale 1.5 ----------------------------------------------------
+# 3.0 / 0.6998 / 0.2987 req/s -> 233 requests (172 / 43 / 18), 78269 input and
+# 7928 output tokens.
+[serving_cases.28586f45-e0dc-49c2-8c18-c1b147d0c9f8]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 2.1 rate scale 1.5: Poisson arrivals at 3.0 / 0.6998 / 0.2987 req/s over 60 s (233 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 2.1, rate_scale = 1.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.28586f45-e0dc-49c2-8c18-c1b147d0c9f8.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 3.0, "huggyllama/llama-13b" = 0.6997747436526056, "huggyllama/llama-30b" = 0.2986528199469207 }
+
+[[serving_cases.28586f45-e0dc-49c2-8c18-c1b147d0c9f8.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.28586f45-e0dc-49c2-8c18-c1b147d0c9f8.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.28586f45-e0dc-49c2-8c18-c1b147d0c9f8.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p19: alpha 2.1, rate scale 2.0 ----------------------------------------------------
+# 4.0 / 0.933 / 0.3982 req/s -> 319 requests (238 / 58 / 23), 110125 input and
+# 9954 output tokens.
+[serving_cases.29f90517-d5eb-4cb9-9c41-9a1057eec305]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 2.1 rate scale 2.0: Poisson arrivals at 4.0 / 0.933 / 0.3982 req/s over 60 s (319 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 2.1, rate_scale = 2.0 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.29f90517-d5eb-4cb9-9c41-9a1057eec305.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 4.0, "huggyllama/llama-13b" = 0.9330329915368074, "huggyllama/llama-30b" = 0.39820375992922763 }
+
+[[serving_cases.29f90517-d5eb-4cb9-9c41-9a1057eec305.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.29f90517-d5eb-4cb9-9c41-9a1057eec305.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.29f90517-d5eb-4cb9-9c41-9a1057eec305.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+# --- p20: alpha 2.1, rate scale 2.5 ----------------------------------------------------
+# 5.0 / 1.1663 / 0.4978 req/s -> 392 requests (291 / 70 / 31), 136506 input and
+# 13172 output tokens.
+[serving_cases.fbeaf556-f4f6-404a-9a5e-b7a2a98ea766]
+description = "MuxServe, 3 LLaMA models on 4 GPUs, paper Figure 5 point alpha 2.1 rate scale 2.5: Poisson arrivals at 5.0 / 1.1663 / 0.4978 req/s over 60 s (392 requests), random prompts and outputs."
+mode = "hosted"
+script = "server.py"
+launch_settings = { alpha = 2.1, rate_scale = 2.5 }
+seed = 0
+max_inflight = 128
+warmup_requests_per_target = 0
+request_timeout_seconds = 330.0
+
+[serving_cases.fbeaf556-f4f6-404a-9a5e-b7a2a98ea766.arrivals]
+kind = "poisson"
+duration_seconds = 60.0
+rates = { "huggyllama/llama-7b" = 5.0, "huggyllama/llama-13b" = 1.1662912394210092, "huggyllama/llama-30b" = 0.49775469991153454 }
+
+[[serving_cases.fbeaf556-f4f6-404a-9a5e-b7a2a98ea766.targets]]
+model_id = "huggyllama/llama-7b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.fbeaf556-f4f6-404a-9a5e-b7a2a98ea766.targets]]
+model_id = "huggyllama/llama-13b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
+
+[[serving_cases.fbeaf556-f4f6-404a-9a5e-b7a2a98ea766.targets]]
+model_id = "huggyllama/llama-30b"
+prompts = { kind = "random", input_tokens = { kind = "lognormal", median_fraction = 0.125, sigma = 1.0 } }
+output_tokens = { kind = "lognormal", median_fraction = 0.03125, sigma = 1.0, max_output_input_ratio = 2.0 }
+sampling = { temperature = 0.0, ignore_eos = true }
