@@ -1,4 +1,4 @@
-"""Entry points the pinned SGLang fork (MuxServe-SGLang-Engine) calls.
+"""Entry points the pinned SGLang fork (xuyue-git/sglang-engine, muxserve-v0.5.20) calls.
 
 The fork imports ``muxserve.flexserver.sglang_hooks`` at its hook sites. Under the
 original runtime only one hook is active: the model loader, which maps the weights

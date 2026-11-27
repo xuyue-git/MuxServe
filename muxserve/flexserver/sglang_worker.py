@@ -6,9 +6,10 @@ This file replaces what MuxServe-vLLM did inside one P/D rank and nothing else:
       -> SGLang's LlamaForCausalLM, built by SGLang's own ModelRunner;
   * vLLM's head-wise PagedAttention (layers/attention.py, MuxServe branch)
       -> HeadwiseAttention below. The K/V store and the decode attention are
-         MuxServe-vLLM's own head-wise ops, called as PagedAttention.forward
-         calls them, on the KV pool the original FlexStore hands out (only
-         those kernels read that layout). The prompt attention is SGLang's
+         MuxServe-vLLM's own head-wise ops (sglang.kernels.ops.attention.headwise
+         in the SGLang fork), called as PagedAttention.forward calls them, on the
+         KV pool the original FlexStore hands out (only those kernels read that
+         layout). The prompt attention is SGLang's
          default for this GPU: FlashInfer's ragged causal prefill, as
          SGLang's FlashInferAttnBackend runs a prompt without a cached prefix;
   * GreedySampler (flexserver/sampler.py) -> greedy_sample below, same steps;
@@ -114,8 +115,8 @@ class HeadwiseAttention:
     def __init__(self, key_cache: torch.Tensor, value_cache: torch.Tensor,
                  num_heads: int, num_kv_heads: int,
                  prefill: RaggedPrefill = None) -> None:
-        from muxserve import _headwise
-        self.ops = _headwise
+        from sglang.kernels.ops.attention import headwise
+        self.ops = headwise
         self.key_cache = key_cache
         self.value_cache = value_cache
         self.block_size = value_cache.shape[-1]

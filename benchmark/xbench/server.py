@@ -39,9 +39,11 @@ from pathlib import Path
 VERSION = "baseline"
 SCRIPT = "benchmark/xbench/server.py"
 YAML = "benchmark/xbench/fig5-a0.7-s1.0.yaml"
-ENV_HELP = "the SGLang environment (Python 3.12, SGLang fork MuxServe-SGLang-Engine)"
+ENV_HELP = "the SGLang environment (Python 3.12, SGLang fork xuyue-git/sglang-engine muxserve-v0.5.20)"
 # Extensions built by tools/build_sglang_ext.py (`build`); start checks they exist.
-EXTENSIONS = ("_headwise", "memory_manager", "batch_scheduler")
+EXTENSIONS = ("memory_manager", "batch_scheduler")
+# Kernels the SGLang fork compiles on first use; `build` compiles them ahead of time.
+PREBUILD = ("sglang.kernels.ops.attention.headwise",)
 
 
 def engine_env(env: dict, python_env: str, cuda: str) -> None:
@@ -454,9 +456,13 @@ def cmd_build(args: argparse.Namespace) -> int:
     env = clean_env(settings["MUXSERVE_ENV"])
     engine_env(env, settings["MUXSERVE_ENV"], settings["CUDA_HOME"])
     env["CUDA_HOME"] = settings["CUDA_HOME"]
-    command = [f"{settings['MUXSERVE_ENV']}/bin/python", "tools/build_sglang_ext.py"]
-    say(" ".join(command))
-    return subprocess.run(command, cwd=REPO, env=env).returncode
+    python = f"{settings['MUXSERVE_ENV']}/bin/python"
+    for command in ([python, "tools/build_sglang_ext.py"], *([python, "-m", m] for m in PREBUILD)):
+        say(" ".join(command))
+        code = subprocess.run(command, cwd=REPO, env=env).returncode
+        if code:
+            return code
+    return 0
 
 
 def main() -> int:
