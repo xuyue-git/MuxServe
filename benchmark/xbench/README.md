@@ -51,6 +51,9 @@ ADBS 启动时要知道各模型的到达率。用 `--alpha A --rate-scale S` �
 
 1. 在本仓库根目录，把本目录的 `.env.example` 复制成 `.env`（git 不收），填两项：
    `MUXSERVE_ENV` = 装了 SGLang 分支的 Python 环境，`CUDA_HOME` = CUDA 13.2。
+   如果这个环境是和别的仓库共用的、装的不是 SGLang 分支，再填 `SGLANG_FORK` = SGLang 分支的目录
+   （xuyue-git/sglang-engine 的 muxserve-v0.5.20），`server.py` 会让服务端从它的 `python/` 导入 SGLang，
+   共用的环境不用动。启动时日志里的 `sglang from` 会写出实际用的是哪一份。
 2. 编译扩展：`uv run benchmark/xbench/server.py build`
 3. CrossPool 用 main `987b2d5` 或更新的版本。`XPOOL_CONFIG` 指向的配置里，`[vendor]` 的 `model_base_uri`
    设成模型目录（这台机器是 `/storage/crosspool-models`）：xbench 要从那里读分词器，生成随机问题。

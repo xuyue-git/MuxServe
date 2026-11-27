@@ -126,7 +126,17 @@ def read_settings(args: argparse.Namespace) -> dict:
                 f"to .env there and fill it in.")
     if not Path(values["MUXSERVE_ENV"], "bin", "python").exists():
         die(f"MUXSERVE_ENV={values['MUXSERVE_ENV']} has no bin/python")
+    if values.get("SGLANG_FORK") and not Path(values["SGLANG_FORK"], "python", "sglang").is_dir():
+        die(f"SGLANG_FORK={values['SGLANG_FORK']} has no python/sglang (the SGLang fork checkout)")
     return values
+
+
+def fork_first(env: dict, settings: dict) -> None:
+    """SGLANG_FORK (optional, .env): the server imports SGLang from that checkout's python/, ahead of
+    the environment's own sglang (for an environment shared with another checkout)."""
+    if settings.get("SGLANG_FORK"):
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (env.get("PYTHONPATH"), f"{settings['SGLANG_FORK']}/python") if p)
 
 
 def clean_env(python_env: str) -> dict:
@@ -437,6 +447,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                   f"a{point[0]:.1f}-s{point[1]:.1f}-{datetime.datetime.now():%Y%m%d-%H%M%S}")
     env = clean_env(python_env)
     engine_env(env, python_env, cuda)
+    fork_first(env, settings)
     env.update(MPS=MPS_DIR, CUDA_MPS_PIPE_DIRECTORY=f"{MPS_DIR}/nvidia-mps",
                CUDA_MPS_LOG_DIRECTORY=f"{MPS_DIR}/nvidia-log", CUDA_VISIBLE_DEVICES=",".join(uuids),
                VLLM_PROC_LOG=str(logdir / "proc"))
@@ -472,8 +483,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             f"Run: uv run {SCRIPT} stop")
     signals_seen = []
     try:
-        check = subprocess.run([python, "-c", "import torch; n = torch.cuda.device_count(); "
-                                f"print('visible GPUs', n); assert n == {GPUS}"], env=env, cwd=REPO)
+        check = subprocess.run([python, "-c", "import importlib.util, os, torch; n = torch.cuda.device_count(); "
+                                "s = importlib.util.find_spec('sglang'); print('visible GPUs', n, '| sglang from', "
+                                f"s and os.path.dirname(s.origin)); assert n == {GPUS}"], env=env, cwd=REPO)
         if check.returncode != 0:
             raise SystemExit(f"the server environment does not see {GPUS} GPUs")
         catch_signals(signals_seen)
@@ -594,6 +606,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     settings = read_settings(args)
     env = clean_env(settings["MUXSERVE_ENV"])
     engine_env(env, settings["MUXSERVE_ENV"], settings["CUDA_HOME"])
+    fork_first(env, settings)
     env["CUDA_HOME"] = settings["CUDA_HOME"]
     python = f"{settings['MUXSERVE_ENV']}/bin/python"
     for command in ([python, "tools/build_sglang_ext.py"], *([python, "-m", m] for m in PREBUILD)):
